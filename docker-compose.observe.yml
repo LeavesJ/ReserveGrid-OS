@@ -1,0 +1,192 @@
+# ReserveGrid OS — Observe Mode Stack
+#
+# Runs the full verification pipeline against synthetic demo data with
+# verdict persistence enabled. Includes rg-feed-server for external
+# consumers to subscribe to the live template and verdict stream via
+# WebSocket (license key required).
+#
+# Pipeline: rg-demo-feed -> rg-feed-adapter -> template-manager -> pool-verifier
+# Feed:     rg-feed-server (WebSocket, port 9200, license key auth via rg-auth)
+# UI:       rg-dashboard (operator UI) + rg-auth (authentication)
+#
+# Usage:
+#   docker compose -f docker-compose.observe.yml up
+#
+# This stack is designed for operators evaluating ReserveGrid OS with
+# verdict persistence and the external feed API. All policy detections
+# fire at least once per demo feed cycle.
+
+services:
+  # ── Synthetic template feed ──
+  rg-demo-feed:
+    build:
+      context: .
+      dockerfile: services/rg-demo-feed/Dockerfile
+    environment:
+      VELDRA_LOG_FORMAT: json
+      VELDRA_LOG_FILTER: info
+      VELDRA_DEMO_FEED_LISTEN: "0.0.0.0:9100"
+      VELDRA_DEMO_FEED_INTERVAL_MS: "5000"
+    ports:
+      - "9100:9100"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '(echo > /dev/tcp/localhost/9100) 2>/dev/null' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      start_period: 5s
+      retries: 5
+
+  # ── Feed-to-RPC translator ──
+  # Impersonates a bitcoind JSON-RPC endpoint so template-manager can
+  # consume demo data without code changes.
+  rg-feed-adapter:
+    build:
+      context: .
+      dockerfile: services/rg-feed-adapter/Dockerfile
+    environment:
+      VELDRA_LOG_FORMAT: json
+      VELDRA_LOG_FILTER: info
+      VELDRA_ADAPTER_LISTEN: "0.0.0.0:18444"
+      VELDRA_FEED_URL: "ws://rg-demo-feed:9100/ws"
+    ports:
+      - "18444:18444"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:18444/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      start_period: 5s
+      retries: 5
+    depends_on:
+      rg-demo-feed:
+        condition: service_healthy
+
+  # ── Pool Verifier (observe mode) ──
+  pool-verifier:
+    build:
+      context: .
+      dockerfile: services/pool-verifier/Dockerfile
+    user: "0"
+    environment:
+      VELDRA_LOG_FORMAT: json
+      VELDRA_LOG_FILTER: info
+      VELDRA_VERIFIER_ADDR: "0.0.0.0:9090"
+      VELDRA_HTTP_ADDR: "0.0.0.0:8081"
+      VELDRA_POLICY_FILE: /config/policy.toml
+      VELDRA_VERIFIER_CONFIG: /config/verifier.toml
+      VELDRA_MODE: observe
+    volumes:
+      - ./config:/config:rw
+    ports:
+      - "9090:9090"
+      - "8081:8081"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8081/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 10
+
+  # ── Template Manager (reads from adapter, not bitcoind) ──
+  template-manager:
+    build:
+      context: .
+      dockerfile: services/template-manager/Dockerfile
+    user: "0"
+    environment:
+      VELDRA_LOG_FORMAT: json
+      VELDRA_LOG_FILTER: info
+      VELDRA_MANAGER_CONFIG: /config/manager-shadow.toml
+      VELDRA_MANAGER_HTTP_ADDR: "0.0.0.0:8082"
+      VELDRA_VERIFIER_ADDR: "pool-verifier:9090"
+    volumes:
+      - ./dev:/config:rw
+    ports:
+      - "8082:8082"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8082/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 10
+    depends_on:
+      pool-verifier:
+        condition: service_healthy
+      rg-feed-adapter:
+        condition: service_healthy
+
+  # ── Auth Service ──
+  rg-auth:
+    build:
+      context: .
+      dockerfile: services/rg-auth/Dockerfile
+    user: "0"
+    environment:
+      VELDRA_LOG_FORMAT: json
+      VELDRA_LOG_FILTER: info
+      VELDRA_AUTH_ADDR: "0.0.0.0:3030"
+      VELDRA_AUTH_DB: /data/auth.db
+      VELDRA_AUTH_SITE_URL: "http://localhost:8084"
+      VELDRA_AUTH_ADMIN_EMAIL: "${VELDRA_AUTH_ADMIN_EMAIL:-admin@localhost}"
+      VELDRA_AUTH_ALLOWED_ORIGIN: "http://localhost:8084"
+      VELDRA_AUTH_RATE_LIMIT_MULTIPLIER: "${VELDRA_AUTH_RATE_LIMIT_MULTIPLIER:-1}"
+      VELDRA_AUTH_TRUST_PROXY: "1"
+    ports:
+      - "3030:3030"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3030/auth/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 10
+
+  # ── Feed Server (external WebSocket API, license key auth) ──
+  rg-feed-server:
+    build:
+      context: .
+      dockerfile: services/rg-feed-server/Dockerfile
+    environment:
+      VELDRA_LOG_FORMAT: json
+      VELDRA_LOG_FILTER: info
+      VELDRA_FEED_SERVER_CONFIG: /config/feed-server-observe.toml
+    volumes:
+      - ./dev:/config:ro
+    ports:
+      - "9200:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '(echo > /dev/tcp/localhost/9200) 2>/dev/null' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 10
+    depends_on:
+      rg-feed-adapter:
+        condition: service_healthy
+      rg-auth:
+        condition: service_healthy
+
+  # ── Dashboard (operator UI) ──
+  rg-dashboard:
+    build:
+      context: .
+      dockerfile: services/rg-dashboard/Dockerfile
+    user: "0"
+    environment:
+      VELDRA_LOG_FORMAT: json
+      VELDRA_LOG_FILTER: info
+      VELDRA_DASHBOARD_CONFIG: /config/dashboard.toml
+      VELDRA_MODE: observe
+    volumes:
+      - ./dev:/config:ro
+    ports:
+      - "8084:8084"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8084/healthz || exit 1"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+    depends_on:
+      pool-verifier:
+        condition: service_healthy
+      template-manager:
+        condition: service_healthy

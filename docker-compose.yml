@@ -1,0 +1,234 @@
+# ReserveGrid OS development stack
+#
+# Brings up the full mining pool pipeline in regtest:
+#   bitcoind (regtest) -> template-manager -> pool-verifier -> sv2-gateway
+#
+# Modes: Set VELDRA_GATEWAY_MODE to "inline", "observe", or "shadow".
+#
+# Usage:
+#   docker compose up                          # default: inline mode
+#   VELDRA_GATEWAY_MODE=observe docker compose up
+#
+# Prerequisite: generate Noise keypair files and place them in ./dev/keys/.
+#   The dev/gateway.toml config references these paths.
+#
+# Note: user: "0" overrides are required for macOS Docker Desktop where
+# bind-mounted files are not readable by non-root container users.
+# Production deployments should use proper image-baked configs instead.
+
+services:
+  # ── Bitcoin Core (regtest) ──
+  bitcoind:
+    image: lncm/bitcoind:v27.0
+    command:
+      - -regtest
+      - -server
+      - -rpcuser=${VELDRA_BITCOIND_RPC_USER:-reservegrid}
+      - -rpcpassword=${VELDRA_BITCOIND_RPC_PASS:?Set VELDRA_BITCOIND_RPC_PASS in .env}
+      - -rpcallowip=0.0.0.0/0
+      - -rpcbind=0.0.0.0
+      - -fallbackfee=0.00001
+      - -txindex=1
+    environment:
+      VELDRA_BITCOIND_RPC_USER: "${VELDRA_BITCOIND_RPC_USER:-reservegrid}"
+      VELDRA_BITCOIND_RPC_PASS: "${VELDRA_BITCOIND_RPC_PASS:?Set VELDRA_BITCOIND_RPC_PASS in .env}"
+    ports:
+      - "18443:18443"
+    volumes:
+      - bitcoind-data:/home/bitcoin/.bitcoin
+    healthcheck:
+      test: ["CMD-SHELL", "bitcoin-cli -regtest -rpcuser=$VELDRA_BITCOIND_RPC_USER -rpcpassword=$VELDRA_BITCOIND_RPC_PASS getblockchaininfo"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 10
+
+  # ── Template Manager ──
+  template-manager:
+    build:
+      context: .
+      dockerfile: services/template-manager/Dockerfile
+    user: "0"
+    environment:
+      VELDRA_LOG_FORMAT: json
+      VELDRA_LOG_FILTER: info
+      VELDRA_MANAGER_CONFIG: /config/manager.toml
+      VELDRA_MANAGER_HTTP_ADDR: "0.0.0.0:8082"
+      VELDRA_VERIFIER_ADDR: "pool-verifier:9090"
+      VELDRA_BITCOIND_RPC_USER: "${VELDRA_BITCOIND_RPC_USER:-reservegrid}"
+      VELDRA_BITCOIND_RPC_PASS: "${VELDRA_BITCOIND_RPC_PASS:?Set VELDRA_BITCOIND_RPC_PASS in .env}"
+    volumes:
+      - ./dev:/config:rw
+    ports:
+      - "8082:8082"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8082/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 10
+    depends_on:
+      pool-verifier:
+        condition: service_healthy
+
+  # ── Pool Verifier ──
+  pool-verifier:
+    build:
+      context: .
+      dockerfile: services/pool-verifier/Dockerfile
+    user: "0"
+    environment:
+      VELDRA_LOG_FORMAT: json
+      VELDRA_LOG_FILTER: info
+      VELDRA_MODE: "${VELDRA_MODE:-inline}"
+      VELDRA_VERIFIER_ADDR: "0.0.0.0:9090"
+      VELDRA_HTTP_ADDR: "0.0.0.0:8081"
+      VELDRA_API_SECRET: "${VELDRA_API_SECRET:-}"
+      VELDRA_POLICY_FILE: /config/policy.toml
+      VELDRA_VERIFIER_CONFIG: /config/verifier.toml
+    volumes:
+      - ./config:/config:rw
+    ports:
+      - "9090:9090"
+      - "8081:8081"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8081/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 10
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+
+  # ── SV2 Gateway ──
+  sv2-gateway:
+    build:
+      context: .
+      dockerfile: services/sv2-gateway/Dockerfile
+    user: "0"
+    environment:
+      VELDRA_LOG_FORMAT: json
+      VELDRA_LOG_FILTER: info
+      VELDRA_GATEWAY_CONFIG: /config/gateway.toml
+      VELDRA_TEMPLATE_URL: "http://template-manager:8082"
+      VELDRA_ALLOW_REMOTE_VERIFIER: "1"
+    ports:
+      - "3333:3333"
+      - "8080:8080"
+    volumes:
+      - ./dev:/config:rw
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/healthz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      start_period: 15s
+      retries: 10
+    depends_on:
+      pool-verifier:
+        condition: service_healthy
+      template-manager:
+        condition: service_healthy
+
+  # ── Test Miner (regtest validation only) ──
+  # Connects to sv2-gateway, opens a channel, submits shares, then exits.
+  # Not part of the production stack; activated via: docker compose --profile test up
+  test-miner:
+    build:
+      context: .
+      dockerfile: services/test-miner/Dockerfile
+    environment:
+      VELDRA_LOG_FILTER: info
+    command:
+      - "--gateway-addr"
+      - "sv2-gateway:3333"
+      - "--authority-pubkey"
+      - "9095236f0477b38d1dabc5a098de5f19da2b1400c67cb7b3fd15904b4b9ab7b8"
+      - "--worker-name"
+      - "regtest-test-worker"
+      - "--num-shares"
+      - "5"
+      - "--share-interval-ms"
+      - "2000"
+    depends_on:
+      sv2-gateway:
+        condition: service_healthy
+    profiles:
+      - test
+
+  # ── Auth Service ──
+  rg-auth:
+    build:
+      context: .
+      dockerfile: services/rg-auth/Dockerfile
+    user: "0"
+    environment:
+      VELDRA_LOG_FORMAT: json
+      VELDRA_LOG_FILTER: info
+      VELDRA_AUTH_ADDR: "0.0.0.0:3030"
+      VELDRA_AUTH_DB: /data/auth.db
+      VELDRA_AUTH_SITE_URL: "http://localhost:8084"
+      VELDRA_AUTH_ADMIN_EMAIL: "${VELDRA_AUTH_ADMIN_EMAIL:-admin@localhost}"
+      VELDRA_AUTH_SMTP_HOST: "${VELDRA_AUTH_SMTP_HOST:-}"
+      VELDRA_AUTH_SMTP_PORT: "${VELDRA_AUTH_SMTP_PORT:-587}"
+      VELDRA_AUTH_SMTP_USER: "${VELDRA_AUTH_SMTP_USER:-}"
+      VELDRA_AUTH_SMTP_PASS: "${VELDRA_AUTH_SMTP_PASS:-}"
+      VELDRA_AUTH_SMTP_FROM: "${VELDRA_AUTH_SMTP_FROM:-${VELDRA_AUTH_SMTP_USER:-}}"
+      VELDRA_AUTH_ALLOWED_ORIGIN: "http://localhost:8084"
+      VELDRA_AUTH_RATE_LIMIT_MULTIPLIER: "${VELDRA_AUTH_RATE_LIMIT_MULTIPLIER:-1}"
+      VELDRA_AUTH_TRUST_PROXY: "1"
+    volumes:
+      - ./dev:/config:ro
+    ports:
+      - "3030:3030"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3030/auth/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 10
+
+  # ── Prometheus (monitoring) ──
+  # Activated via: docker compose --profile monitoring up
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    profiles:
+      - monitoring
+    volumes:
+      - ./dev/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9091:9090"
+    depends_on:
+      pool-verifier:
+        condition: service_healthy
+      template-manager:
+        condition: service_healthy
+
+  # ── Dashboard (operator UI) ──
+  rg-dashboard:
+    build:
+      context: .
+      dockerfile: services/rg-dashboard/Dockerfile
+    user: "0"
+    environment:
+      VELDRA_LOG_FORMAT: json
+      VELDRA_LOG_FILTER: info
+      VELDRA_DASHBOARD_CONFIG: /config/dashboard.toml
+    volumes:
+      - ./dev:/config:ro
+    ports:
+      - "8084:8084"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8084/healthz || exit 1"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+    depends_on:
+      pool-verifier:
+        condition: service_healthy
+      template-manager:
+        condition: service_healthy
+
+volumes:
+  bitcoind-data:

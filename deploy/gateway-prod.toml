@@ -1,0 +1,77 @@
+# Production gateway configuration.
+#
+# This template enforces secure defaults for internet-facing deployments.
+# Copy to your deployment and fill in all TODO fields before starting.
+#
+# Key differences from dev/gateway.toml:
+#   - No regtest channel target (miners must meet real difficulty)
+#   - Per-IP connection cap enforced (50)
+#   - Tighter ntime slack (10s, tuned for mainnet)
+#   - WAL enabled for crash-durable share delivery
+#   - upstream_failure_policy = "fail_closed"
+#   - Unique gateway_instance_id per deployment instance
+
+mode = "inline"
+
+[gateway]
+listen_addr = "0.0.0.0:3333"
+health_addr = "0.0.0.0:8080"
+max_connections = 1024
+max_connections_per_ip = 50
+max_channels_per_conn = 4
+
+# TODO: generate a fresh keypair per instance using `reservegrid keygen`.
+# Never reuse dev/keys/noise.key outside regtest.
+noise_keypair_path = "/config/keys/noise.key"
+
+# TODO: set to the x-only public key derived from your noise keypair.
+authority_pubkey = "TODO_SET_AUTHORITY_PUBKEY_64_HEX_CHARS"
+
+noise_cert_validity_secs = 3600
+noise_handshake_timeout_ms = 5000
+template_poll_interval_ms = 1000
+max_template_age_ms = 30000
+prevhash_verdict_timeout_ms = 50
+prevhash_stale_hold_ms = 5000
+upstream_stale_max_ms = 30000
+upstream_failure_policy = "fail_closed"
+job_retention_ms = 300000
+max_shares_per_second_per_channel = 100
+
+# Mainnet: 10s is a reasonable window. Adjust based on observed clock
+# skew between your gateway host and bitcoind. Do not use 30s unless
+# you have measured a need.
+ntime_elapsed_slack_seconds = 10
+
+# No channel_target_hex: miners must meet the real network difficulty.
+# channel_target_hex = (omitted)
+
+noise_cert_path = "/config/keys/noise_cert.bin"
+noise_keypair_reload_sighup = true
+noise_keypair_poll_interval_secs = 300
+
+# TODO: set a unique ID per gateway instance for share tracing.
+gateway_instance_id = "prod-gateway-01"
+
+# TODO: set to your template manager URL.
+template_url = "http://template-manager:8082"
+
+# WAL for crash-durable share delivery. Point to a persistent volume.
+wal_path = "/data/share_wal.ndjson"
+wal_compaction_threshold = 1000
+
+[verifier]
+addr = "pool-verifier:9090"
+health_probe_staleness_ms = 15000
+
+# TODO: uncomment and set TLS fields for non-loopback verifier.
+# tls_ca_cert = "/config/tls/verifier-ca.pem"
+# tls_client_cert = "/config/tls/gateway-client.pem"
+# tls_client_key = "/config/tls/gateway-client-key.pem"
+# tls_server_name = "pool-verifier"
+
+[share_upstream]
+url = "http://template-manager:8082/shares"
+retries = 3
+forward_queue_size = 10000
+forward_max_in_flight = 64
