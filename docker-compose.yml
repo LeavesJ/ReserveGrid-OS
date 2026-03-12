@@ -204,6 +204,26 @@ services:
       template-manager:
         condition: service_healthy
 
+  # ── Grafana (monitoring) ──
+  # Activated via: docker compose --profile monitoring up
+  grafana:
+    image: grafana/grafana-oss:11.4.0
+    profiles:
+      - monitoring
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${VELDRA_GRAFANA_ADMIN_PASSWORD:-reservegrid}
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./dev/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./dev/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      prometheus:
+        condition: service_started
+
   # ── Dashboard (operator UI) ──
   rg-dashboard:
     build:

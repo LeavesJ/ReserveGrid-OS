@@ -1,0 +1,11 @@
+# Auto-provisioned Prometheus datasource for ReserveGrid OS.
+# Loaded by Grafana on startup via the monitoring profile.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
