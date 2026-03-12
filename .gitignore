@@ -74,10 +74,13 @@ docs/MEETING_PREP.md
 rg-os-wireframes.html
 pdf-export/
 TEST_COVERAGE_AUDIT.md
-Dockerfile
+/Dockerfile
 
 # Website lives in LeavesJ/veldra-site
 veldra-site-v3/
+
+# Release note drafts (consumed by gh release create, not tracked)
+RELEASE_NOTES_*.md
 
 # Claude Code config
 CLAUDE.md
