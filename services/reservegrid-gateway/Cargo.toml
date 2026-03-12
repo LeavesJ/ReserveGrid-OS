@@ -1,0 +1,37 @@
+[package]
+name = "reservegrid-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "SV2 Mining Protocol gateway for ReserveGrid OS"
+publish = false
+
+[dependencies]
+reservegrid-common = { path = "../reservegrid-common" }
+rg-protocol = { path = "../rg-protocol" }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+axum = "0.8"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+tower = { version = "0.5", features = ["timeout", "limit"] }
+tower-http = { version = "0.6", features = ["set-header", "request-id", "trace"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+http = "1"
+uuid = { version = "1", features = ["v7"] }
+subtle = "2"
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+tower = { version = "0.5", features = ["timeout", "limit", "util"] }
+http-body-util = "0.1"

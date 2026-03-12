@@ -1,0 +1,7 @@
+[manager]
+backend = "bitcoind"
+poll_interval_secs = 1
+
+# RPC credentials come from VELDRA_BITCOIND_RPC_USER / VELDRA_BITCOIND_RPC_PASS env vars.
+rpc_url = "http://127.0.0.1:18443"
+rpc_user = "reservegrid"

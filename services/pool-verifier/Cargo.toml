@@ -1,0 +1,40 @@
+[package]
+name = "pool-verifier"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "io-util", "sync"] }
+toml = "0.8"
+axum = "0.7"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rcgen = "0.13"
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+rg-protocol = { path = "../rg-protocol" }
+reservegrid-common = { path = "../reservegrid-common" }
+prometheus-client = { workspace = true }
+
+[[bin]]
+name = "pool-verifier"
+path = "src/main.rs"
+
+[[bin]]
+name = "init-policy"
+path = "src/bin/init_policy.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true

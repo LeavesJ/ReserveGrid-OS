@@ -1,0 +1,21 @@
+//! reservegrid-common: Shared types, error codes, and configuration primitives.
+//!
+//! This crate is the single source of truth for:
+//! - Unified reason codes (`ReasonCode`) spanning verification and gateway
+//! - Gateway-specific reason codes (`GatewayReason`)
+//! - Configuration schema and validation
+//! - Redacted wrapper for secret-bearing values
+//! - Shared error response types
+
+pub mod config;
+pub mod config_io;
+pub mod error;
+pub mod metrics;
+pub mod mode;
+pub mod reason;
+pub mod redacted;
+
+// Re-export the most commonly used types at crate root for ergonomics.
+pub use error::ErrorResponse;
+pub use mode::DeployMode;
+pub use reason::{GatewayReason, ReasonCode};

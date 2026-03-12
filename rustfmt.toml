@@ -1,0 +1,5 @@
+edition = "2024"
+max_width = 100
+use_field_init_shorthand = true
+# imports_granularity = "Crate"       # requires nightly; enable when CI uses nightly fmt
+# group_imports = "StdExternalCrate"  # requires nightly; enable when CI uses nightly fmt

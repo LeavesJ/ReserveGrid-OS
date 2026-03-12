@@ -1,0 +1,21 @@
+# cargo-audit configuration
+#
+# Acknowledged advisories are transitive dependencies where no upgrade
+# path exists yet. Each entry includes a justification and the upstream
+# tracking issue or migration plan.
+
+[advisories]
+ignore = [
+    # proc-macro-error 1.0.4 is unmaintained (RUSTSEC-2024-0370).
+    # Pulled in transitively: rust-embed -> include-flate -> include-flate-codegen -> proc-macro-error.
+    # No release of include-flate-codegen drops this dep yet.
+    # Impact: build-time only, never runs in production binaries.
+    "RUSTSEC-2024-0370",
+
+    # rustls-pemfile 2.2.0 is unmaintained (RUSTSEC-2025-0134).
+    # Successor is rustls-pki-types which absorbed PEM parsing.
+    # axum-server 0.7 still depends on rustls-pemfile 2.x.
+    # Migration: upgrade to axum-server 0.8+ when available, or switch
+    # to rustls-pki-types directly. No vulnerability, just unmaintained.
+    "RUSTSEC-2025-0134",
+]

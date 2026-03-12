@@ -1,0 +1,84 @@
+# Rust build output
+target/
+**/target/
+
+# Per-service Cargo.lock (workspace root Cargo.lock is tracked)
+services/*/Cargo.lock
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.fuse_hidden*
+
+# Env files (keep .env.example tracked)
+.env
+.env.*
+!.env.example
+
+# Secrets and credentials — never commit
+*.pem
+*.key
+*.p12
+*.pfx
+*.secret
+*.crt
+*.csr
+id_rsa*
+id_ed25519*
+
+# Logs / traces
+*.log
+*.ndjson
+
+# Runtime generated data
+services/pool-verifier/data/
+artifacts/
+
+# Local-only config and policy overrides
+config/local/
+config/*.local.toml
+config/policy.toml
+services/pool-verifier/policy.toml
+
+# Node
+node_modules/
+*.tsbuildinfo
+
+# Scratch / temp files
+*.patch
+dist/
+.tmp/
+
+# SQLite runtime databases
+*.db
+*.db-shm
+*.db-wal
+
+# Private engineering docs (local only, all under docs/)
+docs/DEVLOG.md
+docs/lessons.md
+docs/PRODUCTION_BLOCKERS.md
+docs/BIZLOG.md
+docs/EXECLOG.md
+docs/TESTLOG.md
+docs/DASHBOARD_SMOKE_TEST.md
+docs/architecture-comparison.md
+docs/MEETING_PREP.md
+
+# Private assets (local only)
+rg-os-wireframes.html
+pdf-export/
+TEST_COVERAGE_AUDIT.md
+Dockerfile
+
+# Website lives in LeavesJ/veldra-site
+veldra-site-v3/
+
+# Claude Code config
+CLAUDE.md
+.claude/

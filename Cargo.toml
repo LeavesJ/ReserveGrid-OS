@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+  "services/pool-verifier",
+  "services/template-manager",
+  "services/rg-protocol",
+  "services/sv2-bridge",
+  "services/rg-auth",
+  "services/reservegrid-common",
+  "services/reservegrid-gateway",
+  "services/sv2-gateway",
+  "services/test-miner",
+  "services/rg-dashboard",
+  "services/rg-feed-adapter",
+  "services/rg-demo-feed",
+  "services/rg-feed-server",
+  "services/rg-load-test",
+]
+
+[workspace.package]
+version = "1.0.0-alpha.0"
+edition = "2024"
+rust-version = "1.92"
+
+# ── Workspace-wide lint policy ──
+# All crates opt in via `[lints] workspace = true`.
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+[workspace.dependencies]
+prometheus-client = "0.22"

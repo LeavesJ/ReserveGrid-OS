@@ -1,0 +1,26 @@
+# Strict policy for load testing rejection paths.
+# Enables all enforcement flags so every rejection scenario triggers.
+
+[policy]
+protocol_version = 2
+required_prevhash_len = 64
+min_total_fees = 1000
+max_tx_count = 4294967295
+
+low_mempool_tx = 0
+high_mempool_tx = 0
+min_avg_fee_lo = 0
+min_avg_fee_mid = 0
+min_avg_fee_hi = 0
+
+reject_empty_templates = true
+reject_coinbase_zero = true
+unknown_mempool_as_high = true
+
+[policy.safety]
+max_weight_ratio = 0.999
+enforce_weight_ratio = false
+max_template_age_ms = 5000
+enforce_template_age = true
+warn_sigops_ratio = 0.95
+warn_coinbase_sigops_max = 400

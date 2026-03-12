@@ -1,0 +1,5 @@
+[manager]
+backend = "stratum"
+poll_interval_secs = 2
+stratum_addr = "127.0.0.1:3333"
+stratum_auth = "optional-token"
