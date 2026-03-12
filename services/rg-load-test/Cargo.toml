@@ -1,0 +1,25 @@
+[package]
+name = "rg-load-test"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "rg-load-test"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rg-protocol = { path = "../rg-protocol" }
+rand = "0.8"
+rand_chacha = "0.3"
+anyhow = "1"
+
+[lints]
+workspace = true

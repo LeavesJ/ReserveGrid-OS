@@ -1,0 +1,36 @@
+[package]
+name = "test-miner"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# Internal crate — reuse sv2_codec and transport types.
+sv2-gateway = { path = "../sv2-gateway" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# SV2 Noise NX initiator
+noise_sv2 = "1.4"
+
+# Crypto (secp256k1 for authority key parsing)
+secp256k1 = { version = "0.28", features = ["global-context", "rand"] }
+rand = "0.8"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+# Hex encoding
+hex = "0.4"
+
+# Error handling
+thiserror = "2"
