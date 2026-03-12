@@ -1,0 +1,60 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ReserveGrid OS — Forge Line design tokens */
+:root {
+  --amber: #d4943c;
+  --amber-light: #e8b060;
+  --amber-dim: #b07828;
+  --amber-glow: rgba(212,148,60,.35);
+  --amber-glow-sm: rgba(212,148,60,.15);
+  --navy: #080e1a;
+  --navy-mid: #0c1526;
+  --navy-light: #111d35;
+  --panel: #0f1520;
+  --panel-light: #1a2230;
+  --steel: #8899ad;
+  --steel-dim: #6b7d91;
+  --bg: #06090f;
+  --bg-alt: #0a0e18;
+  --ink: #e2e8f0;
+  --ink-muted: rgba(226,232,240,.6);
+  --ink-subtle: rgba(226,232,240,.35);
+  --border: rgba(226,232,240,.07);
+  --border-md: rgba(226,232,240,.11);
+  --border-bright: rgba(226,232,240,.18);
+  --success: #22c55e;
+  --warning: #f59e0b;
+  --error: #ef4444;
+  --sans: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --mono: 'IBM Plex Mono', 'SF Mono', ui-monospace, Menlo, Consolas, monospace;
+  --r-sm: 8px;
+  --r-md: 12px;
+  --r-lg: 16px;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { -webkit-font-smoothing: antialiased; }
+body {
+  font-family: var(--sans);
+  color: var(--ink);
+  background: var(--bg);
+  line-height: 1.6;
+}
+
+/* Scrollbar styling for Forge Line */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-bright);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--steel-dim);
+}

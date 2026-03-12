@@ -1,0 +1,26 @@
+[package]
+name = "rg-dashboard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "ReserveGrid OS operator dashboard — API aggregation proxy and embedded SPA"
+publish = false
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+tower = { version = "0.5", features = ["timeout"] }
+tower-http = { version = "0.6", features = ["cors", "compression-gzip", "set-header"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+rust-embed = { version = "8", features = ["compression"] }
+mime_guess = "2"
+http = "1"
+
+[lints]
+workspace = true
