@@ -1,0 +1,19 @@
+# Litestream — continuous SQLite replication to object storage.
+#
+# In production (Fly.io), set these secrets:
+#   LITESTREAM_ACCESS_KEY_ID
+#   LITESTREAM_SECRET_ACCESS_KEY
+#
+# The replica bucket/path should be unique per environment.
+# Litestream starts as PID 1, restores from the replica on boot,
+# then launches rg-auth as a subprocess.
+
+dbs:
+  - path: /data/auth.db
+    replicas:
+      - type: s3
+        bucket: ${LITESTREAM_REPLICA_BUCKET}
+        path: auth.db
+        endpoint: ${LITESTREAM_REPLICA_ENDPOINT}
+        region: ${LITESTREAM_REPLICA_REGION:-us-east-1}
+        sync-interval: 1s

@@ -1,0 +1,41 @@
+app = "rg-auth-veldra"
+primary_region = "sjc"
+
+[build]
+  dockerfile = "Dockerfile"
+  # Dockerfile expects workspace root as build context
+  # Deploy with: fly deploy --dockerfile services/rg-auth/Dockerfile .
+
+[env]
+  VELDRA_AUTH_ADDR = "0.0.0.0:3030"
+  VELDRA_AUTH_DB = "/data/auth.db"
+  VELDRA_AUTH_SITE_URL = "https://veldra.org"
+  VELDRA_AUTH_URL = "https://auth.veldra.org"
+  VELDRA_AUTH_ALLOWED_ORIGIN = "https://veldra.org"
+  VELDRA_AUTH_SESSION_TTL_HOURS = "168"
+
+# Litestream replication (secrets set via `fly secrets set`):
+#   LITESTREAM_REPLICA_BUCKET     — S3/R2 bucket name
+#   LITESTREAM_REPLICA_ENDPOINT   — S3-compatible endpoint (e.g. Cloudflare R2)
+#   LITESTREAM_REPLICA_REGION     — defaults to us-east-1
+#   LITESTREAM_ACCESS_KEY_ID      — S3/R2 access key
+#   LITESTREAM_SECRET_ACCESS_KEY  — S3/R2 secret key
+#
+# SMTP secrets (set via `fly secrets set`):
+#   VELDRA_AUTH_ADMIN_EMAIL
+#   VELDRA_AUTH_SMTP_HOST
+#   VELDRA_AUTH_SMTP_PORT
+#   VELDRA_AUTH_SMTP_USER
+#   VELDRA_AUTH_SMTP_PASS
+#   VELDRA_AUTH_SMTP_FROM
+
+[http_service]
+  internal_port = 3030
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+[mounts]
+  source = "auth_data"
+  destination = "/data"
