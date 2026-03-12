@@ -1,0 +1,32 @@
+# rg-feed-server default configuration
+#
+# Streams real mainnet Bitcoin template data to authenticated observe-mode
+# operators over WebSocket. Same NDJSON wire format as rg-demo-feed.
+
+[feed]
+# WebSocket listen address.
+listen = "0.0.0.0:9200"
+
+# bitcoind JSON-RPC endpoint.
+rpc_url = "http://127.0.0.1:8332"
+rpc_user = ""
+rpc_pass = ""
+
+# Polling interval for getblocktemplate / getmempoolinfo (milliseconds).
+poll_interval_ms = 3000
+
+# Heartbeat interval sent to idle clients (milliseconds).
+heartbeat_interval_ms = 15000
+
+# Broadcast channel capacity (buffered frames per client before lagging).
+channel_capacity = 64
+
+[auth]
+# Comma-separated list of valid license keys for local/dev use.
+# In production, set VELDRA_FEED_VALID_KEYS or use the auth_url endpoint.
+valid_keys = ""
+
+# Optional: rg-auth base URL for key validation.
+# When set, keys are validated via POST {auth_url}/api/keys/validate.
+# When empty, only the static valid_keys list is checked.
+auth_url = ""

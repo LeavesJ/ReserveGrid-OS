@@ -1,0 +1,7 @@
+# rg-feed-adapter config for shadow mode.
+# Connects to the public demo feed (no auth required).
+
+[adapter]
+listen = "127.0.0.1:18444"
+feed_url = "wss://demo.veldra.org/ws"
+license_key = ""

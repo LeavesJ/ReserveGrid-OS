@@ -1,0 +1,8 @@
+# rg-feed-adapter config for observe mode.
+# Connects to the authenticated mainnet reference feed.
+# Set VELDRA_FEED_LICENSE_KEY env var or fill in below.
+
+[adapter]
+listen = "127.0.0.1:18444"
+feed_url = "wss://feed.veldra.org/ws"
+license_key = ""
