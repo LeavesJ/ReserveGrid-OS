@@ -1,0 +1,25 @@
+# Shadow-mode template-manager configuration.
+# Connects to rg-feed-adapter (which translates rg-demo-feed WebSocket
+# into bitcoind JSON-RPC responses). No real bitcoind required.
+
+[manager]
+backend = "bitcoind"
+poll_interval_secs = 5
+
+# rg-feed-adapter impersonates bitcoind on port 18444.
+# No auth needed (demo feed is unauthenticated).
+# rpc_pass is required by template-manager's bitcoind client init;
+# the adapter ignores it, so any non-empty value satisfies the check.
+rpc_url = "http://rg-feed-adapter:18444"
+rpc_user = "demo"
+rpc_pass = "demo"
+
+# HTTP API and health endpoint.
+http_listen_addr = "0.0.0.0:8082"
+
+# Coinbase construction: OP_TRUE output (shadow mode never mines real blocks).
+coinbase_output_script_hex = "51"
+extranonce_size = 4
+
+# Verifier TCP connection (pool-verifier in the compose stack).
+verifier_tcp_addr = "pool-verifier:9090"

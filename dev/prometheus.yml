@@ -1,0 +1,18 @@
+# ReserveGrid OS Prometheus scrape config
+# Used by the `monitoring` profile in docker-compose.yml.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: sv2-gateway
+    static_configs:
+      - targets: ["sv2-gateway:8080"]
+
+  - job_name: pool-verifier
+    static_configs:
+      - targets: ["pool-verifier:8081"]
+
+  - job_name: template-manager
+    static_configs:
+      - targets: ["template-manager:8082"]

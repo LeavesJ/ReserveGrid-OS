@@ -1,0 +1,22 @@
+# Development template-manager configuration for docker-compose.
+# Connects to the bitcoind service in the compose stack.
+
+[manager]
+backend = "bitcoind"
+poll_interval_secs = 1
+
+# RPC credentials come from VELDRA_BITCOIND_RPC_USER / VELDRA_BITCOIND_RPC_PASS env vars.
+# Do not hardcode passwords in config files.
+rpc_url = "http://bitcoind:18443"
+rpc_user = "reservegrid"
+
+# HTTP API and health endpoint (must match docker-compose healthcheck port)
+http_listen_addr = "0.0.0.0:8082"
+
+# Coinbase construction: OP_TRUE output for regtest (any miner can spend).
+# For mainnet/testnet, replace with the pool payout scriptPubKey hex.
+coinbase_output_script_hex = "51"
+extranonce_size = 4
+
+# Verifier TCP connection (pool-verifier in the compose stack)
+verifier_tcp_addr = "pool-verifier:9090"

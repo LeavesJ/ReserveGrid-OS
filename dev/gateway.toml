@@ -1,0 +1,63 @@
+# Development gateway configuration for docker-compose.
+# Mode: override via VELDRA_GATEWAY_MODE env var.
+
+mode = "inline"
+
+[gateway]
+listen_addr = "0.0.0.0:3333"
+health_addr = "0.0.0.0:8080"
+max_connections = 1024
+max_channels_per_conn = 4
+noise_keypair_path = "/config/keys/noise.key"
+authority_pubkey = "9095236f0477b38d1dabc5a098de5f19da2b1400c67cb7b3fd15904b4b9ab7b8"
+noise_cert_validity_secs = 3600
+noise_handshake_timeout_ms = 10000
+template_poll_interval_ms = 1000
+max_template_age_ms = 30000
+prevhash_verdict_timeout_ms = 50
+prevhash_stale_hold_ms = 5000
+upstream_stale_max_ms = 30000
+upstream_failure_policy = "fail_open"
+job_retention_ms = 300000
+max_shares_per_second_per_channel = 100
+
+# Regtest: relax ntime elapsed window to 30s. In regtest the template curtime
+# from getblocktemplate can lag wall clock by several seconds (poll interval,
+# RPC latency, Docker clock granularity). Default of 2s is too tight.
+# Production should tune this per network conditions (mainnet: 10 to 30).
+ntime_elapsed_slack_seconds = 30
+
+# Regtest: all-FF target (every hash passes). Remove for mainnet.
+channel_target_hex = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+
+# noise_cert_path is reserved for forward compatibility. Per-connection certs
+# are generated at runtime from the authority keypair. Certificate rotation is
+# handled by reloading the keypair via SIGHUP or file poll.
+noise_cert_path = "/config/keys/noise_cert.bin"
+
+# Key rotation: SIGHUP (kill -HUP <pid>) reloads noise_keypair_path on the fly.
+# In containers without SIGHUP, set noise_keypair_poll_interval_secs > 0.
+noise_keypair_reload_sighup = true
+noise_keypair_poll_interval_secs = 0
+
+# Gateway instance ID for share tracing. Defaults to $HOSTNAME if omitted.
+gateway_instance_id = "dev-gateway-01"
+
+# Template manager HTTP base URL. When set, the gateway fetches block templates
+# from this endpoint. Falls back to VELDRA_TEMPLATE_URL env var if empty.
+template_url = "http://template-manager:8082"
+
+# Share forward WAL for crash-durable event delivery. Empty disables WAL.
+# In production, set to a persistent volume path (e.g., "/data/share_wal.ndjson").
+# wal_path = ""
+# wal_compaction_threshold = 1000
+
+[verifier]
+addr = "pool-verifier:9090"
+health_probe_staleness_ms = 15000
+
+[share_upstream]
+url = "http://template-manager:8082/shares"
+retries = 2
+forward_queue_size = 10000
+forward_max_in_flight = 64

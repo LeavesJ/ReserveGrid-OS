@@ -1,0 +1,70 @@
+[package]
+name = "sv2-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# Internal crates
+rg-protocol = { path = "../rg-protocol" }
+reservegrid-common = { path = "../reservegrid-common" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# SV2 protocol stack
+noise_sv2 = "1.4"
+codec_sv2 = { version = "4.0", features = ["noise_sv2"] }
+framing_sv2 = "6.0"
+mining_sv2 = "7.0"
+common_messages_sv2 = "6.0"
+const_sv2 = "4.0"
+
+# Crypto (secp256k1 for Noise NX authority key, rand for handshake RNG)
+secp256k1 = { version = "0.28", features = ["global-context", "rand", "hashes"] }
+rand = "0.8"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Logging and observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+# HTTP (health endpoints, upstream share relay)
+axum = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+http = "1"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Error handling
+thiserror = "2"
+
+# Crypto
+sha2 = "0.10"
+hmac = "0.12"
+
+# Hex encoding
+hex = "0.4"
+
+# TLS (verifier mTLS)
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+
+# Metrics
+prometheus-client = { workspace = true }
+
+# Misc
+uuid = { version = "1", features = ["v7"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+tower = { version = "0.5", features = ["util"] }

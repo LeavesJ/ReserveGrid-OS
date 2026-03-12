@@ -1,0 +1,22 @@
+# rg-feed-server configuration for observe mode compose stack.
+#
+# In observe mode the feed-server reads from rg-feed-adapter (which translates
+# rg-demo-feed WebSocket into bitcoind JSON-RPC). License keys are validated
+# against rg-auth dynamically.
+
+[feed]
+listen = "0.0.0.0:9200"
+
+# rg-feed-adapter impersonates bitcoind on port 18444 inside the compose network.
+rpc_url = "http://rg-feed-adapter:18444"
+rpc_user = ""
+rpc_pass = ""
+
+poll_interval_ms = 5000
+heartbeat_interval_ms = 15000
+channel_capacity = 64
+
+[auth]
+valid_keys = ""
+# Validate keys dynamically against rg-auth.
+auth_url = "http://rg-auth:3030"
