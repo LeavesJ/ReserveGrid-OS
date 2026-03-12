@@ -1,14 +1,25 @@
 # Contributing to ReserveGrid OS
 
-Thank you for your interest in contributing. This document covers the workflow,
-conventions, and quality gates that apply to all changes.
+ReserveGrid OS is released under the Veldra Source Available License v1.0,
+which restricts modification, derivative works, and redistribution. External
+contributions are accepted **by invitation only** and require written
+authorization from the project owner before any work begins.
 
-## Getting Started
+## How to Contribute
 
-1. Fork the repository
-2. Create a feature branch from `main`
-3. Make your changes
-4. Open a pull request against `main`
+1. Contact jarrondeng@veldra.org describing the change you would like to make
+2. Wait for written authorization before forking or modifying the codebase
+3. Once authorized, follow the workflow and conventions below
+
+Unsolicited pull requests from unauthorized contributors will be closed without
+review.
+
+## Authorized Contributor Workflow
+
+1. Fork the repository (only after written authorization)
+2. Create a feature branch from `dev`
+3. Make your changes following the conventions below
+4. Open a pull request against `dev`
 
 ## Development Setup
 
@@ -24,7 +35,7 @@ cargo build --workspace
 cargo test --workspace
 
 # Lint
-cargo clippy --workspace -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
@@ -54,14 +65,6 @@ Types: `feat`, `fix`, `refactor`, `test`, `docs`, `ci`, `style`, `perf`, `chore`
 Scope should be the crate name when applicable (e.g., `pool-verifier`,
 `sv2-gateway`, `rg-auth`).
 
-Examples:
-
-```
-feat(sv2-gateway): add per-channel share rate limiting
-fix(pool-verifier): handle empty coinbase transaction in template
-test(rg-auth): add rate limiter sliding window edge cases
-```
-
 ## Pull Request Requirements
 
 Every PR must:
@@ -70,7 +73,7 @@ Every PR must:
 2. Include tests for new behavior
 3. Not break existing tests
 4. Not introduce new clippy warnings
-5. Target `main` via a feature branch
+5. Target `dev` via a feature branch
 
 ## Code Conventions
 
@@ -99,7 +102,11 @@ Do not introduce `unsafe` code. The workspace denies it via lint config:
 unsafe_code = "deny"
 ```
 
-## License
+## Intellectual Property
 
-By contributing, you agree that your contributions will be licensed under the
-same license as the project (see [LICENSE](LICENSE)).
+By submitting a contribution, you grant Veldra, Inc. a perpetual, worldwide,
+irrevocable, royalty free, sublicensable license to use, reproduce, modify,
+distribute, and create derivative works from your contribution for any purpose,
+as described in Section 6 of the [LICENSE](LICENSE). You represent that you have
+the right to grant this license and that your contribution does not infringe any
+third party rights.
