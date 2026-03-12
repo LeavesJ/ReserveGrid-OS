@@ -1,0 +1,32 @@
+# ReserveGrid OS pre-commit hooks
+# Install: pip install pre-commit && pre-commit install
+# Run manually: pre-commit run --all-files
+repos:
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all --check
+        language: system
+        pass_filenames: false
+        types: [rust]
+
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --workspace --all-targets -- -D warnings
+        language: system
+        pass_filenames: false
+        types: [rust]
+
+      - id: toml-validate
+        name: validate TOML policy files
+        entry: python3 -c "import tomllib, sys; [tomllib.load(open(f,'rb')) for f in sys.argv[1:]]"
+        language: system
+        files: '\.toml$'
+        types: [file]
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      - id: gitleaks
+        name: gitleaks secrets scan

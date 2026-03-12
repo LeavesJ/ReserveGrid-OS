@@ -1,0 +1,501 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (pinned)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build frontend assets (rg-dashboard)
+        run: |
+          cd services/rg-dashboard/frontend
+          npm ci
+          npm run build
+
+      - name: Build
+        run: cargo build --workspace
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Advisory scan
+        run: cargo audit
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+
+      - name: License check
+        run: cargo deny check licenses
+
+      - name: Ban check
+        run: cargo deny check bans
+
+      - name: Source check
+        run: cargo deny check sources
+
+      - name: Advisory check
+        run: cargo deny check advisories
+
+  vet:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (pinned)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0
+
+      - name: Install cargo-vet
+        run: cargo install cargo-vet --locked
+
+      - name: Supply chain audit
+        run: cargo vet
+
+  integration:
+    runs-on: ubuntu-latest
+    needs: build-test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate dev Noise keypair (if absent)
+        run: bash dev/generate-dev-keys.sh
+
+      - name: Create test .env
+        run: |
+          cp .env.example .env
+          sed -i 's/^VELDRA_BITCOIND_RPC_PASS=.*/VELDRA_BITCOIND_RPC_PASS=ci_test_pass/' .env
+          grep -q '^VELDRA_BITCOIND_RPC_PASS=ci_test_pass$' .env || { echo "FATAL: rpc_pass injection failed"; exit 1; }
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
+          driver-opts: network=host
+
+      - name: Build images (cached)
+        uses: docker/bake-action@v5
+        with:
+          files: docker-compose.yml
+          load: true
+          set: |
+            *.cache-from=type=gha
+            *.cache-to=type=gha,mode=max
+
+      - name: Start stack (all profiles)
+        run: docker compose --profile test up -d
+        timeout-minutes: 5
+        env:
+          VELDRA_AUTH_RATE_LIMIT_MULTIPLIER: "100"
+
+      - name: Wait for infrastructure services to become healthy
+        run: |
+          healthy=false
+          for i in $(seq 1 120); do
+            if docker compose --profile test ps --format json | python3 -c "
+          import sys, json
+          services = [json.loads(l) for l in sys.stdin if l.strip()]
+          infra = [s for s in services if s.get('Service') != 'test-miner']
+          healthy = all(s.get('Health','') == 'healthy' for s in infra)
+          running = len(infra) >= 6
+          sys.exit(0 if healthy and running else 1)
+          " 2>/dev/null; then
+              echo "All infrastructure services healthy after ${i}s"
+              healthy=true
+              break
+            fi
+            sleep 1
+          done
+          if [ "$healthy" != "true" ]; then
+            echo "Services did not become healthy within 120s"
+            docker compose --profile test ps
+            docker compose --profile test logs --tail 30
+            exit 1
+          fi
+
+      - name: Seed regtest chain
+        run: |
+          # bitcoind starts with an empty regtest chain. getblocktemplate
+          # requires a wallet and at least one mature coinbase, so we create
+          # a wallet and mine 101 blocks. This feeds the template pipeline:
+          # bitcoind -> template-manager -> sv2-gateway -> test-miner.
+          BTC="docker compose exec -T bitcoind bitcoin-cli -regtest \
+            -rpcuser=reservegrid -rpcpassword=ci_test_pass"
+          $BTC createwallet "ci" >/dev/null
+          ADDR=$($BTC getnewaddress)
+          $BTC generatetoaddress 101 "$ADDR" >/dev/null
+          echo "Mined 101 blocks to $ADDR"
+
+      - name: Wait for test-miner to complete
+        run: |
+          # test-miner starts automatically after sv2-gateway is healthy
+          # (depends_on condition: service_healthy in docker-compose.yml).
+          # Wait for the container to appear, then wait for it to exit.
+          for i in $(seq 1 60); do
+            CONTAINER=$(docker compose --profile test ps -q test-miner 2>/dev/null)
+            if [ -n "$CONTAINER" ]; then
+              echo "test-miner container found: $CONTAINER"
+              break
+            fi
+            echo "Waiting for test-miner container to start (${i}s)..."
+            sleep 1
+          done
+          if [ -z "$CONTAINER" ]; then
+            echo "test-miner container never appeared"
+            docker compose --profile test ps
+            docker compose --profile test logs --tail 50
+            exit 1
+          fi
+          docker compose --profile test logs -f test-miner &
+          LOG_PID=$!
+          EXIT_CODE=$(docker wait "$CONTAINER")
+          kill $LOG_PID 2>/dev/null || true
+          echo "test-miner exited with code: $EXIT_CODE"
+          exit "$EXIT_CODE"
+        timeout-minutes: 3
+
+      - name: Verify all service endpoints
+        run: bash scripts/test-endpoints.sh
+
+      - name: Run inline mode smoke test
+        run: bash scripts/test-inline-mode.sh
+        env:
+          VELDRA_BITCOIND_RPC_PASS: ci_test_pass
+
+      - name: Run auth integration tests
+        run: |
+          AUTH_URL=http://localhost:3030 \
+          AUTH_CONTAINER=$(docker compose --profile test ps -q rg-auth) \
+          bash scripts/test-auth-flow.sh
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose --profile test logs --tail 100
+
+      - name: Tear down
+        if: always()
+        run: docker compose --profile test down -v
+
+  integration-shadow:
+    runs-on: ubuntu-latest
+    needs: build-test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
+          driver-opts: network=host
+
+      - name: Build shadow images (cached)
+        uses: docker/bake-action@v5
+        with:
+          files: docker-compose.shadow.yml
+          load: true
+          set: |
+            *.cache-from=type=gha
+            *.cache-to=type=gha,mode=max
+
+      - name: Start shadow stack
+        run: docker compose -f docker-compose.shadow.yml up -d
+        timeout-minutes: 5
+
+      - name: Wait for shadow services to become healthy
+        run: |
+          healthy=false
+          for i in $(seq 1 120); do
+            if docker compose -f docker-compose.shadow.yml ps --format json | python3 -c "
+          import sys, json
+          services = [json.loads(l) for l in sys.stdin if l.strip()]
+          healthy = all(s.get('Health','') == 'healthy' for s in services)
+          running = len(services) >= 6
+          sys.exit(0 if healthy and running else 1)
+          " 2>/dev/null; then
+              echo "All shadow services healthy after ${i}s"
+              healthy=true
+              break
+            fi
+            sleep 1
+          done
+          if [ "$healthy" != "true" ]; then
+            echo "Shadow services did not become healthy within 120s"
+            docker compose -f docker-compose.shadow.yml ps
+            docker compose -f docker-compose.shadow.yml logs --tail 30
+            exit 1
+          fi
+
+      - name: Verify template pipeline is flowing
+        run: |
+          # Poll the pool-verifier /stats endpoint to confirm it is
+          # receiving templates from the demo feed via the adapter.
+          # /health returns plain text "ok"; /stats returns JSON with
+          # a "total" field counting processed verdicts.
+          for i in $(seq 1 30); do
+            RESP=$(curl -sf http://localhost:8081/stats 2>/dev/null || echo "")
+            if echo "$RESP" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          sys.exit(0 if data.get('total', 0) > 0 else 1)
+          " 2>/dev/null; then
+              echo "Templates flowing after ${i}s"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "No templates received within 60s"
+          docker compose -f docker-compose.shadow.yml logs --tail 50
+          exit 1
+        timeout-minutes: 2
+
+      - name: Verify shadow mode settings
+        run: |
+          SETTINGS=$(curl -sf http://localhost:8081/settings)
+          echo "$SETTINGS" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          mode = data.get('deploy_mode', '')
+          assert mode == 'shadow', f'Expected shadow mode, got {mode}'
+          print('deploy_mode = shadow confirmed')
+          "
+
+      - name: Verify dashboard is reachable
+        run: curl -sf http://localhost:8084/healthz
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.shadow.yml logs --tail 100
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker-compose.shadow.yml down -v
+
+  integration-auth:
+    runs-on: ubuntu-latest
+    needs: build-test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate dev Noise keypair (if absent)
+        run: bash dev/generate-dev-keys.sh
+
+      - name: Create test .env
+        run: |
+          cp .env.example .env
+          sed -i 's/^VELDRA_BITCOIND_RPC_PASS=.*/VELDRA_BITCOIND_RPC_PASS=ci_test_pass/' .env
+          grep -q '^VELDRA_BITCOIND_RPC_PASS=ci_test_pass$' .env || { echo "FATAL: rpc_pass injection failed"; exit 1; }
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
+          driver-opts: network=host
+
+      - name: Build auth images (cached)
+        uses: docker/bake-action@v5
+        with:
+          files: docker-compose.yml
+          targets: rg-auth
+          load: true
+          set: |
+            *.cache-from=type=gha
+            *.cache-to=type=gha,mode=max
+
+      - name: Start rg-auth
+        run: docker compose up -d rg-auth
+        timeout-minutes: 3
+        env:
+          VELDRA_AUTH_RATE_LIMIT_MULTIPLIER: "100"
+
+      - name: Wait for rg-auth healthy
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:3030/auth/health >/dev/null 2>&1; then
+              echo "rg-auth healthy after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "rg-auth did not become healthy within 60s"
+          docker compose logs rg-auth --tail 30
+          exit 1
+
+      - name: Run auth integration tests
+        run: |
+          AUTH_URL=http://localhost:3030 \
+          AUTH_CONTAINER=$(docker compose ps -q rg-auth) \
+          bash scripts/test-auth-flow.sh
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose logs rg-auth --tail 100
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+  integration-observe:
+    runs-on: ubuntu-latest
+    needs: build-test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
+          driver-opts: network=host
+
+      - name: Build observe images (cached)
+        uses: docker/bake-action@v5
+        with:
+          files: docker-compose.observe.yml
+          load: true
+          set: |
+            *.cache-from=type=gha
+            *.cache-to=type=gha,mode=max
+
+      - name: Start observe stack
+        run: docker compose -f docker-compose.observe.yml up -d
+        timeout-minutes: 5
+
+      - name: Wait for observe services to become healthy
+        run: |
+          healthy=false
+          for i in $(seq 1 120); do
+            if docker compose -f docker-compose.observe.yml ps --format json | python3 -c "
+          import sys, json
+          services = [json.loads(l) for l in sys.stdin if l.strip()]
+          healthy = all(s.get('Health','') == 'healthy' for s in services)
+          running = len(services) >= 7
+          sys.exit(0 if healthy and running else 1)
+          " 2>/dev/null; then
+              echo "All observe services healthy after ${i}s"
+              healthy=true
+              break
+            fi
+            sleep 1
+          done
+          if [ "$healthy" != "true" ]; then
+            echo "Observe services did not become healthy within 120s"
+            docker compose -f docker-compose.observe.yml ps
+            docker compose -f docker-compose.observe.yml logs --tail 30
+            exit 1
+          fi
+
+      - name: Run observe mode smoke tests
+        run: bash scripts/test-observe-mode.sh
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.observe.yml logs --tail 100
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker-compose.observe.yml down -v
+
+  docker-images:
+    runs-on: ubuntu-latest
+    needs: [build-test, integration, integration-shadow, integration-auth, integration-observe]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        service:
+          - pool-verifier
+          - template-manager
+          - sv2-gateway
+          - rg-auth
+          - rg-dashboard
+          - rg-demo-feed
+          - rg-feed-adapter
+          - rg-feed-server
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}/${{ matrix.service }}
+          tags: |
+            type=sha,prefix=
+            type=raw,value=latest
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: services/${{ matrix.service }}/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,scope=${{ matrix.service }},mode=max
+
+  secrets-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

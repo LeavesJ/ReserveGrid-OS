@@ -1,0 +1,23 @@
+# Gitleaks configuration — allowlist for false positives.
+#
+# The gitleaks-action in CI reads this file automatically.
+# Only add entries here for verified false positives (placeholder values,
+# schema definitions, example configs). Never allowlist real secrets.
+
+title = "ReserveGrid OS gitleaks config"
+
+[allowlist]
+  description = "False positives on example configs and schema definitions"
+
+  paths = [
+    # Production env template contains TODO placeholders, not real credentials.
+    "deploy/env\\.prod\\.example",
+    # Dev env template contains default regtest credentials, not production secrets.
+    "\\.env\\.example",
+  ]
+
+  regexTarget = "line"
+  regexes = [
+    # SQL DDL column definitions named 'password', 'key_value', 'token', etc.
+    '''(?i)(CREATE TABLE|TEXT\s+NOT NULL|INTEGER PRIMARY KEY|INSERT INTO|SELECT .* FROM|UPDATE .* SET)\b''',
+  ]
