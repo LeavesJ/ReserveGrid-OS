@@ -76,7 +76,8 @@ pdf-export/
 TEST_COVERAGE_AUDIT.md
 /Dockerfile
 
-# Website lives in LeavesJ/veldra-site
+# Website lives in LeavesJ/veldra-site (cloned locally as veldra-site/)
+veldra-site/
 veldra-site-v3/
 
 # Release note drafts (consumed by gh release create, not tracked)
