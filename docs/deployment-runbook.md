@@ -292,10 +292,21 @@ curl -s --user "$VELDRA_BITCOIND_RPC_USER:$VELDRA_BITCOIND_RPC_PASS" \
 
 ## Step 6: Start the Stack
 
+**Important:** Grafana (port 3000) and Prometheus (port 9091) are on the
+`monitoring` Docker Compose profile. A plain `docker compose up` will not
+start them. You must pass `--profile monitoring` to include the observability
+stack.
+
 ```bash
-# Inline mode with monitoring
+# Inline mode with monitoring (production)
 docker compose -f docker-compose.yml -f docker-compose.prod.yml \
   --profile monitoring up --build -d
+
+# Development (no prod overlay, with monitoring)
+docker compose --profile monitoring up --build -d
+
+# Development (core services only, no monitoring)
+docker compose up --build -d
 ```
 
 Watch the logs during first startup:
@@ -311,8 +322,8 @@ What to look for in a healthy startup sequence:
 3. `template-manager` logs first template received from bitcoind
 4. `sv2-gateway` logs `listening for miners on 0.0.0.0:3333`
 5. `rg-dashboard` logs `serving on 0.0.0.0:8084`
-6. `prometheus` begins scraping (check `http://localhost:9091/targets`)
-7. `grafana` loads the provisioned dashboard (check `http://localhost:3000`)
+6. `prometheus` begins scraping (check `http://localhost:9091/targets`) — requires `--profile monitoring`
+7. `grafana` loads the provisioned dashboard (check `http://localhost:3000`) — requires `--profile monitoring`
 
 ---
 

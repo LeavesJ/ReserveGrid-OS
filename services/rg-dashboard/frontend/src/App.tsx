@@ -16,6 +16,7 @@ import {
   register, verifyEmail,
   forgotPassword, resetPassword,
 } from "./hooks/useApi";
+import { isTauri, tauriFetch, getLicenseStatus, setLicenseKey, clearLicense } from "./tauri-bridge";
 import type {
   ServiceHealth, VerdictStats, Verdict, PolicyConfig,
   LatestTemplate, MempoolStats, DeployMode, ModeCapabilities,
@@ -1422,6 +1423,267 @@ function SettingsPage({ caps }: { caps: ModeCapabilities }) {
 
 /* ── Login page ── */
 
+/* ── License key onboarding (Tauri native client) ── */
+
+type OnboardingStep = "license" | "connect";
+
+interface ServiceProbe {
+  name: string;
+  status: "checking" | "ok" | "down";
+  latency_ms?: number;
+}
+
+function LicenseGate({ onValidated }: { onValidated: () => void }) {
+  const [step, setStep] = useState<OnboardingStep>("license");
+  const [key, setKey] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [services, setServices] = useState<ServiceProbe[]>([]);
+  const [probing, setProbing] = useState(false);
+  const probeInterval = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // On mount, check if a valid license already exists.
+  useEffect(() => {
+    getLicenseStatus().then((status) => {
+      if (status.valid) {
+        setStep("connect");
+      }
+      setLoading(false);
+    }).catch(() => setLoading(false));
+  }, []);
+
+  // When entering the connect step, start probing services.
+  useEffect(() => {
+    if (step !== "connect") return;
+
+    const probe = async () => {
+      setProbing(true);
+      try {
+        const resp = await tauriFetch("/api/health");
+        if (resp.ok) {
+          const data = await resp.json() as { services: Array<{ name: string; status: string; latency_ms: number }> };
+          setServices(data.services.map((s) => ({
+            name: s.name,
+            status: s.status === "ok" ? "ok" : "down",
+            latency_ms: s.latency_ms,
+          })));
+        } else {
+          setServices([
+            { name: "pool-verifier", status: "down" },
+            { name: "template-manager", status: "down" },
+          ]);
+        }
+      } catch {
+        setServices([
+          { name: "pool-verifier", status: "down" },
+          { name: "template-manager", status: "down" },
+        ]);
+      }
+      setProbing(false);
+    };
+
+    probe();
+    probeInterval.current = setInterval(probe, 5000);
+    return () => {
+      if (probeInterval.current) clearInterval(probeInterval.current);
+    };
+  }, [step]);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const trimmed = key.trim();
+    if (!trimmed) return;
+    setChecking(true);
+    setError(null);
+    try {
+      const result = await setLicenseKey(trimmed);
+      if (result.ok) {
+        setStep("connect");
+      } else {
+        setError("Invalid license key. Check the key and try again.");
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Validation failed");
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  const coreReady = services.some((s) => s.name === "pool-verifier" && s.status === "ok")
+    && services.some((s) => s.name === "template-manager" && s.status === "ok");
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center min-h-screen" style={{ background: V.bg }}>
+        <Loader2 className="animate-spin" style={{ color: V.amber }} size={32} />
+      </div>
+    );
+  }
+
+  /* ── Step 2: Service connection check ── */
+  if (step === "connect") {
+    return (
+      <div className="flex items-center justify-center min-h-screen" style={{ background: V.bg }}>
+        <div className="w-full max-w-md p-8 rounded-lg" style={{ background: V.panel, border: `1px solid ${V.border}` }}>
+          <div className="mb-6 text-center">
+            <h1 className="text-lg font-semibold tracking-wide" style={{ color: V.amber }}>
+              ReserveGrid OS
+            </h1>
+            <p className="mt-1 text-xs" style={{ color: V.steelDim }}>
+              Connecting to backend services
+            </p>
+          </div>
+
+          <div className="space-y-3 mb-6">
+            {services.length === 0 && probing && (
+              <div className="flex items-center gap-3 text-sm" style={{ color: V.steel }}>
+                <Loader2 className="animate-spin shrink-0" size={14} style={{ color: V.amber }} />
+                <span>Checking services...</span>
+              </div>
+            )}
+            {services.map((s) => (
+              <div key={s.name} className="flex items-center justify-between text-sm">
+                <div className="flex items-center gap-2">
+                  <StatusDot status={s.status === "ok" ? "ok" : "down"} />
+                  <span style={{ color: V.ink }}>{s.name}</span>
+                </div>
+                <span className="text-xs" style={{ color: V.steelDim }}>
+                  {s.status === "ok" && s.latency_ms !== undefined
+                    ? `${s.latency_ms}ms`
+                    : s.status === "down" ? "unreachable" : ""}
+                </span>
+              </div>
+            ))}
+          </div>
+
+          {!coreReady && services.length > 0 && (
+            <div className="mb-4 p-3 rounded text-xs" style={{ background: V.bgAlt, border: `1px solid ${V.border}`, color: V.steel }}>
+              <p className="mb-1" style={{ color: V.warning }}>Backend services not detected</p>
+              <p>Start the compose stack:</p>
+              <code className="block mt-1 px-2 py-1 rounded text-xs" style={{ background: V.bg, color: V.amber, fontFamily: "var(--mono)" }}>
+                docker compose up -d
+              </code>
+            </div>
+          )}
+
+          <button
+            onClick={() => {
+              if (probeInterval.current) clearInterval(probeInterval.current);
+              onValidated();
+            }}
+            disabled={!coreReady && services.length > 0 && !probing}
+            className="w-full py-2 rounded text-sm font-medium transition-opacity"
+            style={{
+              background: coreReady ? V.amber : V.steelDim,
+              color: V.bg,
+              opacity: coreReady ? 1 : 0.5,
+              cursor: coreReady ? "pointer" : "not-allowed",
+            }}
+          >
+            {coreReady ? "Open Dashboard" : "Waiting for services\u2026"}
+          </button>
+
+          {coreReady && (
+            <p className="mt-3 text-center text-xs" style={{ color: V.success }}>
+              <CheckCircle className="inline mr-1" size={12} />
+              Core services online
+            </p>
+          )}
+
+          <div className="mt-4 pt-3 text-center" style={{ borderTop: `1px solid ${V.border}` }}>
+            <button
+              onClick={() => {
+                if (probeInterval.current) clearInterval(probeInterval.current);
+                onValidated();
+              }}
+              className="text-xs underline"
+              style={{ color: V.steelDim }}
+            >
+              Skip and open dashboard anyway
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  /* ── Step 1: License key entry ── */
+  return (
+    <div className="flex items-center justify-center min-h-screen" style={{ background: V.bg }}>
+      <form
+        onSubmit={handleSubmit}
+        className="w-full max-w-md p-8 rounded-lg"
+        style={{ background: V.panel, border: `1px solid ${V.border}` }}
+      >
+        <div className="mb-6 text-center">
+          <h1 className="text-lg font-semibold tracking-wide" style={{ color: V.amber }}>
+            ReserveGrid OS
+          </h1>
+          <p className="mt-1 text-xs" style={{ color: V.steelDim }}>
+            Enter your license key to get started
+          </p>
+        </div>
+
+        <label className="block mb-1 text-xs" style={{ color: V.steel }}>License Key</label>
+        <input
+          type="text"
+          required
+          autoFocus
+          value={key}
+          onChange={(e) => setKey(e.target.value)}
+          disabled={checking}
+          placeholder="veldra_lic_..."
+          className="w-full px-3 py-2 mb-2 rounded text-sm outline-none"
+          style={{
+            background: V.bgAlt,
+            border: `1px solid ${V.borderMd}`,
+            color: V.ink,
+            fontFamily: "var(--mono)",
+          }}
+        />
+        <p className="mb-4 text-xs" style={{ color: V.steelDim }}>
+          Get your key from{" "}
+          <a
+            href="https://veldra.org/account"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="underline"
+            style={{ color: V.amber }}
+          >
+            veldra.org/account
+          </a>
+        </p>
+
+        {error && (
+          <p className="mb-4 text-xs" style={{ color: V.error }}>{error}</p>
+        )}
+
+        <button
+          type="submit"
+          disabled={checking}
+          className="w-full py-2 rounded text-sm font-medium transition-opacity"
+          style={{
+            background: V.amber,
+            color: V.bg,
+            opacity: checking ? 0.6 : 1,
+            cursor: checking ? "wait" : "pointer",
+          }}
+        >
+          {checking ? "Validating\u2026" : "Activate"}
+        </button>
+
+        <div className="mt-6 pt-4 text-center" style={{ borderTop: `1px solid ${V.border}` }}>
+          <div className="flex items-center justify-center gap-2 text-xs" style={{ color: V.steelDim }}>
+            <KeyRound size={12} />
+            <span>Validated offline. No account required.</span>
+          </div>
+        </div>
+      </form>
+    </div>
+  );
+}
+
 function LoginPage({ onLogin, loading, error, onRegister, onForgot }: {
   onLogin: (email: string, password: string) => Promise<void>;
   loading: boolean;
@@ -1965,7 +2227,33 @@ function ResetPasswordPage({ token, onBack }: { token: string; onBack: () => voi
 
 type AuthView = "login" | "register" | "verify" | "forgot" | "reset";
 
+/**
+ * App entry point. Two code paths:
+ *
+ * Tauri (native client): LicenseGate validates the license key on startup.
+ *   Once valid, renders Dashboard directly with a stub user (no auth service).
+ *
+ * Browser (rg-dashboard fallback): existing login/register/verify flow via
+ *   useSession() and rg-auth.
+ */
 export default function App() {
+  const [licensed, setLicensed] = useState(false);
+
+  // Tauri path: license key gate, no auth service.
+  if (isTauri()) {
+    if (!licensed) {
+      return <LicenseGate onValidated={() => setLicensed(true)} />;
+    }
+    const stubUser = { name: "Operator", email: "", org: "" };
+    return <Dashboard user={stubUser} onLogout={async () => { await clearLicense(); setLicensed(false); }} />;
+  }
+
+  // Browser path: existing auth flow via rg-auth.
+  return <BrowserAuthApp />;
+}
+
+/** Browser-only auth wrapper (preserves the original login flow). */
+function BrowserAuthApp() {
   const { user, login, logout, loading: authLoading, error: authError } = useSession();
   const [authView, setAuthView] = useState<AuthView>(() => {
     const params = new URLSearchParams(window.location.search);
@@ -2000,8 +2288,11 @@ function Dashboard({ user, onLogout }: { user: { name: string; email: string; or
   const { template, live: templateLive } = useLatestTemplate();
   const { mempool, live: mempoolLive } = useMempool();
 
+  const { settings: verifierSettings } = useVerifierSettings();
   const { settings: dashSettings } = useDashboardSettings();
-  const deployMode: DeployMode = dashSettings.deploy_mode ?? "shadow";
+  // Source of truth for deploy mode is the verifier's own config, not the
+  // dashboard env var (which defaults to "shadow" and drifts in Tauri).
+  const deployMode: DeployMode = verifierSettings.deploy_mode ?? dashSettings.deploy_mode ?? "shadow";
   const caps = modeCapabilities(deployMode);
   const visibleNav = NAV.filter((item) => {
     if (item.id === "miners" && !caps.canViewMiners) return false;

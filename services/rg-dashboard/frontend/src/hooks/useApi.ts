@@ -3,9 +3,14 @@
  *
  * Each hook fetches on a fixed interval and falls back to mock data
  * when the backend is unreachable so the SPA renders during development.
+ *
+ * When running inside the Tauri desktop client, all fetch calls route
+ * through IPC commands instead of HTTP. The `tauriFetch` adapter handles
+ * this transparently.
  */
 
 import { useState, useEffect, useRef, useCallback } from "react";
+import { tauriFetch } from "../tauri-bridge";
 import type {
   HealthResponse, ServiceHealth, VerdictStats,
   Verdict, PolicyConfig, MempoolStats, LatestTemplate,
@@ -42,7 +47,7 @@ async function fetchJson<T>(url: string, timeoutMs = 5000): Promise<T | null> {
   try {
     const ctrl = new AbortController();
     const id = setTimeout(() => ctrl.abort(), timeoutMs);
-    const resp = await fetch(url, { headers: authHeaders(), signal: ctrl.signal });
+    const resp = await tauriFetch(url, { headers: authHeaders(), signal: ctrl.signal });
     clearTimeout(id);
     if (resp.status === 401) { _onUnauthorized?.(); return null; }
     if (!resp.ok) return null;
@@ -56,7 +61,7 @@ async function postJson<T>(url: string, body: unknown, timeoutMs = 5000): Promis
   try {
     const ctrl = new AbortController();
     const id = setTimeout(() => ctrl.abort(), timeoutMs);
-    const resp = await fetch(url, {
+    const resp = await tauriFetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...authHeaders() },
       body: JSON.stringify(body),
@@ -383,7 +388,7 @@ export async function register(
   try {
     const ctrl = new AbortController();
     const id = setTimeout(() => ctrl.abort(), 10_000);
-    const resp = await fetch("/api/auth/register", {
+    const resp = await tauriFetch("/api/auth/register", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ email, name, org, password }),
@@ -400,7 +405,7 @@ export async function register(
 
 export async function verifyEmail(token: string): Promise<{ ok: boolean; message: string }> {
   try {
-    const resp = await fetch(`/api/auth/verify?token=${encodeURIComponent(token)}`);
+    const resp = await tauriFetch(`/api/auth/verify?token=${encodeURIComponent(token)}`);
     const body = await resp.json().catch(() => null) as { ok?: boolean; message?: string; detail?: string } | null;
     if (resp.ok && body?.ok) return { ok: true, message: body.message ?? "Email verified." };
     return { ok: false, message: body?.detail ?? body?.message ?? "Verification failed" };
@@ -423,7 +428,7 @@ export async function resetPassword(token: string, password: string): Promise<{ 
   try {
     const ctrl = new AbortController();
     const id = setTimeout(() => ctrl.abort(), 10_000);
-    const resp = await fetch("/api/auth/reset-password", {
+    const resp = await tauriFetch("/api/auth/reset-password", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ token, password }),
@@ -467,7 +472,7 @@ export function useSession(): {
     try {
       const ctrl = new AbortController();
       const id = setTimeout(() => ctrl.abort(), 10_000);
-      const resp = await fetch("/api/auth/login", {
+      const resp = await tauriFetch("/api/auth/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email, password }),
@@ -497,7 +502,7 @@ export function useSession(): {
     const token = getAuthToken();
     clearSession();
     if (token) {
-      fetch("/api/auth/logout", {
+      tauriFetch("/api/auth/logout", {
         method: "POST",
         headers: { Authorization: `Bearer ${token}` },
       }).catch(() => {});
