@@ -1,0 +1,65 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nickalcala/tauri-releases/main/schema/2.0.0/tauri.conf.json",
+  "productName": "ReserveGrid",
+  "identifier": "com.veldra.reservegrid",
+  "version": "1.0.1",
+  "build": {
+    "frontendDist": "../rg-dashboard/frontend/dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": {
+      "script": "npm run dev",
+      "cwd": "../rg-dashboard/frontend"
+    },
+    "beforeBuildCommand": {
+      "script": "npm run build",
+      "cwd": "../rg-dashboard/frontend"
+    }
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "ReserveGrid OS",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 1024,
+        "minHeight": 700,
+        "resizable": true,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' http://localhost:* http://127.0.0.1:*"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "10.15"
+    },
+    "linux": {
+      "deb": {
+        "depends": ["libwebkit2gtk-4.1-0", "libgtk-3-0"]
+      },
+      "appimage": {
+        "bundleMediaFramework": false
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/LeavesJ/veldra/releases/latest/download/update.json"
+      ],
+      "pubkey": ""
+    }
+  }
+}

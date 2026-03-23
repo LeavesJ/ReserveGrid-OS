@@ -1,0 +1,208 @@
+name: Release Desktop
+
+# Triggered by pushing a version tag like v1.0.1.
+# Builds macOS (universal) and Linux (x86_64) installers,
+# then publishes them to a GitHub Release with a Tauri
+# auto-update manifest.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version tag to build (e.g. v1.0.1)"
+        required: true
+
+permissions:
+  contents: write  # create/edit releases
+
+env:
+  RUST_TOOLCHAIN: "1.92.0"
+  NODE_VERSION: "20"
+  TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+  TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: macos-latest
+            rust_target: aarch64-apple-darwin
+            label: macos-arm64
+          - platform: macos-13
+            rust_target: x86_64-apple-darwin
+            label: macos-x86_64
+          - platform: ubuntu-22.04
+            rust_target: x86_64-unknown-linux-gnu
+            label: linux-x86_64
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.rust_target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.label }}
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # Linux system dependencies required by Tauri / WebKitGTK.
+      - name: Install Linux dependencies
+        if: startsWith(matrix.platform, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libgtk-3-dev \
+            libssl-dev
+
+      - name: Install frontend dependencies
+        working-directory: services/rg-dashboard/frontend
+        run: npm ci
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: Build desktop app
+        working-directory: services/rg-desktop
+        run: cargo tauri build --target ${{ matrix.rust_target }}
+
+      # Collect platform-specific artifacts into a known directory.
+      - name: Collect artifacts (macOS)
+        if: startsWith(matrix.platform, 'macos')
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.rust_target }}/release/bundle/dmg/*.dmg dist/ || true
+          cp target/${{ matrix.rust_target }}/release/bundle/macos/*.app.tar.gz dist/ || true
+          cp target/${{ matrix.rust_target }}/release/bundle/macos/*.app.tar.gz.sig dist/ || true
+
+      - name: Collect artifacts (Linux)
+        if: startsWith(matrix.platform, 'ubuntu')
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.rust_target }}/release/bundle/appimage/*.AppImage dist/ || true
+          cp target/${{ matrix.rust_target }}/release/bundle/appimage/*.AppImage.tar.gz dist/ || true
+          cp target/${{ matrix.rust_target }}/release/bundle/appimage/*.AppImage.tar.gz.sig dist/ || true
+          cp target/${{ matrix.rust_target }}/release/bundle/deb/*.deb dist/ || true
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.label }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lhR artifacts/
+
+      - name: Resolve version tag
+        id: tag
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            echo "version=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Generate the Tauri updater manifest (update.json) that the
+      # desktop client polls for new versions.
+      - name: Generate update manifest
+        run: |
+          VERSION="${{ steps.tag.outputs.version }}"
+          REPO="${{ github.repository }}"
+          BASE_URL="https://github.com/${REPO}/releases/download/${VERSION}"
+
+          # Read signatures from .sig files if they exist.
+          MAC_ARM_SIG=""
+          MAC_X86_SIG=""
+          LINUX_SIG=""
+          for f in artifacts/*.app.tar.gz.sig; do
+            if echo "$f" | grep -q "aarch64\|arm64"; then
+              MAC_ARM_SIG=$(cat "$f" 2>/dev/null || echo "")
+            else
+              MAC_X86_SIG=$(cat "$f" 2>/dev/null || echo "")
+            fi
+          done
+          for f in artifacts/*.AppImage.tar.gz.sig; do
+            LINUX_SIG=$(cat "$f" 2>/dev/null || echo "")
+          done
+
+          # Find actual filenames.
+          MAC_ARM_TAR=$(cd artifacts && ls *aarch64*app.tar.gz 2>/dev/null | head -1 || echo "")
+          MAC_X86_TAR=$(cd artifacts && ls *x86_64*app.tar.gz 2>/dev/null | head -1 || echo "")
+          LINUX_TAR=$(cd artifacts && ls *.AppImage.tar.gz 2>/dev/null | head -1 || echo "")
+
+          cat > artifacts/update.json << MANIFEST
+          {
+            "version": "${VERSION}",
+            "notes": "ReserveGrid OS ${VERSION}",
+            "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "platforms": {
+              "darwin-aarch64": {
+                "signature": "${MAC_ARM_SIG}",
+                "url": "${BASE_URL}/${MAC_ARM_TAR}"
+              },
+              "darwin-x86_64": {
+                "signature": "${MAC_X86_SIG}",
+                "url": "${BASE_URL}/${MAC_X86_TAR}"
+              },
+              "linux-x86_64": {
+                "signature": "${LINUX_SIG}",
+                "url": "${BASE_URL}/${LINUX_TAR}"
+              }
+            }
+          }
+          MANIFEST
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.version }}
+          name: "ReserveGrid OS ${{ steps.tag.outputs.version }}"
+          body: |
+            ## ReserveGrid OS ${{ steps.tag.outputs.version }}
+
+            ### Downloads
+            | Platform | File |
+            |----------|------|
+            | macOS (Apple Silicon) | `.dmg` |
+            | macOS (Intel) | `.dmg` |
+            | Linux (x86_64) | `.AppImage` / `.deb` |
+
+            ### Auto-update
+            Existing installations will update automatically via the built-in updater.
+          draft: false
+          prerelease: false
+          files: artifacts/*
+          fail_on_unmatched_files: false
