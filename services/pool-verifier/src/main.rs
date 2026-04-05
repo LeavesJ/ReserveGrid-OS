@@ -109,7 +109,10 @@ fn enforce_api_secret() {
     }
 }
 
-fn init_metrics() -> (reservegrid_common::metrics::SharedRegistry, Arc<metrics::VerifierMetrics>) {
+fn init_metrics() -> (
+    reservegrid_common::metrics::SharedRegistry,
+    Arc<metrics::VerifierMetrics>,
+) {
     let mut registry = prometheus_client::registry::Registry::default();
     let verifier_metrics = Arc::new(metrics::VerifierMetrics::new_registered(&mut registry));
     let shared: reservegrid_common::metrics::SharedRegistry = Arc::new(registry);
