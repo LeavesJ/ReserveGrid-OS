@@ -501,32 +501,25 @@ pub fn validate(config: &GatewayConfig) -> Result<Vec<String>, String> {
     if config.gateway.prevhash_verdict_timeout_ms == 0 {
         return Err("prevhash_verdict_timeout_ms must be > 0".to_string());
     }
-    if config.gateway.prevhash_verdict_timeout_ms
-        >= config.gateway.prevhash_stale_hold_ms
-    {
+    if config.gateway.prevhash_verdict_timeout_ms >= config.gateway.prevhash_stale_hold_ms {
         return Err(format!(
             "prevhash_verdict_timeout_ms ({}) must be < prevhash_stale_hold_ms ({}); \
              the verdict must arrive before the stale hold expires",
-            config.gateway.prevhash_verdict_timeout_ms,
-            config.gateway.prevhash_stale_hold_ms,
+            config.gateway.prevhash_verdict_timeout_ms, config.gateway.prevhash_stale_hold_ms,
         ));
     }
-    if config.gateway.prevhash_stale_hold_ms
-        >= config.gateway.upstream_stale_max_ms
-    {
+    if config.gateway.prevhash_stale_hold_ms >= config.gateway.upstream_stale_max_ms {
         return Err(format!(
             "prevhash_stale_hold_ms ({}) must be < upstream_stale_max_ms ({}); \
              the stale hold must finish before the upstream is declared dead",
-            config.gateway.prevhash_stale_hold_ms,
-            config.gateway.upstream_stale_max_ms,
+            config.gateway.prevhash_stale_hold_ms, config.gateway.upstream_stale_max_ms,
         ));
     }
     if config.gateway.job_retention_ms < config.gateway.upstream_stale_max_ms {
         return Err(format!(
             "job_retention_ms ({}) must be >= upstream_stale_max_ms ({}); \
              jobs must outlive upstream staleness detection",
-            config.gateway.job_retention_ms,
-            config.gateway.upstream_stale_max_ms,
+            config.gateway.job_retention_ms, config.gateway.upstream_stale_max_ms,
         ));
     }
     if config.verifier.health_probe_staleness_ms == 0 {
