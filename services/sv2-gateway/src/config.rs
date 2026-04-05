@@ -421,14 +421,9 @@ fn is_loopback_addr(addr: &str) -> bool {
     host == "localhost"
 }
 
-/// Validate configuration at startup. Returns a list of warnings
-/// (non-fatal) and an error if anything is invalid.
 /// Timing invariant chain:
 /// `verdict_timeout < stale_hold < upstream_stale_max <= job_retention`
-fn validate_timing_chain(
-    config: &GatewayConfig,
-    warnings: &mut Vec<String>,
-) -> Result<(), String> {
+fn validate_timing_chain(config: &GatewayConfig, warnings: &mut Vec<String>) -> Result<(), String> {
     if config.gateway.prevhash_verdict_timeout_ms == 0 {
         return Err("prevhash_verdict_timeout_ms must be > 0".to_string());
     }
@@ -467,10 +462,7 @@ fn validate_timing_chain(
 }
 
 /// Verifier TLS field consistency and remote security enforcement.
-fn validate_verifier_security(
-    config: &GatewayConfig,
-    warnings: &mut Vec<String>,
-) -> Result<(), String> {
+fn validate_verifier_security(config: &GatewayConfig, warnings: &mut Vec<String>) -> Result<(), String> {
     if config.verifier.tls_ca_cert.is_some()
         && (config.verifier.tls_client_cert.is_none() || config.verifier.tls_client_key.is_none())
     {
@@ -511,6 +503,8 @@ fn validate_verifier_security(
     Ok(())
 }
 
+/// Validate configuration at startup. Returns a list of warnings
+/// (non-fatal) and an error if anything is invalid.
 pub fn validate(config: &GatewayConfig) -> Result<Vec<String>, String> {
     let mut warnings = Vec::new();
 
