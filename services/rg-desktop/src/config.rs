@@ -175,10 +175,7 @@ impl DesktopConfig {
             toml::value::Table::new()
         };
 
-        table.insert(
-            "license_key".into(),
-            toml::Value::String(key.to_string()),
-        );
+        table.insert("license_key".into(), toml::Value::String(key.to_string()));
 
         let output = toml::to_string_pretty(&table).map_err(|e| ConfigError::Serialize {
             path: path.display().to_string(),
