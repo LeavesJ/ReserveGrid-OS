@@ -731,7 +731,7 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                 "failed to bind health server; continuing without health endpoint",
             );
         }
-    };
+    }
 
     // ── 2. Connect to verifier NDJSON stream ──
     let (verifier_outbound_tx, verifier_outbound_rx) = mpsc::channel::<VerifierOutbound>(256);
@@ -1290,20 +1290,20 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                     // WAL: track accepted shares that require a forward result.
                     // Must complete before downstream SV2 ACK so a crash
                     // between here and the forward result is recoverable.
-                    if evt.sv2_response == "success" {
-                        if let Some(ref wal) = share_wal {
-                            let wal = Arc::clone(wal);
-                            let sid = evt.share_id_hex.clone();
-                            let eid = evt.event_id_hex.clone();
-                            let _ = tokio::task::spawn_blocking(move || {
-                                if let Ok(mut w) = wal.lock() {
-                                    w.mark_pending(&sid, &eid);
-                                } else {
-                                    error!("wal: mutex poisoned in mark_pending");
-                                }
-                            })
-                            .await;
-                        }
+                    if evt.sv2_response == "success"
+                        && let Some(ref wal) = share_wal
+                    {
+                        let wal = Arc::clone(wal);
+                        let sid = evt.share_id_hex.clone();
+                        let eid = evt.event_id_hex.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            if let Ok(mut w) = wal.lock() {
+                                w.mark_pending(&sid, &eid);
+                            } else {
+                                error!("wal: mutex poisoned in mark_pending");
+                            }
+                        })
+                        .await;
                     }
                     if let Ok(line) = serde_json::to_string(&evt) {
                         info!(target: "share_events", "{}", line);
