@@ -137,11 +137,14 @@ jobs:
             *.cache-from=type=gha
             *.cache-to=type=gha,mode=max
 
+      - name: Inject test env overrides
+        run: |
+          sed -i 's/^VELDRA_LICENSE_SIGNING_KEY=.*/VELDRA_LICENSE_SIGNING_KEY=KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio/' .env
+          sed -i 's/^VELDRA_AUTH_RATE_LIMIT_MULTIPLIER=.*/VELDRA_AUTH_RATE_LIMIT_MULTIPLIER=100/' .env
+
       - name: Start stack (all profiles)
         run: docker compose --profile test up -d
         timeout-minutes: 5
-        env:
-          VELDRA_AUTH_RATE_LIMIT_MULTIPLIER: "100"
 
       - name: Wait for infrastructure services to become healthy
         run: |
@@ -362,11 +365,6 @@ jobs:
         run: |
           sed -i 's/^VELDRA_LICENSE_SIGNING_KEY=.*/VELDRA_LICENSE_SIGNING_KEY=KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio/' .env
           sed -i 's/^VELDRA_AUTH_RATE_LIMIT_MULTIPLIER=.*/VELDRA_AUTH_RATE_LIMIT_MULTIPLIER=100/' .env
-          echo "--- .env signing key line ---"
-          grep VELDRA_LICENSE_SIGNING_KEY .env
-          echo "--- compose config env ---"
-          docker compose config rg-auth 2>&1 | grep -i license || true
-
       - name: Start rg-auth
         run: docker compose up -d rg-auth
         timeout-minutes: 3
@@ -383,11 +381,6 @@ jobs:
           echo "rg-auth did not become healthy within 60s"
           docker compose logs rg-auth --tail 30
           exit 1
-
-      - name: Check signing key loaded
-        run: |
-          docker compose logs rg-auth 2>&1 | grep -iE "signing|license" || echo "no signing key log lines found"
-          docker compose exec -T rg-auth printenv VELDRA_LICENSE_SIGNING_KEY 2>/dev/null || echo "could not read container env"
 
       - name: Run auth integration tests
         run: |
