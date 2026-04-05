@@ -874,9 +874,7 @@ async fn handle_miner_frame(
                 Err(exit) => FrameAction::Disconnect(exit),
             }
         }
-        MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL => {
-            reject_extended_channel(transport).await
-        }
+        MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL => reject_extended_channel(transport).await,
         MESSAGE_TYPE_CLOSE_CHANNEL => {
             handle_close_channel(peer_state, channels, channel_registry, payload).await
         }
