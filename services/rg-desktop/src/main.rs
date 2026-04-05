@@ -123,11 +123,6 @@ fn main() {
                     // std::process::exit().
                     api.prevent_exit();
                 }
-                RunEvent::Reopen { .. } => {
-                    // macOS: user clicked the dock icon while no windows are
-                    // visible. Restore the main window.
-                    tray::show_main_window(app);
-                }
                 _ => {}
             }
         });

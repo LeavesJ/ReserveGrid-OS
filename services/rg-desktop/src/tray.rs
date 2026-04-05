@@ -18,12 +18,9 @@ use tracing::info;
 /// the `CloseRequested` handler in main.rs.
 ///
 /// On macOS, a background process must activate itself before it can
-/// bring windows to the foreground. `app.show()` calls
-/// `[NSApp activateIgnoringOtherApps:YES]` under the hood.
+/// bring windows to the foreground. The `WebviewWindow::show()` call
+/// handles activation internally.
 pub fn show_main_window(app: &AppHandle) {
-    // Activate the application so macOS allows window foregrounding.
-    let _ = app.show();
-
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
