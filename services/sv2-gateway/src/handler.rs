@@ -347,6 +347,22 @@ async fn run_connection_inner(
 // Stage 1: SetupConnection
 // ─────────────────────────────────────────────────────────────────────
 
+/// Best-effort: encode and send a `SetupConnection.Error` frame. Failures are
+/// logged at debug level and swallowed because the connection is about to close.
+async fn send_setup_error(transport: &mut Sv2Transport, flags: u32) {
+    let err_msg = sv2_codec::SetupConnectionError {
+        flags,
+        error_code: "unsupported-protocol".to_string(),
+    };
+    if let Ok(err_payload) = err_msg.encode()
+        && let Err(e) = transport
+            .write_frame(0x0000, MESSAGE_TYPE_SETUP_CONNECTION_ERROR, &err_payload)
+            .await
+    {
+        debug!(error = %e, "best-effort SetupConnection.Error write failed");
+    }
+}
+
 async fn handle_setup_connection(
     transport: &mut Sv2Transport,
     peer_state: &PeerState,
@@ -370,53 +386,21 @@ async fn handle_setup_connection(
             "expected SetupConnection (0x{:02x}), got 0x{:02x}",
             MESSAGE_TYPE_SETUP_CONNECTION, header.msg_type,
         );
-        // Best effort: send SetupConnection.Error.
-        let err_msg = sv2_codec::SetupConnectionError {
-            flags: 0,
-            error_code: "unsupported-protocol".to_string(),
-        };
-        if let Ok(err_payload) = err_msg.encode()
-            && let Err(e) = transport
-                .write_frame(0x0000, MESSAGE_TYPE_SETUP_CONNECTION_ERROR, &err_payload)
-                .await
-        {
-            debug!(error = %e, "best-effort SetupConnection.Error write failed");
-        }
+        send_setup_error(transport, 0).await;
         return Err(HandlerExit::SetupRejected(reason));
     }
 
     let setup = match sv2_codec::SetupConnection::decode(&payload) {
         Ok(s) => s,
         Err(e) => {
-            // Best effort: inform the peer before disconnecting.
-            let err_msg = sv2_codec::SetupConnectionError {
-                flags: 0,
-                error_code: "unsupported-protocol".to_string(),
-            };
-            if let Ok(err_payload) = err_msg.encode()
-                && let Err(we) = transport
-                    .write_frame(0x0000, MESSAGE_TYPE_SETUP_CONNECTION_ERROR, &err_payload)
-                    .await
-            {
-                debug!(error = %we, "best-effort SetupConnection.Error write failed");
-            }
+            send_setup_error(transport, 0).await;
             return Err(HandlerExit::CodecError(e));
         }
     };
 
     // Validate: protocol must be MiningProtocol (0), version range must include 2.
     if setup.protocol != 0 {
-        let err_msg = sv2_codec::SetupConnectionError {
-            flags: 0,
-            error_code: "unsupported-protocol".to_string(),
-        };
-        if let Ok(err_payload) = err_msg.encode()
-            && let Err(e) = transport
-                .write_frame(0x0000, MESSAGE_TYPE_SETUP_CONNECTION_ERROR, &err_payload)
-                .await
-        {
-            debug!(error = %e, "best-effort SetupConnection.Error write failed");
-        }
+        send_setup_error(transport, 0).await;
         return Err(HandlerExit::SetupRejected(format!(
             "protocol {} is not MiningProtocol",
             setup.protocol,
@@ -424,17 +408,7 @@ async fn handle_setup_connection(
     }
 
     if setup.min_version > 2 || setup.max_version < 2 {
-        let err_msg = sv2_codec::SetupConnectionError {
-            flags: setup.flags,
-            error_code: "unsupported-protocol".to_string(),
-        };
-        if let Ok(err_payload) = err_msg.encode()
-            && let Err(e) = transport
-                .write_frame(0x0000, MESSAGE_TYPE_SETUP_CONNECTION_ERROR, &err_payload)
-                .await
-        {
-            debug!(error = %e, "best-effort SetupConnection.Error write failed");
-        }
+        send_setup_error(transport, setup.flags).await;
         return Err(HandlerExit::SetupRejected(format!(
             "version range [{}, {}] does not include 2",
             setup.min_version, setup.max_version,
@@ -769,6 +743,65 @@ enum FrameAction {
     Disconnect(HandlerExit),
 }
 
+/// Reject an extended mining channel open request. Extended channels are not
+/// supported; send a best-effort `CloseChannel` and disconnect.
+async fn reject_extended_channel(transport: &mut Sv2Transport) -> FrameAction {
+    let close = sv2_codec::CloseChannel {
+        channel_id: 0,
+        reason_code: GatewayReason::ExtendedChannelUnsupported
+            .as_str()
+            .to_string(),
+    };
+    if let Ok(close_payload) = close.encode()
+        && let Err(e) = transport
+            .write_frame(0x8000, MESSAGE_TYPE_CLOSE_CHANNEL, &close_payload)
+            .await
+    {
+        debug!(error = %e, "best-effort CloseChannel write failed");
+    }
+    FrameAction::Disconnect(HandlerExit::SetupRejected(
+        "extended channels not supported".to_string(),
+    ))
+}
+
+/// Handle a miner-initiated `CloseChannel`. Unregisters the channel and
+/// disconnects if no channels remain open.
+async fn handle_close_channel(
+    peer_state: &PeerState,
+    channels: &mut ConnectionChannels,
+    channel_registry: &SharedChannelRegistry,
+    payload: &[u8],
+) -> FrameAction {
+    match sv2_codec::CloseChannel::decode(payload) {
+        Ok(close) => {
+            debug!(
+                peer = %peer_state.peer_addr,
+                channel_id = close.channel_id,
+                reason = %close.reason_code,
+                "miner closed channel",
+            );
+            channels.close_channel(close.channel_id);
+            channel_registry.unregister(close.channel_id).await;
+            if channels.open_count() == 0 {
+                info!(
+                    peer = %peer_state.peer_addr,
+                    "all channels closed; disconnecting",
+                );
+                return FrameAction::Disconnect(HandlerExit::Shutdown);
+            }
+            FrameAction::Continue
+        }
+        Err(e) => {
+            warn!(
+                peer = %peer_state.peer_addr,
+                error = %e,
+                "failed to decode CloseChannel; disconnecting",
+            );
+            FrameAction::Disconnect(HandlerExit::CodecError(e))
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_miner_frame(
     transport: &mut Sv2Transport,
@@ -842,53 +875,10 @@ async fn handle_miner_frame(
             }
         }
         MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL => {
-            let close = sv2_codec::CloseChannel {
-                channel_id: 0,
-                reason_code: GatewayReason::ExtendedChannelUnsupported
-                    .as_str()
-                    .to_string(),
-            };
-            if let Ok(close_payload) = close.encode()
-                && let Err(e) = transport
-                    .write_frame(0x8000, MESSAGE_TYPE_CLOSE_CHANNEL, &close_payload)
-                    .await
-            {
-                debug!(error = %e, "best-effort CloseChannel write failed");
-            }
-            FrameAction::Disconnect(HandlerExit::SetupRejected(
-                "extended channels not supported".to_string(),
-            ))
+            reject_extended_channel(transport).await
         }
         MESSAGE_TYPE_CLOSE_CHANNEL => {
-            match sv2_codec::CloseChannel::decode(payload) {
-                Ok(close) => {
-                    debug!(
-                        peer = %peer_state.peer_addr,
-                        channel_id = close.channel_id,
-                        reason = %close.reason_code,
-                        "miner closed channel",
-                    );
-                    channels.close_channel(close.channel_id);
-                    channel_registry.unregister(close.channel_id).await;
-                    // If no open channels remain, disconnect.
-                    if channels.open_count() == 0 {
-                        info!(
-                            peer = %peer_state.peer_addr,
-                            "all channels closed; disconnecting",
-                        );
-                        return FrameAction::Disconnect(HandlerExit::Shutdown);
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        peer = %peer_state.peer_addr,
-                        error = %e,
-                        "failed to decode CloseChannel; disconnecting",
-                    );
-                    return FrameAction::Disconnect(HandlerExit::CodecError(e));
-                }
-            }
-            FrameAction::Continue
+            handle_close_channel(peer_state, channels, channel_registry, payload).await
         }
         other => {
             debug!(
