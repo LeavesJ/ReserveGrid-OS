@@ -321,7 +321,10 @@ fn dispatch_inbound(
                         accepted = verdict.accepted,
                         "received template verdict"
                     );
-                    if verdict_tx.send(VerifierInbound::TemplateVerdict(verdict)).is_err() {
+                    if verdict_tx
+                        .send(VerifierInbound::TemplateVerdict(verdict))
+                        .is_err()
+                    {
                         warn!("verdict_tx has no receivers; template verdict dropped");
                     }
                 }

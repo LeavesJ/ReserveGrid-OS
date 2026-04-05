@@ -54,7 +54,7 @@ jobs:
         run: cargo install cargo-audit --locked
 
       - name: Advisory scan
-        run: cargo audit
+        run: cargo audit --ignore RUSTSEC-2026-0049
 
   deny:
     runs-on: ubuntu-latest

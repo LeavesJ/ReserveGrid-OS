@@ -880,7 +880,9 @@ mod tests {
         let result = validate(&config);
         assert!(result.is_err());
         assert!(
-            result.unwrap_err().contains("health_probe_staleness_ms must be > 0"),
+            result
+                .unwrap_err()
+                .contains("health_probe_staleness_ms must be > 0"),
         );
     }
 
@@ -892,7 +894,9 @@ mod tests {
         assert!(result.is_ok());
         let warnings = result.unwrap();
         assert!(
-            warnings.iter().any(|w| w.contains("prevhash_verdict_timeout_ms=50")),
+            warnings
+                .iter()
+                .any(|w| w.contains("prevhash_verdict_timeout_ms=50")),
             "expected regtest warning, got: {warnings:?}",
         );
     }

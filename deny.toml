@@ -20,7 +20,11 @@ feature-depth = 1
 #
 # proc-macro-error v1.0.4 is unmaintained (RUSTSEC-2024-0370); pulled in
 # transitively via include-flate → rust-embed. No replacement available yet.
-ignore = ["RUSTSEC-2025-0134", "RUSTSEC-2024-0370"]
+#
+# rustls-webpki v0.102.8 CRL distribution point matching (RUSTSEC-2026-0049);
+# fix requires upgrading rustls 0.22→0.23 which cascades through tungstenite
+# and tokio-tungstenite. Tracked for v1.1.0 dep bump pass.
+ignore = ["RUSTSEC-2025-0134", "RUSTSEC-2024-0370", "RUSTSEC-2026-0049"]
 
 [licenses]
 allow = [
