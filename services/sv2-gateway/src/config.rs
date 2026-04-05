@@ -462,7 +462,10 @@ fn validate_timing_chain(config: &GatewayConfig, warnings: &mut Vec<String>) -> 
 }
 
 /// Verifier TLS field consistency and remote security enforcement.
-fn validate_verifier_security(config: &GatewayConfig, warnings: &mut Vec<String>) -> Result<(), String> {
+fn validate_verifier_security(
+    config: &GatewayConfig,
+    warnings: &mut Vec<String>,
+) -> Result<(), String> {
     if config.verifier.tls_ca_cert.is_some()
         && (config.verifier.tls_client_cert.is_none() || config.verifier.tls_client_key.is_none())
     {
