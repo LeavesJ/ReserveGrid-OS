@@ -363,6 +363,7 @@ jobs:
         timeout-minutes: 3
         env:
           VELDRA_AUTH_RATE_LIMIT_MULTIPLIER: "100"
+          VELDRA_LICENSE_SIGNING_KEY: "KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio"
 
       - name: Wait for rg-auth healthy
         run: |

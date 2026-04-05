@@ -182,6 +182,7 @@ services:
       VELDRA_AUTH_ALLOWED_ORIGIN: "http://localhost:8084"
       VELDRA_AUTH_RATE_LIMIT_MULTIPLIER: "${VELDRA_AUTH_RATE_LIMIT_MULTIPLIER:-1}"
       VELDRA_AUTH_TRUST_PROXY: "1"
+      VELDRA_LICENSE_SIGNING_KEY: "${VELDRA_LICENSE_SIGNING_KEY:-}"
     volumes:
       - ./dev:/config:ro
     ports:
