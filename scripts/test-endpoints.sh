@@ -167,7 +167,7 @@ check_json_array "${GATEWAY}/channels" 200 "GW /channels"
 
 info "rg-auth (${AUTH})"
 check_endpoint "${AUTH}/auth/health"    200 "AUTH /auth/health"
-check_endpoint "${AUTH}/auth/settings"  200 "AUTH /auth/settings" "bind_addr"
+check_endpoint "${AUTH}/auth/settings"  401 "AUTH /auth/settings"
 
 # ── rg-dashboard ─────────────────────────────────────────────────────────────
 
@@ -183,7 +183,7 @@ check_endpoint "${DASHBOARD}/api/verifier/stats"    200 "DASH /api/verifier/stat
 check_endpoint "${DASHBOARD}/api/verifier/settings" 200 "DASH /api/verifier/settings"  "log_level"
 check_endpoint "${DASHBOARD}/api/templates/latest"  200 "DASH /api/templates/latest"   "block_height"
 check_endpoint "${DASHBOARD}/api/gateway/settings"  200 "DASH /api/gateway/settings"   "gateway_mode"
-check_endpoint "${DASHBOARD}/api/auth/settings"     200 "DASH /api/auth/settings"      "bind_addr"
+check_endpoint "${DASHBOARD}/api/auth/settings"     401 "DASH /api/auth/settings"
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 

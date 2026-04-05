@@ -180,13 +180,15 @@ else
 fi
 
 # 3. Duplicate registration
-info "T03: Duplicate registration rejection"
+# The handler intentionally returns 201 for duplicate emails to prevent
+# email enumeration (R-87). Verify we get 201 (not 500 or 400).
+info "T03: Duplicate registration (anti-enumeration)"
 RESP=$(http_post "${AUTH_URL}/auth/register" "{\"email\":\"${EMAIL}\",\"name\":\"${NAME}\",\"org\":\"${ORG}\",\"password\":\"${PASSWORD}\"}")
 STATUS=$(parse_status "$RESP")
-if [[ "$STATUS" == "409" ]]; then
-  pass "T03: Duplicate registration returned 409"
+if [[ "$STATUS" == "201" ]]; then
+  pass "T03: Duplicate registration returned 201 (anti-enumeration)"
 else
-  fail "T03: Duplicate registration returned ${STATUS} (expected 409)"
+  fail "T03: Duplicate registration returned ${STATUS} (expected 201)"
 fi
 
 # 4. Login before verification
@@ -246,7 +248,8 @@ fi
 if [[ -z "$APPROVE_TOKEN" ]]; then
   fail "T07: Could not extract approval token from logs"
 else
-  RESP=$(http_get "${AUTH_URL}/auth/approve?token=${APPROVE_TOKEN}")
+  # GET renders the confirmation page; POST actually approves the user.
+  RESP=$(http_post "${AUTH_URL}/auth/approve" "{\"token\":\"${APPROVE_TOKEN}\"}")
   STATUS=$(parse_status "$RESP")
   if [[ "$STATUS" == "200" ]]; then
     pass "T07: Admin approval returned 200"
@@ -449,20 +452,14 @@ else
   skip "T19: No session token"
 fi
 
-# 20. Settings endpoint
-info "T20: Settings endpoint"
+# 20. Settings endpoint (admin-gated; unauthenticated requests must get 401)
+info "T20: Settings endpoint (unauthenticated)"
 RESP=$(http_get "${AUTH_URL}/auth/settings")
 STATUS=$(parse_status "$RESP")
-BODY=$(parse_body "$RESP")
-if [[ "$STATUS" == "200" ]]; then
-  BIND=$(json_field "$BODY" "bind_addr")
-  if [[ -n "$BIND" ]]; then
-    pass "T20: Settings endpoint returned bind_addr=${BIND}"
-  else
-    fail "T20: Settings returned 200 but missing bind_addr"
-  fi
+if [[ "$STATUS" == "401" ]]; then
+  pass "T20: Settings returned 401 for unauthenticated request"
 else
-  fail "T20: Settings returned ${STATUS} (expected 200)"
+  fail "T20: Settings returned ${STATUS} (expected 401)"
 fi
 
 # ── Feed server key validation (optional) ────────────────────────────────────
