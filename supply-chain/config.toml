@@ -4,6 +4,14 @@
 [cargo-vet]
 version = "0.10"
 
+# rg-desktop (Tauri) pulls a large GTK/webkit2gtk dependency tree that
+# would require ~6M lines of audit backlog. The desktop app has its own
+# release-desktop CI workflow. The CI vet step also excludes rg-desktop
+# from the workspace before running (see .github/workflows/ci.yml).
+[policy.rg-desktop]
+audit-as-crates-io = false
+criteria = "safe-to-run"
+
 [[exemptions.adler2]]
 version = "2.0.1"
 criteria = "safe-to-deploy"

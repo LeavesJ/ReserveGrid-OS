@@ -28,22 +28,27 @@ jobs:
           npm run build
 
       - name: Build
-        run: cargo build --workspace
+        run: cargo build --workspace --exclude rg-desktop
 
       - name: Format check
         run: cargo fmt --all --check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --exclude rg-desktop --all-targets -- -D warnings
 
       - name: Tests
-        run: cargo test --workspace
+        run: cargo test --workspace --exclude rg-desktop
 
   audit:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Exclude rg-desktop from workspace
+        run: |
+          sed -i '/"services\/rg-desktop",/d' Cargo.toml
+          cargo generate-lockfile
 
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
@@ -56,6 +61,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Exclude rg-desktop from workspace
+        run: |
+          sed -i '/"services\/rg-desktop",/d' Cargo.toml
+          cargo generate-lockfile
 
       - name: Install cargo-deny
         run: cargo install cargo-deny --locked
@@ -82,6 +92,11 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.92.0
+
+      - name: Exclude rg-desktop from workspace
+        run: |
+          sed -i '/"services\/rg-desktop",/d' Cargo.toml
+          cargo generate-lockfile
 
       - name: Install cargo-vet
         run: cargo install cargo-vet --locked

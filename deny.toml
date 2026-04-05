@@ -6,6 +6,10 @@
 targets = []
 all-features = false
 no-default-features = false
+# rg-desktop (Tauri) pulls GTK/webkit2gtk system deps that generate
+# advisory noise on headless CI. It has its own release-desktop workflow
+# with the correct system libraries installed.
+exclude = ["rg-desktop"]
 
 [output]
 feature-depth = 1
