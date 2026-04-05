@@ -65,7 +65,7 @@ pub struct GatewaySection {
     #[serde(default = "default_max_channels_per_conn")]
     pub max_channels_per_conn: u32,
 
-    /// Timeout for the initial channel open after SetupConnection (ms).
+    /// Timeout for the initial channel open after `SetupConnection` (ms).
     /// Miners that do not open a channel within this period are disconnected.
     /// Default 30000 (30 seconds).
     #[serde(default = "default_channel_open_timeout_ms")]
@@ -423,6 +423,94 @@ fn is_loopback_addr(addr: &str) -> bool {
 
 /// Validate configuration at startup. Returns a list of warnings
 /// (non-fatal) and an error if anything is invalid.
+/// Timing invariant chain:
+/// `verdict_timeout < stale_hold < upstream_stale_max <= job_retention`
+fn validate_timing_chain(
+    config: &GatewayConfig,
+    warnings: &mut Vec<String>,
+) -> Result<(), String> {
+    if config.gateway.prevhash_verdict_timeout_ms == 0 {
+        return Err("prevhash_verdict_timeout_ms must be > 0".to_string());
+    }
+    if config.gateway.prevhash_verdict_timeout_ms >= config.gateway.prevhash_stale_hold_ms {
+        return Err(format!(
+            "prevhash_verdict_timeout_ms ({}) must be < prevhash_stale_hold_ms ({}); \
+             the verdict must arrive before the stale hold expires",
+            config.gateway.prevhash_verdict_timeout_ms, config.gateway.prevhash_stale_hold_ms,
+        ));
+    }
+    if config.gateway.prevhash_stale_hold_ms >= config.gateway.upstream_stale_max_ms {
+        return Err(format!(
+            "prevhash_stale_hold_ms ({}) must be < upstream_stale_max_ms ({}); \
+             the stale hold must finish before the upstream is declared dead",
+            config.gateway.prevhash_stale_hold_ms, config.gateway.upstream_stale_max_ms,
+        ));
+    }
+    if config.gateway.job_retention_ms < config.gateway.upstream_stale_max_ms {
+        return Err(format!(
+            "job_retention_ms ({}) must be >= upstream_stale_max_ms ({}); \
+             jobs must outlive upstream staleness detection",
+            config.gateway.job_retention_ms, config.gateway.upstream_stale_max_ms,
+        ));
+    }
+    if config.verifier.health_probe_staleness_ms == 0 {
+        return Err("health_probe_staleness_ms must be > 0".to_string());
+    }
+    if config.gateway.prevhash_verdict_timeout_ms < 1000 {
+        warnings.push(format!(
+            "prevhash_verdict_timeout_ms={} is below 1000ms; \
+             this is regtest-appropriate but will cause mass disconnections on mainnet",
+            config.gateway.prevhash_verdict_timeout_ms,
+        ));
+    }
+    Ok(())
+}
+
+/// Verifier TLS field consistency and remote security enforcement.
+fn validate_verifier_security(
+    config: &GatewayConfig,
+    warnings: &mut Vec<String>,
+) -> Result<(), String> {
+    if config.verifier.tls_ca_cert.is_some()
+        && (config.verifier.tls_client_cert.is_none() || config.verifier.tls_client_key.is_none())
+    {
+        return Err(
+            "verifier.tls_ca_cert is set but tls_client_cert and tls_client_key are \
+             both required for mTLS"
+                .to_string(),
+        );
+    }
+
+    if !is_loopback_addr(&config.verifier.addr) {
+        if config.verifier.tls_enabled() {
+            // TLS configured for remote verifier. Expected production path.
+        } else {
+            let allow_insecure = std::env::var("VELDRA_ALLOW_INSECURE_VERIFIER")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            let allow_legacy = std::env::var("VELDRA_ALLOW_REMOTE_VERIFIER")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+
+            if !allow_insecure && !allow_legacy {
+                return Err(format!(
+                    "verifier.addr={} is not loopback and TLS is not configured. \
+                     Configure verifier TLS (tls_ca_cert, tls_client_cert, tls_client_key) \
+                     or set VELDRA_ALLOW_INSECURE_VERIFIER=1 to override",
+                    config.verifier.addr,
+                ));
+            }
+            warnings.push(format!(
+                "insecure verifier override active; verifier at {} uses plaintext TCP. \
+                 This is not safe for untrusted networks",
+                config.verifier.addr,
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 pub fn validate(config: &GatewayConfig) -> Result<Vec<String>, String> {
     let mut warnings = Vec::new();
 
@@ -496,86 +584,8 @@ pub fn validate(config: &GatewayConfig) -> Result<Vec<String>, String> {
         warnings.push("noise_handshake_timeout_ms > 120s is unusually high".to_string());
     }
 
-    // ── Timing parameter cross-validation ──
-    // Invariant chain: verdict_timeout < stale_hold < upstream_stale_max <= job_retention
-    if config.gateway.prevhash_verdict_timeout_ms == 0 {
-        return Err("prevhash_verdict_timeout_ms must be > 0".to_string());
-    }
-    if config.gateway.prevhash_verdict_timeout_ms >= config.gateway.prevhash_stale_hold_ms {
-        return Err(format!(
-            "prevhash_verdict_timeout_ms ({}) must be < prevhash_stale_hold_ms ({}); \
-             the verdict must arrive before the stale hold expires",
-            config.gateway.prevhash_verdict_timeout_ms, config.gateway.prevhash_stale_hold_ms,
-        ));
-    }
-    if config.gateway.prevhash_stale_hold_ms >= config.gateway.upstream_stale_max_ms {
-        return Err(format!(
-            "prevhash_stale_hold_ms ({}) must be < upstream_stale_max_ms ({}); \
-             the stale hold must finish before the upstream is declared dead",
-            config.gateway.prevhash_stale_hold_ms, config.gateway.upstream_stale_max_ms,
-        ));
-    }
-    if config.gateway.job_retention_ms < config.gateway.upstream_stale_max_ms {
-        return Err(format!(
-            "job_retention_ms ({}) must be >= upstream_stale_max_ms ({}); \
-             jobs must outlive upstream staleness detection",
-            config.gateway.job_retention_ms, config.gateway.upstream_stale_max_ms,
-        ));
-    }
-    if config.verifier.health_probe_staleness_ms == 0 {
-        return Err("health_probe_staleness_ms must be > 0".to_string());
-    }
-    if config.gateway.prevhash_verdict_timeout_ms < 1000 {
-        warnings.push(format!(
-            "prevhash_verdict_timeout_ms={} is below 1000ms; \
-             this is regtest-appropriate but will cause mass disconnections on mainnet",
-            config.gateway.prevhash_verdict_timeout_ms,
-        ));
-    }
-
-    // ── Verifier TLS field consistency ──
-    // If tls_ca_cert is set, both client cert and key must also be set (mTLS).
-    if config.verifier.tls_ca_cert.is_some()
-        && (config.verifier.tls_client_cert.is_none() || config.verifier.tls_client_key.is_none())
-    {
-        return Err(
-            "verifier.tls_ca_cert is set but tls_client_cert and tls_client_key are \
-             both required for mTLS"
-                .to_string(),
-        );
-    }
-
-    // ── Remote verifier security enforcement ──
-    // Non-loopback verifier addresses require TLS unless explicitly overridden.
-    if !is_loopback_addr(&config.verifier.addr) {
-        if config.verifier.tls_enabled() {
-            // TLS is configured for the remote verifier. Good.
-            // Intentionally no warning; TLS + remote is the expected production path.
-        } else {
-            // No TLS configured. Check for the insecure override escape hatch.
-            let allow_insecure = std::env::var("VELDRA_ALLOW_INSECURE_VERIFIER")
-                .map(|v| v == "1")
-                .unwrap_or(false);
-            // Also accept the legacy escape hatch for backward compatibility.
-            let allow_legacy = std::env::var("VELDRA_ALLOW_REMOTE_VERIFIER")
-                .map(|v| v == "1")
-                .unwrap_or(false);
-
-            if !allow_insecure && !allow_legacy {
-                return Err(format!(
-                    "verifier.addr={} is not loopback and TLS is not configured. \
-                     Configure verifier TLS (tls_ca_cert, tls_client_cert, tls_client_key) \
-                     or set VELDRA_ALLOW_INSECURE_VERIFIER=1 to override",
-                    config.verifier.addr,
-                ));
-            }
-            warnings.push(format!(
-                "insecure verifier override active; verifier at {} uses plaintext TCP. \
-                 This is not safe for untrusted networks",
-                config.verifier.addr,
-            ));
-        }
-    }
+    validate_timing_chain(config, &mut warnings)?;
+    validate_verifier_security(config, &mut warnings)?;
 
     Ok(warnings)
 }
