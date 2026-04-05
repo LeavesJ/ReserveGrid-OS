@@ -145,10 +145,10 @@ pub(crate) fn rotate_verdict_log_if_needed() {
         let dst = format!("{VERDICT_LOG_PATH}.{i}");
 
         // Skip exists() check to avoid TOCTOU; try rename directly.
-        if let Err(e) = std::fs::remove_file(&dst) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                warn!(dst, error = %e, "verdict log rotation: remove_file failed");
-            }
+        if let Err(e) = std::fs::remove_file(&dst)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(dst, error = %e, "verdict log rotation: remove_file failed");
         }
         match std::fs::rename(&src, &dst) {
             Ok(()) => {}

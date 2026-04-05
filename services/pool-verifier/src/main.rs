@@ -109,6 +109,13 @@ fn enforce_api_secret() {
     }
 }
 
+fn init_metrics() -> (reservegrid_common::metrics::SharedRegistry, Arc<metrics::VerifierMetrics>) {
+    let mut registry = prometheus_client::registry::Registry::default();
+    let verifier_metrics = Arc::new(metrics::VerifierMetrics::new_registered(&mut registry));
+    let shared: reservegrid_common::metrics::SharedRegistry = Arc::new(registry);
+    (shared, verifier_metrics)
+}
+
 // ── Main ─────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -183,23 +190,12 @@ async fn main() -> anyhow::Result<()> {
     let mempool_url = mempool_url_from_env();
     let tcp_mempool_url = mempool_url.clone();
 
-    // Build optional TLS acceptor for the verifier TCP channel.
-    // Controlled by VELDRA_VERIFIER_TLS_CERT, VELDRA_VERIFIER_TLS_KEY, and
-    // VELDRA_VERIFIER_TLS_CLIENT_CA env vars (mTLS: server cert + client CA).
-    let tcp_tls_acceptor = match ingress::build_tcp_tls_acceptor() {
-        Ok(a) => a,
-        Err(e) => {
-            tracing::error!(error = %e, "failed to build TCP TLS acceptor");
-            std::process::exit(1);
-        }
-    };
+    let tcp_tls_acceptor = ingress::build_tcp_tls_acceptor().unwrap_or_else(|e| {
+        tracing::error!(error = %e, "failed to build TCP TLS acceptor");
+        std::process::exit(1);
+    });
 
-    // ── Prometheus metrics ──
-    let mut metrics_registry = prometheus_client::registry::Registry::default();
-    let verifier_metrics = Arc::new(metrics::VerifierMetrics::new_registered(
-        &mut metrics_registry,
-    ));
-    let shared_registry: reservegrid_common::metrics::SharedRegistry = Arc::new(metrics_registry);
+    let (shared_registry, verifier_metrics) = init_metrics();
     let tcp_metrics = verifier_metrics.clone();
 
     let tcp_task = tokio::spawn(async move {
