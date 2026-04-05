@@ -358,12 +358,14 @@ jobs:
             *.cache-from=type=gha
             *.cache-to=type=gha,mode=max
 
+      - name: Inject auth test env
+        run: |
+          echo 'VELDRA_LICENSE_SIGNING_KEY=KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio' >> .env
+          echo 'VELDRA_AUTH_RATE_LIMIT_MULTIPLIER=100' >> .env
+
       - name: Start rg-auth
         run: docker compose up -d rg-auth
         timeout-minutes: 3
-        env:
-          VELDRA_AUTH_RATE_LIMIT_MULTIPLIER: "100"
-          VELDRA_LICENSE_SIGNING_KEY: "KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio"
 
       - name: Wait for rg-auth healthy
         run: |
