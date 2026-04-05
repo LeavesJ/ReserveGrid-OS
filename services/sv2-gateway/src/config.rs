@@ -833,7 +833,9 @@ mod tests {
         let result = validate(&config);
         assert!(result.is_err());
         assert!(
-            result.unwrap_err().contains("prevhash_verdict_timeout_ms must be > 0"),
+            result
+                .unwrap_err()
+                .contains("prevhash_verdict_timeout_ms must be > 0"),
         );
     }
 
@@ -845,7 +847,9 @@ mod tests {
         let result = validate(&config);
         assert!(result.is_err());
         assert!(
-            result.unwrap_err().contains("must be < prevhash_stale_hold_ms"),
+            result
+                .unwrap_err()
+                .contains("must be < prevhash_stale_hold_ms"),
         );
     }
 
@@ -857,7 +861,9 @@ mod tests {
         let result = validate(&config);
         assert!(result.is_err());
         assert!(
-            result.unwrap_err().contains("must be < upstream_stale_max_ms"),
+            result
+                .unwrap_err()
+                .contains("must be < upstream_stale_max_ms"),
         );
     }
 
@@ -869,7 +875,9 @@ mod tests {
         let result = validate(&config);
         assert!(result.is_err());
         assert!(
-            result.unwrap_err().contains("must be >= upstream_stale_max_ms"),
+            result
+                .unwrap_err()
+                .contains("must be >= upstream_stale_max_ms"),
         );
     }
 

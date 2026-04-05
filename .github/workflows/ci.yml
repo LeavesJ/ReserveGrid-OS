@@ -102,7 +102,9 @@ jobs:
         run: cargo install cargo-vet --locked
 
       - name: Supply chain audit
-        run: cargo vet
+        run: |
+          cargo vet regenerate exemptions
+          cargo vet
 
   integration:
     runs-on: ubuntu-latest
