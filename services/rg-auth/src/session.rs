@@ -243,11 +243,11 @@ mod tests {
     #[test]
     fn wrong_key_fails_verify() {
         let sk = test_keypair();
-        let other_sk = SigningKey::from_bytes(&[99u8; 32]);
-        let other_vk = other_sk.verifying_key();
+        let wrong_signer = SigningKey::from_bytes(&[99u8; 32]);
+        let wrong_verifier = wrong_signer.verifying_key();
         let key = sign_license_key(&sk, "org_test", "observe_paid", &[]);
         assert!(
-            verify_license_key(&key, &other_vk).is_none(),
+            verify_license_key(&key, &wrong_verifier).is_none(),
             "key signed by different keypair must fail"
         );
     }
