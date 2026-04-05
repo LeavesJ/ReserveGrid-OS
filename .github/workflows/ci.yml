@@ -360,8 +360,8 @@ jobs:
 
       - name: Inject auth test env
         run: |
-          echo 'VELDRA_LICENSE_SIGNING_KEY=KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio' >> .env
-          echo 'VELDRA_AUTH_RATE_LIMIT_MULTIPLIER=100' >> .env
+          sed -i 's/^VELDRA_LICENSE_SIGNING_KEY=.*/VELDRA_LICENSE_SIGNING_KEY=KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio/' .env
+          sed -i 's/^VELDRA_AUTH_RATE_LIMIT_MULTIPLIER=.*/VELDRA_AUTH_RATE_LIMIT_MULTIPLIER=100/' .env
 
       - name: Start rg-auth
         run: docker compose up -d rg-auth
