@@ -25,6 +25,10 @@ pub async fn security_headers_layer(req: Request, next: Next) -> Response {
         HeaderValue::from_static("default-src 'none'"),
     );
     headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    headers.insert(
+        "permissions-policy",
+        HeaderValue::from_static("camera=(), microphone=(), geolocation=(), interest-cohort=()"),
+    );
 
     resp
 }
@@ -62,5 +66,9 @@ mod tests {
             "default-src 'none'"
         );
         assert_eq!(h.get("referrer-policy").unwrap(), "no-referrer");
+        assert!(
+            h.get("permissions-policy").is_some(),
+            "missing permissions-policy header"
+        );
     }
 }

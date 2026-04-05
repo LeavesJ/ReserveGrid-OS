@@ -10,12 +10,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::Router;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::routing::{get, post};
 use clap::Parser;
 use serde::Serialize;
 use tokio::sync::RwLock;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 mod config;
 mod feed;
@@ -137,12 +137,20 @@ async fn main() {
     let app = Router::new()
         .route("/", post(rpc::handle_jsonrpc))
         .route("/health", get(health))
-        .with_state(buffer);
+        .with_state(buffer)
+        .layer(DefaultBodyLimit::max(64 * 1024)); // 64 KiB; JSON-RPC calls are small
 
     let addr: SocketAddr = cfg.listen.parse().unwrap_or_else(|e| {
         error!(listen = %cfg.listen, error = %e, "invalid listen address");
         std::process::exit(1);
     });
+
+    if !addr.ip().is_loopback() {
+        warn!(
+            %addr,
+            "feed adapter binding to non-loopback address; ensure network access is intentional"
+        );
+    }
 
     info!(%addr, "JSON-RPC server listening");
 

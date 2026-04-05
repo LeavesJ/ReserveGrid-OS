@@ -6,7 +6,7 @@ use axum::{
 };
 use serde::Deserialize;
 use std::net::SocketAddr;
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::AppState;
 use crate::{db, email, password, session};
@@ -51,6 +51,7 @@ pub async fn health() -> &'static str {
 
 // ── Register ────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_lines)]
 pub async fn register(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -115,11 +116,29 @@ pub async fn register(
         );
     };
 
-    // Check if email already registered.
+    // Check if email already registered. Return the same success response
+    // regardless to prevent email enumeration. Notify the existing user via
+    // email so they know someone tried to register with their address.
     if let Ok(Some(_)) = db::get_user_by_email(&conn, &req.email) {
+        drop(conn);
+        let body = "Someone attempted to create a new Veldra account using your email address.\n\n\
+                     If this was you, you already have an account. Try logging in or resetting your password.\n\n\
+                     If this was not you, no action is needed. Your account is secure.\n\n\
+                     — Veldra";
+        if let Err(e) = email::send(
+            state.smtp.as_ref(),
+            &req.email,
+            "Account registration attempt — Veldra",
+            body,
+        ) {
+            error!(error = ?e, recipient = %req.email, "send duplicate-registration notice failed");
+        }
         return (
-            StatusCode::CONFLICT,
-            Json(err_json("email_taken", "Email already registered")),
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "ok": true,
+                "message": "Registration successful. Check your email to verify."
+            })),
         );
     }
 
@@ -216,8 +235,12 @@ pub async fn verify_email(
     // Generate approve/deny tokens for admin.
     let approve_token = session::generate_token();
     let deny_token = session::generate_token();
-    let _ = db::insert_email_token(&conn, &approve_token, user_id, "approve");
-    let _ = db::insert_email_token(&conn, &deny_token, user_id, "deny");
+    if let Err(e) = db::insert_email_token(&conn, &approve_token, user_id, "approve") {
+        warn!(user_id, error = %e, "failed to insert approve email token");
+    }
+    if let Err(e) = db::insert_email_token(&conn, &deny_token, user_id, "deny") {
+        warn!(user_id, error = %e, "failed to insert deny email token");
+    }
 
     drop(conn);
 
@@ -326,7 +349,8 @@ pub async fn login(
     }
 
     let token = session::generate_token();
-    if let Err(e) = db::insert_session(&conn, &token, user.id, state.session_ttl_hours) {
+    let token_hash = session::hash_token(&token);
+    if let Err(e) = db::insert_session(&conn, &token_hash, user.id, state.session_ttl_hours) {
         error!(error = ?e, user_id = user.id, "insert session failed");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -334,6 +358,7 @@ pub async fn login(
         );
     }
 
+    // Return the raw token to the client. Only the hash is stored.
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -356,7 +381,10 @@ pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> impl I
     if let Some(token) = extract_bearer(&headers)
         && let Ok(conn) = state.db.lock()
     {
-        let _ = db::delete_session(&conn, token);
+        let token_hash = session::hash_token(token);
+        if let Err(e) = db::delete_session(&conn, &token_hash) {
+            warn!(error = %e, "failed to delete session on logout");
+        }
     }
     (StatusCode::OK, Json(serde_json::json!({"ok": true})))
 }
@@ -378,7 +406,8 @@ pub async fn session_check(State(state): State<AppState>, headers: HeaderMap) ->
         );
     };
 
-    let Ok(Some(user_id)) = db::validate_session(&conn, token) else {
+    let token_hash = session::hash_token(token);
+    let Ok(Some(user_id)) = db::validate_session(&conn, &token_hash) else {
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({"valid": false})),
@@ -412,13 +441,24 @@ pub async fn session_check(State(state): State<AppState>, headers: HeaderMap) ->
 
 // ── Admin approve ───────────────────────────────────────────────
 
-pub async fn approve(
+/// GET /auth/approve?token=X renders a confirmation page. The actual state
+/// change happens only when the admin clicks the confirm button, which submits
+/// a POST. This prevents email link prefetchers (Outlook Safe Links, Google
+/// link scanning) from triggering approvals automatically.
+pub async fn approve(Query(q): Query<TokenQuery>) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        axum::response::Html(admin_confirm_page(&q.token, "approve")),
+    )
+}
+
+/// POST /auth/approve — actually consumes the token and approves the user.
+pub async fn approve_confirm(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Query(q): Query<TokenQuery>,
+    Json(req): Json<TokenQuery>,
 ) -> impl IntoResponse {
-    // Rate limiting: 3 requests per minute.
     let ip = client_ip(&headers, addr, state.trust_proxy);
     if !state
         .rate_limiter
@@ -437,7 +477,7 @@ pub async fn approve(
         );
     };
 
-    let user_id = match db::consume_email_token(&conn, &q.token, "approve") {
+    let user_id = match db::consume_email_token(&conn, &req.token, "approve") {
         Ok(Some(uid)) => uid,
         Ok(None) => {
             return (
@@ -467,7 +507,6 @@ pub async fn approve(
     let user = db::get_user_by_id(&conn, user_id).ok().flatten();
     drop(conn);
 
-    // Notify user of approval.
     if let Some(ref u) = user {
         let body = email::approval_body(&state.site_url);
         if let Err(e) = email::send(
@@ -488,13 +527,21 @@ pub async fn approve(
 
 // ── Admin deny ──────────────────────────────────────────────────
 
-pub async fn deny(
+/// GET /auth/deny?token=X renders a confirmation page (same prefetcher defense).
+pub async fn deny(Query(q): Query<TokenQuery>) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        axum::response::Html(admin_confirm_page(&q.token, "deny")),
+    )
+}
+
+/// POST /auth/deny — actually consumes the token and denies the user.
+pub async fn deny_confirm(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Query(q): Query<TokenQuery>,
+    Json(req): Json<TokenQuery>,
 ) -> impl IntoResponse {
-    // Rate limiting: 3 requests per minute.
     let ip = client_ip(&headers, addr, state.trust_proxy);
     if !state
         .rate_limiter
@@ -513,7 +560,7 @@ pub async fn deny(
         );
     };
 
-    let user_id = match db::consume_email_token(&conn, &q.token, "deny") {
+    let user_id = match db::consume_email_token(&conn, &req.token, "deny") {
         Ok(Some(uid)) => uid,
         Ok(None) => {
             return (
@@ -684,6 +731,12 @@ pub async fn reset_password(
         );
     }
 
+    // Invalidate all existing sessions for this user. Any session obtained
+    // with the old credentials must not survive a password reset.
+    if let Err(e) = db::delete_sessions_for_user(&conn, user_id) {
+        error!(error = ?e, user_id, "delete sessions after password reset failed");
+    }
+
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -702,10 +755,33 @@ pub struct ValidateKeyRequest {
 
 /// Validate a license key. Called by rg-feed-server during WebSocket handshake.
 /// No session required; this is a service-to-service endpoint.
+/// Rate limited to prevent brute force and denial of service.
+///
+/// Validation performs three checks in order:
+/// 1. Ed25519 signature verification (proves the key was issued by Veldra).
+/// 2. Expiry check on the embedded `expires_at` field.
+/// 3. DB revocation check (ensures the key has not been revoked by the user).
+///
+/// The response includes `tier` on success so rg-feed-server can enforce
+/// tier gating without parsing the key itself.
 pub async fn validate_key(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<ValidateKeyRequest>,
 ) -> impl IntoResponse {
+    // Rate limiting: 20 requests per minute per IP.
+    let ip = client_ip(&headers, addr, state.trust_proxy);
+    if !state
+        .rate_limiter
+        .check(ip, 20 * state.rate_limit_multiplier)
+    {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"valid": false, "reason": "rate_limited"})),
+        );
+    }
+
     if req.key.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -713,23 +789,77 @@ pub async fn validate_key(
         );
     }
 
-    let Ok(conn) = state.db.lock() else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"valid": false, "reason": "internal_error"})),
-        );
-    };
+    // Step 1: Verify signature. Derive the verifying key from the signing
+    // key stored in AppState. If no signing key is configured, fall back
+    // to DB only validation for backward compatibility during rollout.
+    if let Some(ref signing_key) = state.signing_key {
+        let verifying_key = signing_key.verifying_key();
+        match session::verify_license_key(&req.key, &verifying_key) {
+            Some(payload) => {
+                // Step 2: Check expiry.
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                if payload.expires_at < now {
+                    return (
+                        StatusCode::OK,
+                        Json(serde_json::json!({"valid": false, "reason": "key_expired"})),
+                    );
+                }
 
-    match db::validate_license_key(&conn, &req.key) {
-        Ok(Some(_user_id)) => (StatusCode::OK, Json(serde_json::json!({"valid": true}))),
-        Ok(None) => (
-            StatusCode::OK,
-            Json(serde_json::json!({"valid": false, "reason": "invalid_or_revoked"})),
-        ),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"valid": false, "reason": "internal_error"})),
-        ),
+                // Step 3: DB revocation check.
+                let Ok(conn) = state.db.lock() else {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"valid": false, "reason": "internal_error"})),
+                    );
+                };
+                match db::validate_license_key(&conn, &req.key) {
+                    Ok(Some(_user_id)) => (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "valid": true,
+                            "tier": payload.tier,
+                            "org_id": payload.org_id,
+                        })),
+                    ),
+                    Ok(None) => (
+                        StatusCode::OK,
+                        Json(serde_json::json!({"valid": false, "reason": "revoked_or_unknown"})),
+                    ),
+                    Err(_) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"valid": false, "reason": "internal_error"})),
+                    ),
+                }
+            }
+            None => (
+                StatusCode::OK,
+                Json(serde_json::json!({"valid": false, "reason": "invalid_signature"})),
+            ),
+        }
+    } else {
+        // Fallback: signing key not configured, validate by DB lookup only.
+        // This path exists for backward compatibility during migration from
+        // the old veldra_<hex> format and will be removed in v1.1.0.
+        let Ok(conn) = state.db.lock() else {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"valid": false, "reason": "internal_error"})),
+            );
+        };
+        match db::validate_license_key(&conn, &req.key) {
+            Ok(Some(_user_id)) => (StatusCode::OK, Json(serde_json::json!({"valid": true}))),
+            Ok(None) => (
+                StatusCode::OK,
+                Json(serde_json::json!({"valid": false, "reason": "invalid_or_revoked"})),
+            ),
+            Err(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"valid": false, "reason": "internal_error"})),
+            ),
+        }
     }
 }
 
@@ -751,7 +881,8 @@ pub async fn list_keys(State(state): State<AppState>, headers: HeaderMap) -> imp
         );
     };
 
-    let Ok(Some(user_id)) = db::validate_session(&conn, token) else {
+    let token_hash = session::hash_token(token);
+    let Ok(Some(user_id)) = db::validate_session(&conn, &token_hash) else {
         return (
             StatusCode::UNAUTHORIZED,
             Json(err_json("unauthorized", "Invalid or expired session")),
@@ -766,6 +897,7 @@ pub async fn list_keys(State(state): State<AppState>, headers: HeaderMap) -> imp
                     serde_json::json!({
                         "id": k.id,
                         "key_prefix": mask_key(&k.key_value),
+                        "key_value": k.key_value,
                         "label": k.label,
                         "status": k.status,
                         "created_at": k.created_at,
@@ -790,12 +922,28 @@ pub struct GenerateKeyRequest {
     pub label: String,
 }
 
-/// Generate a new license key for the authenticated user.
+/// Generate a new signed license key for the authenticated user.
+///
+/// The key format is `veldra_lic_{base64url_payload}.{base64url_signature}`.
+/// The payload embeds the user's org, tier, issuance and expiry timestamps,
+/// and feature flags. The Ed25519 signature allows offline verification by
+/// rg-desktop and rg-feed-server without calling back to rg-auth.
 pub async fn generate_key(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<GenerateKeyRequest>,
 ) -> impl IntoResponse {
+    // Signing key must be configured for key generation.
+    let Some(ref signing_key) = state.signing_key else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(err_json(
+                "signing_key_unavailable",
+                "License signing key not configured",
+            )),
+        );
+    };
+
     let Some(token) = extract_bearer(&headers) else {
         return (
             StatusCode::UNAUTHORIZED,
@@ -810,7 +958,8 @@ pub async fn generate_key(
         );
     };
 
-    let Ok(Some(user_id)) = db::validate_session(&conn, token) else {
+    let token_hash = session::hash_token(token);
+    let Ok(Some(user_id)) = db::validate_session(&conn, &token_hash) else {
         return (
             StatusCode::UNAUTHORIZED,
             Json(err_json("unauthorized", "Invalid or expired session")),
@@ -835,7 +984,12 @@ pub async fn generate_key(
         );
     }
 
-    let key_value = session::generate_license_key();
+    // Map the DB tier value to the license payload tier string.
+    // These must stay in sync with rg-desktop's tier expectations.
+    let tier = &user.tier;
+    let features = tier_features(tier);
+
+    let key_value = session::sign_license_key(signing_key, &user.org, tier, &features);
     let label = if req.label.is_empty() {
         "default".to_string()
     } else {
@@ -851,6 +1005,7 @@ pub async fn generate_key(
                     "id": key_id,
                     "key_value": key_value,
                     "label": label,
+                    "tier": tier,
                     "status": db::key_status::ACTIVE,
                 }
             })),
@@ -870,6 +1025,17 @@ pub async fn generate_key(
                 )
             }
         }
+    }
+}
+
+/// Derive feature flags from the user's tier. These are embedded in the
+/// license payload and used by rg-desktop for local feature gating.
+fn tier_features(tier: &str) -> Vec<String> {
+    match tier {
+        db::tier::OBSERVE_PAID => vec!["exporter".to_string()],
+        db::tier::INLINE_LICENSED => vec!["gateway".to_string(), "exporter".to_string()],
+        // observe_free and any unknown tier get no special features.
+        _ => vec![],
     }
 }
 
@@ -900,7 +1066,8 @@ pub async fn revoke_key(
         );
     };
 
-    let Ok(Some(user_id)) = db::validate_session(&conn, token) else {
+    let token_hash = session::hash_token(token);
+    let Ok(Some(user_id)) = db::validate_session(&conn, &token_hash) else {
         return (
             StatusCode::UNAUTHORIZED,
             Json(err_json("unauthorized", "Invalid or expired session")),
@@ -927,6 +1094,70 @@ pub async fn revoke_key(
             )
         }
     }
+}
+
+// ── Admin settings (requires admin session) ─────────────────────
+
+/// Returns service configuration. Requires an active session belonging to the
+/// admin email configured in `VELDRA_AUTH_ADMIN_EMAIL`. Returns 403 for all
+/// other users and 401 for unauthenticated requests.
+pub async fn admin_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let Some(token) = extract_bearer(&headers) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(err_json("unauthorized", "Missing session token")),
+        );
+    };
+
+    let Ok(conn) = state.db.lock() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(err_json("internal_error", "Database error")),
+        );
+    };
+
+    let token_hash = session::hash_token(token);
+    let Ok(Some(user_id)) = db::validate_session(&conn, &token_hash) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(err_json("unauthorized", "Invalid or expired session")),
+        );
+    };
+
+    let Ok(Some(user)) = db::get_user_by_id(&conn, user_id) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(err_json("unauthorized", "User not found")),
+        );
+    };
+
+    if user.email != state.admin_email {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(err_json("forbidden", "Admin access required")),
+        );
+    }
+
+    drop(conn);
+
+    let log_level = std::env::var("VELDRA_LOG_FILTER").unwrap_or_else(|_| "info".into());
+    let smtp_configured = state.smtp.is_some();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "log_level": log_level,
+            "session_ttl_hours": state.session_ttl_hours,
+            "admin_email": state.admin_email,
+            "site_url": state.site_url,
+            "auth_url": state.auth_url,
+            "smtp_configured": smtp_configured,
+            "trust_proxy": state.trust_proxy,
+        })),
+    )
 }
 
 // ── Helpers ─────────────────────────────────────────────────────
@@ -982,6 +1213,61 @@ fn err_json(code: &str, detail: &str) -> serde_json::Value {
 
 fn ok_json(message: &str) -> serde_json::Value {
     serde_json::json!({"ok": true, "message": message})
+}
+
+/// Renders a minimal HTML confirmation page for admin approve/deny actions.
+/// The page contains a single button that POSTs the token back to the server.
+/// This prevents email link prefetchers from triggering state changes on GET.
+fn admin_confirm_page(token: &str, action: &str) -> String {
+    let label = if action == "approve" {
+        "Approve User"
+    } else {
+        "Deny User"
+    };
+    let color = if action == "approve" {
+        "#22c55e"
+    } else {
+        "#ef4444"
+    };
+    // Token is hex-only (generated by generate_token), safe to embed.
+    // We still escape it defensively.
+    let safe_token: String = token
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    format!(
+        r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>{label} — Veldra</title>
+<style>body{{font-family:system-ui;background:#0a0e17;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}}
+.card{{background:#111827;border:1px solid #1f2937;border-radius:12px;padding:2rem;text-align:center;max-width:400px}}
+button{{background:{color};color:#fff;border:none;padding:0.75rem 2rem;border-radius:8px;font-size:1rem;cursor:pointer;font-weight:600}}
+button:hover{{opacity:0.9}}
+#done{{display:none;color:#9ca3af}}</style></head>
+<body><div class="card">
+<h2>{label}</h2>
+<p style="color:#9ca3af">Click the button below to confirm this action.</p>
+<button id="btn" onclick="doAction()">{label}</button>
+<p id="done"></p>
+</div>
+<script>
+function doAction(){{
+  var btn=document.getElementById('btn');
+  btn.disabled=true;btn.textContent='Processing...';
+  fetch('/auth/{action}',{{
+    method:'POST',
+    headers:{{'Content-Type':'application/json'}},
+    body:JSON.stringify({{token:'{safe_token}'}})
+  }}).then(function(r){{return r.json()}}).then(function(d){{
+    var el=document.getElementById('done');
+    el.style.display='block';
+    el.textContent=d.message||d.detail||'Done.';
+    btn.style.display='none';
+  }}).catch(function(){{
+    btn.textContent='Error. Try again.';btn.disabled=false;
+  }});
+}}
+</script></body></html>"#
+    )
 }
 
 /// Mask a license key for display: show prefix and last 4 chars.

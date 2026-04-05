@@ -120,23 +120,32 @@ async fn setup_connection(transport: &mut MinerTransport) -> Result<(), MinerErr
                 "SetupConnection accepted"
             );
             if success.used_version != 2 {
-                return Err(MinerError::Protocol(format!(
-                    "unexpected used_version: {}",
-                    success.used_version,
-                )));
+                warn!(
+                    used_version = success.used_version,
+                    "unexpected SV2 protocol version"
+                );
+                return Err(MinerError::Protocol(
+                    "unexpected SV2 protocol version".to_string(),
+                ));
             }
             Ok(())
         }
         MESSAGE_TYPE_SETUP_CONNECTION_ERROR => {
             let err = sv2_codec::SetupConnectionError::decode(&resp_payload)?;
-            Err(MinerError::Protocol(format!(
-                "SetupConnection rejected: {}",
-                err.error_code,
-            )))
+            warn!(error_code = %err.error_code, "SetupConnection rejected by gateway");
+            Err(MinerError::Protocol(
+                "SetupConnection rejected by gateway".to_string(),
+            ))
         }
-        other => Err(MinerError::Protocol(format!(
-            "expected SetupConnection response, got msg_type 0x{other:02x}",
-        ))),
+        other => {
+            warn!(
+                msg_type = format!("0x{other:02x}"),
+                "unexpected response to SetupConnection"
+            );
+            Err(MinerError::Protocol(
+                "unexpected response to SetupConnection".to_string(),
+            ))
+        }
     }
 }
 
@@ -197,14 +206,20 @@ async fn open_channel(
         }
         MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR => {
             let err = sv2_codec::OpenMiningChannelError::decode(&resp_payload)?;
-            Err(MinerError::Protocol(format!(
-                "OpenStandardMiningChannel rejected: {}",
-                err.error_code,
-            )))
+            warn!(error_code = %err.error_code, "OpenStandardMiningChannel rejected by gateway");
+            Err(MinerError::Protocol(
+                "OpenStandardMiningChannel rejected by gateway".to_string(),
+            ))
         }
-        other => Err(MinerError::Protocol(format!(
-            "expected OpenStandardMiningChannel response, got msg_type 0x{other:02x}",
-        ))),
+        other => {
+            warn!(
+                msg_type = format!("0x{other:02x}"),
+                "unexpected response to OpenStandardMiningChannel"
+            );
+            Err(MinerError::Protocol(
+                "unexpected response to OpenStandardMiningChannel".to_string(),
+            ))
+        }
     }
 }
 

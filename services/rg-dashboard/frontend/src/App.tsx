@@ -1403,17 +1403,8 @@ function SettingsPage({ caps }: { caps: ModeCapabilities }) {
           <SettingsRow label="log_format" readOnly>
             <SettingsInput value={ds.log_format} disabled />
           </SettingsRow>
-          <SettingsRow label="verifier_url" readOnly>
-            <SettingsInput value={ds.verifier_url} disabled />
-          </SettingsRow>
-          <SettingsRow label="template_url" readOnly>
-            <SettingsInput value={ds.template_url} disabled />
-          </SettingsRow>
-          <SettingsRow label="auth_url" readOnly>
-            <SettingsInput value={ds.auth_url} disabled />
-          </SettingsRow>
-          <SettingsRow label="gateway_url" readOnly>
-            <SettingsInput value={ds.gateway_url || "(none)"} disabled />
+          <SettingsRow label="gateway_configured" readOnly>
+            <SettingsInput value={ds.gateway_configured ? "yes" : "no"} disabled />
           </SettingsRow>
         </div>
       </Card>

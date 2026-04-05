@@ -28,11 +28,11 @@ use verdicts::{DEPLOY_MODE, load_verdict_log};
 #[command(name = "pool-verifier", about = "Veldra pool template verifier")]
 struct Cli {
     /// TCP listen address for template verdicts.
-    #[arg(long, env = "VELDRA_VERIFIER_ADDR", default_value = "0.0.0.0:9090")]
+    #[arg(long, env = "VELDRA_VERIFIER_ADDR", default_value = "127.0.0.1:9090")]
     tcp_addr: String,
 
     /// HTTP listen address for dashboard and API.
-    #[arg(long, env = "VELDRA_HTTP_ADDR", default_value = "0.0.0.0:8081")]
+    #[arg(long, env = "VELDRA_HTTP_ADDR", default_value = "127.0.0.1:8081")]
     http_addr: String,
 
     /// Deploy mode (shadow, observe, inline). Controls WAL persistence and
@@ -83,12 +83,40 @@ fn init_tracing() -> LogReloadHandle {
     reload_handle
 }
 
+// ── Startup checks ──────────────────────────────────────────
+
+/// Require `VELDRA_API_SECRET` unless explicitly opted out via
+/// `VELDRA_API_SECRET_OPTIONAL=1`. Exits the process when the secret is
+/// missing and no opt-out is present.
+fn enforce_api_secret() {
+    let api_secret_set = env::var("VELDRA_API_SECRET")
+        .ok()
+        .is_some_and(|s| !s.is_empty());
+    let api_secret_optional = env::var("VELDRA_API_SECRET_OPTIONAL").as_deref() == Ok("1");
+    if !api_secret_set && !api_secret_optional {
+        tracing::error!(
+            "VELDRA_API_SECRET is not set. All protected HTTP endpoints would be open. \
+             Set VELDRA_API_SECRET to a strong secret, or set VELDRA_API_SECRET_OPTIONAL=1 \
+             to explicitly allow unauthenticated access (not recommended)."
+        );
+        std::process::exit(1);
+    }
+    if !api_secret_set && api_secret_optional {
+        tracing::warn!(
+            "VELDRA_API_SECRET is not set but VELDRA_API_SECRET_OPTIONAL=1 is active. \
+             Protected endpoints are open without authentication."
+        );
+    }
+}
+
 // ── Main ─────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let log_reload = init_tracing();
     let cli = Cli::parse();
+
+    enforce_api_secret();
 
     let tcp_addr = cli.tcp_addr;
     let http_addr = cli.http_addr;
@@ -149,6 +177,8 @@ async fn main() -> anyhow::Result<()> {
     let http_log = verdict_log.clone();
     let http_ui_mode = ui_mode.clone();
     let http_state = app_state.clone();
+    let http_tcp_addr = tcp_addr.clone();
+    let http_policy_file = policy_path.clone();
 
     let mempool_url = mempool_url_from_env();
     let tcp_mempool_url = mempool_url.clone();
@@ -191,6 +221,8 @@ async fn main() -> anyhow::Result<()> {
     let http_task = tokio::spawn(async move {
         if let Err(e) = http::run_http_server(
             http_addr,
+            http_tcp_addr,
+            http_policy_file,
             http_log,
             http_ui_mode,
             http_state,

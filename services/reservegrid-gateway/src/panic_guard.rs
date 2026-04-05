@@ -46,18 +46,37 @@ pub async fn panic_guard_layer(req: Request<Body>, next: Next) -> Response {
     match result {
         Ok(resp) => resp,
         Err(join_err) => {
-            // The task panicked. Log the error.
-            let panic_msg = if let Some(s) = join_err.into_panic().downcast_ref::<&str>() {
-                (*s).to_string()
+            if join_err.is_cancelled() {
+                tracing::error!(
+                    reason_code = %ReasonCode::InternalError.as_str(),
+                    "handler task cancelled",
+                );
+            } else if join_err.is_panic() {
+                let panic_payload = join_err.into_panic();
+                let raw_msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                    (*s).to_string()
+                } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic".to_string()
+                };
+                // Truncate to prevent leaking excessive internal state.
+                let panic_msg = if raw_msg.len() > 200 {
+                    &raw_msg[..200]
+                } else {
+                    &raw_msg
+                };
+                tracing::error!(
+                    reason_code = %ReasonCode::InternalError.as_str(),
+                    panic_message = %panic_msg,
+                    "handler panicked",
+                );
             } else {
-                "unknown panic".to_string()
-            };
-
-            tracing::error!(
-                reason_code = %ReasonCode::InternalError.as_str(),
-                panic_message = %panic_msg,
-                "handler panicked",
-            );
+                tracing::error!(
+                    reason_code = %ReasonCode::InternalError.as_str(),
+                    "handler task failed with unknown error",
+                );
+            }
 
             let body = ErrorResponse {
                 reason_code: ReasonCode::InternalError,

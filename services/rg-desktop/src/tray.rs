@@ -1,11 +1,11 @@
-//! System tray integration for ReserveGrid OS.
+//! System tray integration for `ReserveGrid` OS.
 //!
 //! Shows the Veldra mark icon in the OS tray with a right-click menu:
 //! - "Open Dashboard" — brings the main window to focus
 //! - "Quit" — exits the app
 //!
 //! The tray icon provides a persistent presence even when the window is closed,
-//! signaling that ReserveGrid is running.
+//! signaling that `ReserveGrid` is running.
 
 use tauri::{
     AppHandle, Manager,

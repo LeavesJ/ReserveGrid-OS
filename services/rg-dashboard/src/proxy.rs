@@ -285,11 +285,7 @@ async fn proxy_to(
         }
         Err(e) => {
             warn!(error = %e, upstream = %url, "upstream request failed");
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("upstream unavailable: {url}"),
-            )
-                .into_response()
+            (StatusCode::BAD_GATEWAY, "upstream unavailable").into_response()
         }
     }
 }

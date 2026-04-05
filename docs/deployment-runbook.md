@@ -4,8 +4,8 @@ Production deployment guide for pool operators. Covers all three deployment
 modes (shadow, observe, inline), security configuration, monitoring, backup,
 upgrade procedures, and troubleshooting.
 
-Version: 1.0.0
-Last updated: 2026-03-12
+Version: 1.0.1
+Last updated: 2026-04-04
 
 ---
 
@@ -61,9 +61,10 @@ docker compose -f docker-compose.shadow.yml up --build
 ```
 
 **Observe** (paid evaluation, read-only). Live mainnet template data from a
-Veldra-hosted reference feed. Requires a license key from Veldra. Verdicts are
-logged but not enforced. Use this to see how your real template traffic looks
-under policy, without any production risk.
+Veldra-hosted reference feed. Requires a signed license key from veldra.org
+with tier `observe_paid` or `inline_licensed`. Verdicts are logged but not
+enforced. Use this to see how your real template traffic looks under policy,
+without any production risk.
 
 ```
 docker compose -f docker-compose.observe.yml up --build
@@ -107,6 +108,8 @@ if required values are missing.
 | `VELDRA_AUTH_ALLOWED_ORIGIN` | Frontend URL for CORS | `https://dashboard.yourpool.com` |
 | `VELDRA_AUTH_SITE_URL` | Base URL for email links | `https://dashboard.yourpool.com` |
 | `VELDRA_AUTH_URL` | Auth service public URL | `https://auth.yourpool.com` |
+| `VELDRA_LICENSE_SIGNING_KEY` | Ed25519 seed for license key signing (rg-auth only) | Base64url 32-byte seed |
+| `VELDRA_LICENSE_PUBKEY` | Ed25519 pubkey for license verification (rg-feed-server) | Base64 32-byte pubkey |
 
 **Optional but recommended:**
 
@@ -115,6 +118,8 @@ if required values are missing.
 | `VELDRA_GRAFANA_ADMIN_PASSWORD` | `reservegrid` | Change for production |
 | `VELDRA_AUTH_RATE_GLOBAL_CEILING` | (disabled) | Set if DDoS is a concern |
 | `VELDRA_AUTH_SESSION_TTL_HOURS` | `168` (7 days) | Reduce for higher security |
+| `VELDRA_VERDICT_LOG_MAX_ENTRIES` | `1000` | Cap in-memory verdict log size |
+| `VELDRA_MEMPOOL_TIMEOUT_MS` | `900` | Mempool HTTP client timeout |
 
 ---
 
@@ -321,7 +326,7 @@ What to look for in a healthy startup sequence:
 2. `pool-verifier` logs `listening on 0.0.0.0:9090` and `http server on 0.0.0.0:8081`
 3. `template-manager` logs first template received from bitcoind
 4. `sv2-gateway` logs `listening for miners on 0.0.0.0:3333`
-5. `rg-dashboard` logs `serving on 0.0.0.0:8084`
+5. `rg-dashboard` logs `rg-dashboard listening` on the configured address (default `127.0.0.1:8084`; compose overrides to `0.0.0.0:8084` via `dev/dashboard.toml`)
 6. `prometheus` begins scraping (check `http://localhost:9091/targets`) — requires `--profile monitoring`
 7. `grafana` loads the provisioned dashboard (check `http://localhost:3000`) — requires `--profile monitoring`
 

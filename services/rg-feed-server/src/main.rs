@@ -10,7 +10,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use clap::Parser;
@@ -21,6 +21,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::server::{
     Callback, ErrorResponse, Request, Response,
 };
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tracing::{error, info, warn};
 
 mod auth;
@@ -54,6 +55,10 @@ struct Cli {
 // WebSocket handshake callback: extracts Bearer token
 // ---------------------------------------------------------------------------
 
+/// Maximum bearer token length to prevent memory abuse. Signed license keys
+/// (`veldra_lic_`) are roughly 300+ chars, so 512 gives comfortable headroom.
+const MAX_TOKEN_LENGTH: usize = 512;
+
 struct AuthCallback {
     /// Written during the handshake; read after to decide accept/reject.
     token: std::sync::Mutex<Option<String>>,
@@ -61,14 +66,20 @@ struct AuthCallback {
 
 impl Callback for &AuthCallback {
     fn on_request(self, request: &Request, response: Response) -> Result<Response, ErrorResponse> {
+        // Use the typed header constant for case-insensitive lookup.
         let auth_header = request
             .headers()
-            .get("authorization")
+            .get(http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
 
         let token = if let Some(stripped) = auth_header.strip_prefix("Bearer ") {
-            stripped.trim().to_string()
+            let trimmed = stripped.trim();
+            if trimmed.len() > MAX_TOKEN_LENGTH {
+                String::new()
+            } else {
+                trimmed.to_string()
+            }
         } else {
             String::new()
         };
@@ -112,7 +123,11 @@ async fn main() {
         std::process::exit(1);
     });
 
-    let validator = KeyValidator::new(&cfg.auth.valid_keys, &cfg.auth.auth_url);
+    let validator = KeyValidator::new(
+        &cfg.auth.license_pubkey,
+        &cfg.auth.valid_keys,
+        &cfg.auth.auth_url,
+    );
     let feed_state = Arc::new(FeedState::new());
 
     let (tx, _rx) = broadcast::channel::<Arc<String>>(cfg.feed.channel_capacity);
@@ -150,7 +165,17 @@ async fn main() {
         std::process::exit(1);
     });
 
-    info!(%addr, "rg-feed-server listening");
+    if !addr.ip().is_loopback() {
+        warn!(
+            %addr,
+            "feed server binding to non-loopback address; ensure network access is intentional"
+        );
+    }
+
+    let max_conns = cfg.feed.max_connections;
+    let active_conns = Arc::new(AtomicUsize::new(0));
+
+    info!(%addr, max_connections = max_conns, "rg-feed-server listening");
 
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -161,12 +186,30 @@ async fn main() {
             }
         };
 
+        // Enforce connection limit (0 = unlimited).
+        if max_conns > 0 {
+            let current = active_conns.load(Ordering::Relaxed);
+            if current >= max_conns {
+                warn!(
+                    %peer,
+                    active = current,
+                    max = max_conns,
+                    "connection rejected: at capacity"
+                );
+                drop(stream);
+                continue;
+            }
+        }
+        active_conns.fetch_add(1, Ordering::Relaxed);
+
         let rx = tx.subscribe();
         let val = validator.clone();
         let state = feed_state.clone();
+        let conns = active_conns.clone();
 
         tokio::spawn(async move {
             handle_connection(stream, rx, peer, val, state).await;
+            conns.fetch_sub(1, Ordering::Relaxed);
         });
     }
 }
@@ -183,13 +226,22 @@ async fn handle_connection(
         token: std::sync::Mutex::new(None),
     };
 
-    let ws_stream = match tokio_tungstenite::accept_hdr_async(stream, &auth_cb).await {
-        Ok(ws) => ws,
-        Err(e) => {
-            info!(%peer, error = %e, "websocket handshake failed");
-            return;
-        }
+    let ws_config = WebSocketConfig {
+        max_message_size: Some(1024 * 1024), // 1 MiB
+        max_frame_size: Some(256 * 1024),    // 256 KiB
+        ..WebSocketConfig::default()
     };
+
+    let ws_stream =
+        match tokio_tungstenite::accept_hdr_async_with_config(stream, &auth_cb, Some(ws_config))
+            .await
+        {
+            Ok(ws) => ws,
+            Err(e) => {
+                info!(%peer, error = %e, "websocket handshake failed");
+                return;
+            }
+        };
 
     // Extract token from callback.
     let token = auth_cb
@@ -200,7 +252,7 @@ async fn handle_connection(
         .unwrap_or_default();
 
     // Validate the key.
-    if !validator.validate(&token).await {
+    let Some(validated) = validator.validate(&token).await else {
         info!(%peer, "rejected: invalid or missing license key");
 
         let (mut writer, _reader) = ws_stream.split();
@@ -209,14 +261,23 @@ async fn handle_connection(
             "ts": feed::now_ts(),
             "data": {"code": "unauthorized", "detail": "invalid or missing license key"},
         });
-        if let Ok(msg) = serde_json::to_string(&err_frame) {
-            let _ = writer.send(Message::Text(msg)).await;
+        if let Ok(msg) = serde_json::to_string(&err_frame)
+            && let Err(e) = writer.send(Message::Text(msg)).await
+        {
+            warn!(%peer, error = %e, "failed to send auth error frame");
         }
-        let _ = writer.close().await;
+        if let Err(e) = writer.close().await {
+            warn!(%peer, error = %e, "failed to close rejected connection");
+        }
         return;
-    }
+    };
 
-    info!(%peer, "client authenticated");
+    info!(
+        %peer,
+        org_id = %validated.org_id,
+        tier = %validated.tier,
+        "client authenticated"
+    );
 
     let (mut writer, mut reader) = ws_stream.split();
 
@@ -230,8 +291,11 @@ async fn handle_connection(
                 "rpc_ok": true,
             },
         });
-        if let Ok(msg) = serde_json::to_string(&status_frame) {
-            let _ = writer.send(Message::Text(msg)).await;
+        if let Ok(msg) = serde_json::to_string(&status_frame)
+            && let Err(e) = writer.send(Message::Text(msg)).await
+        {
+            warn!(%peer, error = %e, "failed to send initial status frame");
+            return;
         }
     }
 
@@ -253,7 +317,9 @@ async fn handle_connection(
             incoming = reader.next() => {
                 match incoming {
                     Some(Ok(Message::Ping(data))) => {
-                        let _ = writer.send(Message::Pong(data)).await;
+                        if writer.send(Message::Pong(data)).await.is_err() {
+                            break;
+                        }
                     }
                     Some(Ok(Message::Close(_)) | Err(_)) | None => break,
                     Some(Ok(_)) => {} // ignore client text/binary

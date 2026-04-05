@@ -55,6 +55,12 @@ hmac = "0.12"
 # Hex encoding
 hex = "0.4"
 
+# Security (constant-time comparison)
+subtle = "2"
+
+# HTTP middleware layers
+tower-http = { version = "0.6", features = ["limit"] }
+
 # TLS (verifier mTLS)
 tokio-rustls = "0.26"
 rustls-pemfile = "2"

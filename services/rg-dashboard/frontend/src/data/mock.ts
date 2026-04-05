@@ -255,11 +255,8 @@ export const MOCK_DASHBOARD_SETTINGS: DashboardSettings = {
   log_level: "info",
   log_format: "pretty",
   deploy_mode: "inline",
-  listen: "0.0.0.0:8084",
-  verifier_url: "http://pool-verifier:8081",
-  template_url: "http://template-manager:8082",
-  auth_url: "http://rg-auth:3030",
-  gateway_url: "http://sv2-gateway:8080",
+  listen: "127.0.0.1:8084",
+  gateway_configured: true,
 };
 
 export const MOCK_MINERS: MinerConnection[] = [

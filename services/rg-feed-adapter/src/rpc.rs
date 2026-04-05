@@ -67,7 +67,7 @@ pub async fn handle_jsonrpc(
                     result: None,
                     error: Some(RpcError {
                         code: -32700,
-                        message: format!("parse error: {e}"),
+                        message: "parse error".into(),
                     }),
                     id: serde_json::Value::Null,
                 }),
@@ -134,7 +134,7 @@ pub async fn handle_jsonrpc(
                     result: None,
                     error: Some(RpcError {
                         code: -32601,
-                        message: format!("method not supported by feed adapter: {other}"),
+                        message: "method not found".into(),
                     }),
                     id,
                 }),

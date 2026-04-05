@@ -54,15 +54,22 @@ pub struct GatewaySection {
     #[serde(default = "default_max_connections")]
     pub max_connections: u32,
 
-    /// Maximum concurrent connections from a single IP address. Default 0
-    /// (unlimited). When nonzero, connections beyond this threshold from the
-    /// same source IP are rejected before the Noise handshake.
-    #[serde(default)]
+    /// Maximum concurrent connections from a single IP address. Default 16.
+    /// When nonzero, connections beyond this threshold from the same source
+    /// IP are rejected before the Noise handshake. Set to 0 to disable
+    /// (not recommended for production).
+    #[serde(default = "default_max_connections_per_ip")]
     pub max_connections_per_ip: u32,
 
     /// Maximum standard mining channels per connection.
     #[serde(default = "default_max_channels_per_conn")]
     pub max_channels_per_conn: u32,
+
+    /// Timeout for the initial channel open after SetupConnection (ms).
+    /// Miners that do not open a channel within this period are disconnected.
+    /// Default 30000 (30 seconds).
+    #[serde(default = "default_channel_open_timeout_ms")]
+    pub channel_open_timeout_ms: u64,
 
     /// Maximum worker identity length in bytes.
     #[serde(default = "default_max_worker_id_bytes")]
@@ -185,6 +192,14 @@ pub struct VerifierSection {
     #[serde(default = "default_health_probe_staleness_ms")]
     pub health_probe_staleness_ms: u64,
 
+    /// Delay between reconnect attempts to the verifier (ms). Default 2000.
+    #[serde(default = "default_verifier_reconnect_delay_ms")]
+    pub reconnect_delay_ms: u64,
+
+    /// Heartbeat send interval on the verifier stream (ms). Default 5000.
+    #[serde(default = "default_verifier_heartbeat_interval_ms")]
+    pub heartbeat_interval_ms: u64,
+
     /// Path to the CA certificate PEM file for verifying the verifier's server
     /// certificate. When set, TLS is enabled on the verifier channel.
     #[serde(default)]
@@ -295,10 +310,13 @@ pub struct PrefixMapping {
 // ── Default value functions ──
 
 fn default_health_addr() -> String {
-    "0.0.0.0:8080".to_string()
+    "127.0.0.1:8080".to_string()
 }
 fn default_max_connections() -> u32 {
     1024
+}
+fn default_max_connections_per_ip() -> u32 {
+    16
 }
 fn default_max_channels_per_conn() -> u32 {
     256
@@ -342,6 +360,15 @@ fn default_max_future_block_time_seconds() -> u32 {
 fn default_health_probe_staleness_ms() -> u64 {
     10_000
 }
+fn default_verifier_reconnect_delay_ms() -> u64 {
+    2_000
+}
+fn default_verifier_heartbeat_interval_ms() -> u64 {
+    5_000
+}
+fn default_channel_open_timeout_ms() -> u64 {
+    30_000
+}
 fn default_share_upstream_retries() -> u32 {
     2
 }
@@ -369,6 +396,12 @@ fn default_gateway_instance_id() -> String {
 
 /// Check whether an address string (host:port or host) resolves to a loopback
 /// interface. Accepts `127.x.x.x`, `::1`, `[::1]:port`, and `localhost` variants.
+///
+/// Public alias used by the binary for startup warnings.
+pub fn is_loopback_addr_public(addr: &str) -> bool {
+    is_loopback_addr(addr)
+}
+
 fn is_loopback_addr(addr: &str) -> bool {
     // Try parsing as SocketAddr first (covers "127.0.0.1:9100" and "[::1]:9100").
     if let Ok(sa) = addr.parse::<std::net::SocketAddr>() {
@@ -463,6 +496,50 @@ pub fn validate(config: &GatewayConfig) -> Result<Vec<String>, String> {
         warnings.push("noise_handshake_timeout_ms > 120s is unusually high".to_string());
     }
 
+    // ── Timing parameter cross-validation ──
+    // Invariant chain: verdict_timeout < stale_hold < upstream_stale_max <= job_retention
+    if config.gateway.prevhash_verdict_timeout_ms == 0 {
+        return Err("prevhash_verdict_timeout_ms must be > 0".to_string());
+    }
+    if config.gateway.prevhash_verdict_timeout_ms
+        >= config.gateway.prevhash_stale_hold_ms
+    {
+        return Err(format!(
+            "prevhash_verdict_timeout_ms ({}) must be < prevhash_stale_hold_ms ({}); \
+             the verdict must arrive before the stale hold expires",
+            config.gateway.prevhash_verdict_timeout_ms,
+            config.gateway.prevhash_stale_hold_ms,
+        ));
+    }
+    if config.gateway.prevhash_stale_hold_ms
+        >= config.gateway.upstream_stale_max_ms
+    {
+        return Err(format!(
+            "prevhash_stale_hold_ms ({}) must be < upstream_stale_max_ms ({}); \
+             the stale hold must finish before the upstream is declared dead",
+            config.gateway.prevhash_stale_hold_ms,
+            config.gateway.upstream_stale_max_ms,
+        ));
+    }
+    if config.gateway.job_retention_ms < config.gateway.upstream_stale_max_ms {
+        return Err(format!(
+            "job_retention_ms ({}) must be >= upstream_stale_max_ms ({}); \
+             jobs must outlive upstream staleness detection",
+            config.gateway.job_retention_ms,
+            config.gateway.upstream_stale_max_ms,
+        ));
+    }
+    if config.verifier.health_probe_staleness_ms == 0 {
+        return Err("health_probe_staleness_ms must be > 0".to_string());
+    }
+    if config.gateway.prevhash_verdict_timeout_ms < 1000 {
+        warnings.push(format!(
+            "prevhash_verdict_timeout_ms={} is below 1000ms; \
+             this is regtest-appropriate but will cause mass disconnections on mainnet",
+            config.gateway.prevhash_verdict_timeout_ms,
+        ));
+    }
+
     // ── Verifier TLS field consistency ──
     // If tls_ca_cert is set, both client cert and key must also be set (mTLS).
     if config.verifier.tls_ca_cert.is_some()
@@ -525,8 +602,9 @@ mod tests {
                 noise_cert_path: "/etc/sv2/cert.bin".to_string(),
                 authority_pubkey: "a".repeat(64),
                 max_connections: default_max_connections(),
-                max_connections_per_ip: 0,
+                max_connections_per_ip: default_max_connections_per_ip(),
                 max_channels_per_conn: default_max_channels_per_conn(),
+                channel_open_timeout_ms: default_channel_open_timeout_ms(),
                 max_worker_id_bytes: default_max_worker_id_bytes(),
                 noise_cert_validity_secs: default_noise_cert_validity_secs(),
                 noise_handshake_timeout_ms: default_noise_handshake_timeout_ms(),
@@ -553,6 +631,8 @@ mod tests {
             verifier: VerifierSection {
                 addr: "127.0.0.1:9100".to_string(),
                 health_probe_staleness_ms: default_health_probe_staleness_ms(),
+                reconnect_delay_ms: default_verifier_reconnect_delay_ms(),
+                heartbeat_interval_ms: default_verifier_heartbeat_interval_ms(),
                 tls_ca_cert: None,
                 tls_client_cert: None,
                 tls_client_key: None,
@@ -572,7 +652,9 @@ mod tests {
 
     #[test]
     fn validate_inline_with_upstream_succeeds() {
-        let config = minimal_config(GatewayMode::Inline);
+        let mut config = minimal_config(GatewayMode::Inline);
+        // Use a production-appropriate verdict timeout to avoid the regtest warning.
+        config.gateway.prevhash_verdict_timeout_ms = 2000;
         let result = validate(&config);
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
@@ -715,6 +797,8 @@ mod tests {
         let mut section = VerifierSection {
             addr: "127.0.0.1:9100".to_string(),
             health_probe_staleness_ms: 10_000,
+            reconnect_delay_ms: default_verifier_reconnect_delay_ms(),
+            heartbeat_interval_ms: default_verifier_heartbeat_interval_ms(),
             tls_ca_cert: None,
             tls_client_cert: None,
             tls_client_key: None,
@@ -731,5 +815,98 @@ mod tests {
         assert_eq!(config.verifier.addr, "127.0.0.1:9100");
         let result = validate(&config);
         assert!(result.is_ok());
+    }
+
+    // ── Timing cross-validation tests ──
+
+    #[test]
+    fn validate_default_timing_chain_satisfies_invariants() {
+        let config = minimal_config(GatewayMode::Observe);
+        let result = validate(&config);
+        assert!(result.is_ok(), "defaults must pass: {result:?}");
+    }
+
+    #[test]
+    fn validate_rejects_zero_prevhash_verdict_timeout() {
+        let mut config = minimal_config(GatewayMode::Observe);
+        config.gateway.prevhash_verdict_timeout_ms = 0;
+        let result = validate(&config);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("prevhash_verdict_timeout_ms must be > 0"),
+        );
+    }
+
+    #[test]
+    fn validate_rejects_verdict_timeout_gte_stale_hold() {
+        let mut config = minimal_config(GatewayMode::Observe);
+        config.gateway.prevhash_verdict_timeout_ms = 5000;
+        config.gateway.prevhash_stale_hold_ms = 5000;
+        let result = validate(&config);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("must be < prevhash_stale_hold_ms"),
+        );
+    }
+
+    #[test]
+    fn validate_rejects_stale_hold_gte_upstream_stale_max() {
+        let mut config = minimal_config(GatewayMode::Observe);
+        config.gateway.prevhash_stale_hold_ms = 30_000;
+        config.gateway.upstream_stale_max_ms = 30_000;
+        let result = validate(&config);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("must be < upstream_stale_max_ms"),
+        );
+    }
+
+    #[test]
+    fn validate_rejects_job_retention_below_upstream_stale_max() {
+        let mut config = minimal_config(GatewayMode::Observe);
+        config.gateway.job_retention_ms = 10_000;
+        config.gateway.upstream_stale_max_ms = 30_000;
+        let result = validate(&config);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("must be >= upstream_stale_max_ms"),
+        );
+    }
+
+    #[test]
+    fn validate_rejects_zero_health_probe_staleness() {
+        let mut config = minimal_config(GatewayMode::Observe);
+        config.verifier.health_probe_staleness_ms = 0;
+        let result = validate(&config);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("health_probe_staleness_ms must be > 0"),
+        );
+    }
+
+    #[test]
+    fn validate_warns_on_low_prevhash_verdict_timeout() {
+        let config = minimal_config(GatewayMode::Observe);
+        // Default is 50ms which is < 1000, so warning expected.
+        let result = validate(&config);
+        assert!(result.is_ok());
+        let warnings = result.unwrap();
+        assert!(
+            warnings.iter().any(|w| w.contains("prevhash_verdict_timeout_ms=50")),
+            "expected regtest warning, got: {warnings:?}",
+        );
+    }
+
+    #[test]
+    fn validate_no_regtest_warning_above_1000ms() {
+        let mut config = minimal_config(GatewayMode::Observe);
+        config.gateway.prevhash_verdict_timeout_ms = 2000;
+        let result = validate(&config);
+        assert!(result.is_ok());
+        let warnings = result.unwrap();
+        assert!(
+            !warnings.iter().any(|w| w.contains("regtest")),
+            "unexpected regtest warning: {warnings:?}",
+        );
     }
 }

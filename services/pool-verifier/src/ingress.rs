@@ -5,6 +5,7 @@ use axum::http::{Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use std::io::BufReader as StdBuf;
+use subtle::ConstantTimeEq;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -147,6 +148,14 @@ pub(crate) async fn run_tcp_server(
         "plaintext"
     };
     info!(addr = %addr, tls = tls_mode, "TCP listening");
+    if tls_acceptor.is_none() && !addr.starts_with("127.0.0.1") && !addr.starts_with("[::1]") {
+        tracing::warn!(
+            addr = %addr,
+            "TCP verifier is running without TLS on a non-loopback address. \
+             Templates and verdicts will be sent in plaintext. Set \
+             VELDRA_VERIFIER_TLS_CERT and VELDRA_VERIFIER_TLS_KEY for production."
+        );
+    }
 
     loop {
         let (tcp_stream, _peer) = listener.accept().await?;
@@ -210,7 +219,7 @@ pub(crate) async fn handle_tcp_connection<R, W>(
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    const MAX_LOG: usize = 1000;
+    let max_log = crate::verdicts::verdict_log_max_entries();
 
     let state_clone = app_state;
     let url_clone = mempool_url;
@@ -262,9 +271,18 @@ pub(crate) async fn handle_tcp_connection<R, W>(
                                 payload: serde_json::json!({}),
                             };
                             if let Ok(json) = serde_json::to_string(&ack) {
-                                let _ = writer.write_all(json.as_bytes()).await;
-                                let _ = writer.write_all(b"\n").await;
-                                let _ = writer.flush().await;
+                                if let Err(e) = writer.write_all(json.as_bytes()).await {
+                                    warn!(error = %e, "heartbeat ack write failed");
+                                    return;
+                                }
+                                if let Err(e) = writer.write_all(b"\n").await {
+                                    warn!(error = %e, "heartbeat ack newline write failed");
+                                    return;
+                                }
+                                if let Err(e) = writer.flush().await {
+                                    warn!(error = %e, "heartbeat ack flush failed");
+                                    return;
+                                }
                             }
                             continue;
                         }
@@ -368,6 +386,10 @@ pub(crate) async fn handle_tcp_connection<R, W>(
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     guard.push(logged.clone());
+                    if guard.len() > max_log {
+                        let excess = guard.len() - max_log;
+                        guard.drain(0..excess);
+                    }
                 }
                 let logged_for_disk = logged.clone();
                 tokio::task::spawn_blocking(move || {
@@ -384,9 +406,18 @@ pub(crate) async fn handle_tcp_connection<R, W>(
                     serde_json::to_string(&verdict)
                 };
                 if let Ok(j) = json {
-                    let _ = writer.write_all(j.as_bytes()).await;
-                    let _ = writer.write_all(b"\n").await;
-                    let _ = writer.flush().await;
+                    if let Err(e) = writer.write_all(j.as_bytes()).await {
+                        warn!(error = %e, "verdict write failed");
+                        return;
+                    }
+                    if let Err(e) = writer.write_all(b"\n").await {
+                        warn!(error = %e, "verdict newline write failed");
+                        return;
+                    }
+                    if let Err(e) = writer.flush().await {
+                        warn!(error = %e, "verdict flush failed");
+                        return;
+                    }
                 }
                 continue;
             }
@@ -497,8 +528,8 @@ pub(crate) async fn handle_tcp_connection<R, W>(
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 guard.push(logged.clone());
-                if guard.len() > MAX_LOG {
-                    let excess = guard.len() - MAX_LOG;
+                if guard.len() > max_log {
+                    let excess = guard.len() - max_log;
                     guard.drain(0..excess);
                 }
             }
@@ -540,6 +571,10 @@ pub(crate) async fn handle_tcp_connection<R, W>(
 }
 
 /// API key middleware for protecting routes.
+///
+/// When `VELDRA_API_SECRET` is set (enforced at startup unless opted out),
+/// every non-public request must carry `Authorization: Bearer <secret>`.
+/// No localhost bypass: all callers are treated equally.
 pub(crate) async fn api_key_middleware(
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     req: Request<Body>,
@@ -547,13 +582,7 @@ pub(crate) async fn api_key_middleware(
 ) -> Response {
     use std::env;
 
-    // Localhost bypass: 127.0.0.1 and ::1 skip auth.
-    let is_loopback = addr.ip().is_loopback();
-    if is_loopback {
-        return next.run(req).await;
-    }
-
-    // If no VELDRA_API_SECRET is configured, auth is disabled (open access).
+    // If VELDRA_API_SECRET_OPTIONAL=1 was set and no secret exists, allow all.
     let expected = match env::var("VELDRA_API_SECRET") {
         Ok(k) if !k.is_empty() => k,
         _ => return next.run(req).await,
@@ -566,12 +595,17 @@ pub(crate) async fn api_key_middleware(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| {
             let stripped = v.strip_prefix("Bearer ").unwrap_or(v);
-            stripped == expected
+            stripped.as_bytes().ct_eq(expected.as_bytes()).into()
         });
 
     if authorized {
         next.run(req).await
     } else {
+        tracing::warn!(
+            peer = %addr,
+            path = %req.uri().path(),
+            "api_key_auth_failed"
+        );
         (StatusCode::UNAUTHORIZED, "missing or invalid api key").into_response()
     }
 }

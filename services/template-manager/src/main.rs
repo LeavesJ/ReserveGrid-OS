@@ -1,9 +1,9 @@
 use std::{
-    collections::hash_map::DefaultHasher,
+    collections::{VecDeque, hash_map::DefaultHasher},
     env,
     hash::{Hash, Hasher},
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{Arc, LazyLock, Mutex},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -14,13 +14,18 @@ use tokio::time::{Duration, sleep, timeout};
 
 use axum::{
     Extension, Json, Router,
+    body::Body,
+    extract::Request,
     http::StatusCode,
-    response::IntoResponse,
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use bitcoincore_rpc::json::GetBlockTemplateResult;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
+use tower_http::limit::RequestBodyLimitLayer;
 
 use clap::Parser;
 use tracing::{debug, error, info, warn};
@@ -67,6 +72,133 @@ fn init_tracing() {
     } else {
         fmt().with_env_filter(filter).init();
     }
+}
+
+// ── Security: startup enforcement ────────────────────────────
+
+/// Exit immediately if `VELDRA_API_SECRET` is unset without explicit opt-out.
+fn enforce_api_secret() {
+    let api_secret_set = env::var("VELDRA_API_SECRET")
+        .ok()
+        .is_some_and(|s| !s.is_empty());
+    let api_secret_optional = env::var("VELDRA_API_SECRET_OPTIONAL").as_deref() == Ok("1");
+    if !api_secret_set && !api_secret_optional {
+        tracing::error!(
+            "VELDRA_API_SECRET is not set. All protected HTTP endpoints would be open. \
+             Set VELDRA_API_SECRET to a strong secret, or set VELDRA_API_SECRET_OPTIONAL=1 \
+             to explicitly allow unauthenticated access (not recommended)."
+        );
+        std::process::exit(1);
+    }
+    if !api_secret_set && api_secret_optional {
+        tracing::warn!(
+            "VELDRA_API_SECRET is not set but VELDRA_API_SECRET_OPTIONAL=1 is active. \
+             Protected endpoints are open without authentication."
+        );
+    }
+}
+
+/// Warn loudly when HMAC share verification is disabled without explicit opt-out.
+fn enforce_hmac_secret() {
+    let hmac_set = env::var("VELDRA_SHARE_UPSTREAM_SECRET")
+        .ok()
+        .is_some_and(|s| !s.is_empty());
+    let hmac_optional = env::var("VELDRA_SHARE_HMAC_OPTIONAL").as_deref() == Ok("1");
+    if !hmac_set && !hmac_optional {
+        tracing::error!(
+            "VELDRA_SHARE_UPSTREAM_SECRET is not set. Share submissions will be accepted \
+             without signature verification. Set VELDRA_SHARE_UPSTREAM_SECRET to a shared \
+             secret, or set VELDRA_SHARE_HMAC_OPTIONAL=1 to explicitly allow unsigned \
+             shares (not recommended in production)."
+        );
+        std::process::exit(1);
+    }
+    if !hmac_set && hmac_optional {
+        tracing::warn!(
+            "VELDRA_SHARE_UPSTREAM_SECRET is not set but VELDRA_SHARE_HMAC_OPTIONAL=1 \
+             is active. Share submissions are accepted without signature verification."
+        );
+    }
+}
+
+// ── Security: API key auth middleware ────────────────────────
+
+async fn api_key_middleware(req: Request<Body>, next: Next) -> Response {
+    // If VELDRA_API_SECRET_OPTIONAL=1 was set and no secret exists, allow all.
+    let expected = match env::var("VELDRA_API_SECRET") {
+        Ok(k) if !k.is_empty() => k,
+        _ => return next.run(req).await,
+    };
+
+    // Check Authorization header: "Bearer <key>" or raw key.
+    let authorized = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            let stripped = v.strip_prefix("Bearer ").unwrap_or(v);
+            stripped.as_bytes().ct_eq(expected.as_bytes()).into()
+        });
+
+    if authorized {
+        next.run(req).await
+    } else {
+        tracing::warn!(
+            path = %req.uri().path(),
+            "api_key_auth_failed"
+        );
+        (StatusCode::UNAUTHORIZED, "missing or invalid api key").into_response()
+    }
+}
+
+// ── Security: write throttle ─────────────────────────────────
+
+static WRITE_TIMESTAMPS: LazyLock<Mutex<VecDeque<Instant>>> =
+    LazyLock::new(|| Mutex::new(VecDeque::new()));
+
+const WRITE_THROTTLE_WINDOW: Duration = Duration::from_secs(60);
+const WRITE_THROTTLE_MAX: usize = 10;
+
+fn check_write_throttle() -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let now = Instant::now();
+    let mut ts = WRITE_TIMESTAMPS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    while ts
+        .front()
+        .is_some_and(|t| now.duration_since(*t) > WRITE_THROTTLE_WINDOW)
+    {
+        ts.pop_front();
+    }
+    if ts.len() >= WRITE_THROTTLE_MAX {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "write rate limit exceeded, try again later"
+            })),
+        ));
+    }
+    ts.push_back(now);
+    Ok(())
+}
+
+// ── Security: share log path validation ──────────────────────
+
+fn validate_share_log_path(path: &str) -> Result<(), String> {
+    let p = std::path::Path::new(path);
+    if !p.is_absolute() {
+        return Err(format!(
+            "VELDRA_SHARE_LOG_PATH must be absolute, got: {path}"
+        ));
+    }
+    let normalized = p.to_string_lossy();
+    if normalized.contains("..") {
+        return Err(format!(
+            "VELDRA_SHARE_LOG_PATH contains path traversal: {path}"
+        ));
+    }
+    Ok(())
 }
 
 // ── Prometheus Metrics ──────────────────────────────────────
@@ -656,6 +788,7 @@ impl TemplateSource for BitcoindTemplateSource {
                 total_sigops: Some(total_sigops),
                 coinbase_sigops,
                 template_weight: Some(template_weight),
+                gateway_instance_id: None,
             },
             Some(extras),
         )))
@@ -824,6 +957,11 @@ type ShareHmacSecret = Arc<Vec<u8>>;
 
 const TEMPLATE_LOG_CAP: usize = 500;
 
+/// Maximum length for hex-encoded fields in share submissions.
+const MAX_SHARE_HEX_FIELD: usize = 256;
+/// Maximum length for free-text string fields in share submissions.
+const MAX_SHARE_STRING_FIELD: usize = 256;
+
 /// Convert the GBT `bits` field (big-endian byte vec) to a compact u32 nbits.
 fn bits_to_nbits(bits: &[u8]) -> u32 {
     if bits.len() == 4 {
@@ -845,11 +983,19 @@ fn instance_id() -> String {
 #[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
     init_tracing();
+    enforce_api_secret();
+    enforce_hmac_secret();
     let cli = Cli::parse();
     let cfg_path = cli.config;
 
     let cfg = TemplateManagerConfig::from_path(&cfg_path)?;
-    info!(path = %cfg_path, config = ?cfg, "loaded manager config");
+    info!(
+        path = %cfg_path,
+        backend = %cfg.backend,
+        rpc_url = ?cfg.rpc_url,
+        rpc_pass_set = cfg.rpc_pass.is_some(),
+        "loaded manager config"
+    );
 
     let verifier_addr = env::var("VELDRA_VERIFIER_ADDR")
         .ok()
@@ -872,6 +1018,13 @@ async fn main() -> Result<()> {
                 .filter(|s| !s.trim().is_empty())
         })
         .unwrap_or_else(|| "127.0.0.1:8081".to_string());
+
+    if !http_addr.starts_with("127.0.0.1") && !http_addr.starts_with("[::1]") {
+        tracing::warn!(
+            addr = %http_addr,
+            "HTTP server binding to a non-loopback address; ensure network access is intentional"
+        );
+    }
 
     info!(
         backend = %cfg.backend,
@@ -936,12 +1089,12 @@ async fn main() -> Result<()> {
             .filter(|s| !s.is_empty()),
     );
 
-    if share_hmac_secret.is_empty() {
-        info!("share HMAC verification disabled (VELDRA_SHARE_UPSTREAM_SECRET not set)");
-    } else {
-        info!("share HMAC verification enabled");
-    }
+    // Validate share log path to prevent path traversal (TM-9).
     if let Some(ref p) = *share_log_path {
+        if let Err(e) = validate_share_log_path(p) {
+            tracing::error!(error = %e, "invalid VELDRA_SHARE_LOG_PATH");
+            std::process::exit(1);
+        }
         info!(path = %p, "share NDJSON log enabled");
     }
 
@@ -1028,15 +1181,23 @@ fn build_router(
     metrics_registry: SharedRegistry,
     metrics: SharedTmgrMetrics,
 ) -> Router {
-    Router::new()
+    // Public routes: /health and /metrics bypass API key auth.
+    let public = Router::new()
         .route("/health", get(health_check))
+        .route("/metrics", get(tmgr_metrics_handler));
+
+    // Protected routes: require API key when VELDRA_API_SECRET is set.
+    let protected = Router::new()
         .route("/templates", get(get_templates))
         .route("/latest", get(get_latest_template))
         .route("/mempool", get(get_mempool))
         .route("/shares", post(ingest_share))
         .route("/settings", get(get_settings))
         .route("/settings/save", post(save_settings))
-        .route("/metrics", get(tmgr_metrics_handler))
+        .layer(middleware::from_fn(api_key_middleware));
+
+    public
+        .merge(protected)
         .layer(Extension(template_log))
         .layer(Extension(latest_template))
         .layer(Extension(mempool_log))
@@ -1047,6 +1208,7 @@ fn build_router(
         .layer(Extension(config_path))
         .layer(Extension(metrics_registry))
         .layer(Extension(metrics))
+        .layer(RequestBodyLimitLayer::new(1024 * 1024)) // 1 MB
 }
 
 /// Path to the manager config TOML on disk.
@@ -1136,14 +1298,23 @@ async fn save_settings(
     Extension(config_path): Extension<MgrConfigPath>,
     Json(req): Json<MgrSaveSettingsReq>,
 ) -> impl IntoResponse {
+    if let Err(e) = check_write_throttle() {
+        return e;
+    }
+
     // Validate backend if provided.
     if let Some(ref backend) = req.backend {
         let allowed = ["bitcoind", "stratum"];
+        let safe_backend = if backend.len() > 64 {
+            &backend[..64]
+        } else {
+            backend.as_str()
+        };
         if !allowed.contains(&backend.as_str()) {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(
-                    serde_json::json!({ "ok": false, "error": format!("invalid backend: {backend}; expected one of {allowed:?}") }),
+                    serde_json::json!({ "ok": false, "error": format!("invalid backend: {safe_backend}; expected one of {allowed:?}") }),
                 ),
             );
         }
@@ -1165,10 +1336,15 @@ async fn save_settings(
     if let Some(ref hex_str) = req.coinbase_output_script_hex
         && hex::decode(hex_str).is_err()
     {
+        let safe_hex = if hex_str.len() > 64 {
+            &hex_str[..64]
+        } else {
+            hex_str
+        };
         return (
             StatusCode::BAD_REQUEST,
             Json(
-                serde_json::json!({ "ok": false, "error": format!("coinbase_output_script_hex is not valid hex: {hex_str}") }),
+                serde_json::json!({ "ok": false, "error": format!("coinbase_output_script_hex is not valid hex: {safe_hex}") }),
             ),
         );
     }
@@ -1189,10 +1365,12 @@ async fn save_settings(
     let mut doc: toml::Value = match toml::from_str(&toml_text) {
         Ok(v) => v,
         Err(e) => {
+            let msg = format!("{e}");
+            let truncated = if msg.len() > 200 { &msg[..200] } else { &msg };
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(
-                    serde_json::json!({ "ok": false, "error": format!("failed to parse config: {e}") }),
+                    serde_json::json!({ "ok": false, "error": format!("failed to parse config: {truncated}") }),
                 ),
             );
         }
@@ -1261,10 +1439,12 @@ async fn save_settings(
         }
         Err(e) => {
             let _ = std::fs::remove_file(&tmp_validate);
+            let msg = format!("{e}");
+            let truncated = if msg.len() > 200 { &msg[..200] } else { &msg };
             return (
                 StatusCode::BAD_REQUEST,
                 Json(
-                    serde_json::json!({ "ok": false, "error": format!("validation failed: {e}") }),
+                    serde_json::json!({ "ok": false, "error": format!("validation failed: {truncated}") }),
                 ),
             );
         }
@@ -1281,7 +1461,11 @@ async fn save_settings(
         );
     }
 
-    info!(path = %config_path.display(), "manager config saved to disk");
+    info!(
+        event = "settings_saved",
+        path = %config_path.display(),
+        "manager config saved to disk"
+    );
 
     (
         StatusCode::OK,
@@ -1623,6 +1807,27 @@ async fn ingest_share(
     Json(submission): Json<ShareSubmissionRecord>,
 ) -> Json<ShareUpstreamResponse> {
     metrics.shares_ingested_total.inc();
+
+    // Validate field sizes to prevent abuse (TM-18).
+    if submission.share_id_hex.len() > MAX_SHARE_HEX_FIELD
+        || submission.prev_hash_wire_hex.len() > MAX_SHARE_HEX_FIELD
+        || submission.prev_hash_display_hex.len() > MAX_SHARE_HEX_FIELD
+        || submission.merkle_root_wire_hex.len() > MAX_SHARE_HEX_FIELD
+        || submission.merkle_root_display_hex.len() > MAX_SHARE_HEX_FIELD
+        || submission.event_id_hex.len() > MAX_SHARE_HEX_FIELD
+        || submission.gateway_signature_hex.len() > MAX_SHARE_HEX_FIELD
+        || submission.worker_id.len() > MAX_SHARE_STRING_FIELD
+        || submission.gateway_instance_id.len() > MAX_SHARE_STRING_FIELD
+        || submission.source_instance_id.len() > MAX_SHARE_STRING_FIELD
+        || submission.validation_level.len() > MAX_SHARE_STRING_FIELD
+    {
+        warn!("share rejected: one or more fields exceed maximum length");
+        return Json(ShareUpstreamResponse {
+            accepted: false,
+            reason: Some("field_size_exceeded".to_string()),
+        });
+    }
+
     // Verify HMAC signature when secret is configured.
     if !hmac_secret.is_empty() {
         if submission.gateway_signature_hex.is_empty() {
@@ -1689,20 +1894,29 @@ async fn ingest_share(
         "share accepted",
     );
 
-    // Append NDJSON to the share log file (best effort).
+    // Append NDJSON to the share log file (best effort, logged on failure).
     if let Some(ref path) = *share_log_path
         && let Ok(line) = serde_json::to_string(&submission)
     {
         use tokio::fs::OpenOptions;
-        if let Ok(mut f) = OpenOptions::new()
+        match OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
             .await
         {
-            use tokio::io::AsyncWriteExt;
-            let _ = f.write_all(line.as_bytes()).await;
-            let _ = f.write_all(b"\n").await;
+            Ok(mut f) => {
+                use tokio::io::AsyncWriteExt;
+                if let Err(e) = f.write_all(line.as_bytes()).await {
+                    warn!(error = %e, path = %path, "failed to write share log line");
+                }
+                if let Err(e) = f.write_all(b"\n").await {
+                    warn!(error = %e, path = %path, "failed to write share log newline");
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, path = %path, "failed to open share log file");
+            }
         }
     }
 

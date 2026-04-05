@@ -6,11 +6,13 @@ use axum::{
     routing::{get, post},
 };
 use tokio::net::TcpListener;
+use tower_http::limit::RequestBodyLimitLayer;
 use tracing::info;
 
 use crate::dashboard;
 use crate::handlers::{
-    self, BootConfigSnapshot, ConfigFilePath, RuntimeSettings, SharedRuntimeSettings,
+    self, BootAddrs, BootConfigSnapshot, ConfigFilePath, RuntimeSettings, SharedBootAddrs,
+    SharedRuntimeSettings,
 };
 use crate::ingress::api_key_middleware;
 use crate::metrics;
@@ -22,6 +24,8 @@ use crate::verdicts::VerdictLog;
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_http_server(
     bind_addr: String,
+    tcp_addr: String,
+    policy_file_path: String,
     verdict_log: VerdictLog,
     ui_mode: String,
     app_state: AppState,
@@ -78,6 +82,12 @@ pub(crate) async fn run_http_server(
         let _ = std::fs::create_dir_all(parent);
     }
 
+    let boot_addrs: SharedBootAddrs = Arc::new(BootAddrs {
+        tcp_addr,
+        http_addr: bind_addr.clone(),
+        policy_file: policy_file_path,
+    });
+
     let app = public
         .merge(protected)
         .with_state(app_state.clone())
@@ -87,8 +97,10 @@ pub(crate) async fn run_http_server(
         .layer(Extension(runtime_settings))
         .layer(Extension(boot_snapshot))
         .layer(Extension(config_path))
+        .layer(Extension(boot_addrs))
         .layer(Extension(metrics_registry))
-        .layer(Extension(metrics));
+        .layer(Extension(metrics))
+        .layer(RequestBodyLimitLayer::new(1024 * 1024)); // 1 MB
 
     let addr: std::net::SocketAddr = bind_addr.parse()?;
 

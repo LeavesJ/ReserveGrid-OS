@@ -5,6 +5,60 @@ All notable changes to ReserveGrid OS are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] — 2026-04-04 — Temper
+
+### Added
+
+- Ed25519 signed license key format (`veldra_lic_<base64url_payload>.<base64url_sig>`) replacing the old `veldra_<hex>` keys
+- Offline license key verification in rg-feed-server (tier gating for `observe_paid` and `inline_licensed`)
+- Offline license key verification in rg-desktop (compile time public key via `VELDRA_LICENSE_PUBKEY`)
+- License key persistence in rg-desktop (survives app restart via `~/.config/reservegrid/desktop.toml`)
+- Copy-to-clipboard on the website license page with full key value in TOML snippet
+- Demo Ed25519 keypair in observe compose stack for out of the box key generation
+- `VELDRA_LICENSE_SIGNING_KEY` and `VELDRA_LICENSE_PUBKEY` env vars documented in `.env.example`
+- `gateway_instance_id` field in `TemplatePropose` for multi-gateway split-brain prevention
+- `PRAGMA integrity_check` on rg-auth SQLite startup
+- `VELDRA_VERDICT_LOG_MAX_ENTRIES` env var for configurable in-memory verdict log cap
+- `VELDRA_MEMPOOL_TIMEOUT_MS` env var for configurable mempool client timeout
+- 7 rg-auth email module tests (template bodies, config parsing, dev mode send)
+
+### Changed
+
+- `rg-auth` `generate_key` now produces signed keys with embedded org, tier, expiry, and features
+- `rg-auth` `validate_key` performs 3 step validation: signature, expiry, DB revocation check (falls back to DB only when signing key absent)
+- `rg-feed-server` `KeyValidator::new()` accepts pubkey as first argument for offline verification
+- `list_keys` API response now includes `key_value` alongside `key_prefix` for authenticated users
+- `MAX_TOKEN_LENGTH` in rg-feed-server increased from 256 to 512 for signed key format
+- Verifier reconnect delay, heartbeat interval, and channel open timeout are now config fields (previously hardcoded as 2s, 5s, 30s)
+- WAL I/O and verdict log handler moved to `spawn_blocking` to avoid blocking the async executor
+- Health server bind failure is now non-fatal (warns and continues without health endpoint)
+- In-memory verdict log capped at both push sites (previously only one of two enforced the limit)
+- Verdict log rotation and WAL open use direct open with ENOENT handling instead of path.exists() to avoid TOCTOU races
+
+### Fixed
+
+- Observe compose stack: key generation returned 503 due to missing signing key env var
+- `generate-license-key.py` tier choices corrected from mode names to DB tier constants
+- Stale TODO comments removed from rg-desktop license module
+- Stale reason code counts corrected across 17 files (websites, i18n JSON, docs, pitchdeck)
+- 6 timing parameter cross-validation checks added to gateway config startup
+- 9 silent `try_send` channel drops in share handler now log warnings
+- 15 silent `let _ =` error drops across 4 crates replaced with logged warnings
+- 3 codec decode sites now send error frames before disconnecting (SetupConnection, OpenMiningChannel, SubmitShares)
+- Extension type validation added at all 3 SV2 frame dispatch points (rejects non-base-protocol)
+- Connection limit added to rg-feed-server accept loop (`VELDRA_FEED_MAX_CONNECTIONS`, default 256)
+- `max_connections_per_ip` default changed from 0 (unlimited) to 16
+- CloseChannel decode failure now disconnects instead of silently continuing
+
+### Security
+
+- 111 findings across 14 services resolved (full stack security audit)
+- rg-auth hardened: 11 additional findings resolved (rate limiting, input validation, session management)
+- Production Ed25519 keypair generated for license signing deployment
+- Tauri auto-updater signing keypair configured (v1.0.0 shipped with empty pubkey)
+- Root Dockerfile renamed to prevent flyctl auto-discovery of wrong build target
+- Stale root tauri.conf.json excluded from version control
+
 ## [1.0.0] — Unreleased
 
 ### Added
@@ -16,7 +70,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Feed stack: `rg-demo-feed` (synthetic GBT), `rg-feed-adapter` (WebSocket to JSON RPC bridge), `rg-feed-server` (authenticated feed)
 - `rg-load-test` benchmarking tool for template verdict latency
 - `test-miner` integration harness with job timeout and share submission
-- 15 verdict reason codes and 19 gateway reason codes, all canonical snake_case
+- 15 verdict reason codes and 58 gateway reason codes, all canonical snake_case
 - NDJSON WAL for crash durable event delivery
 - CSV and Prometheus export of verdict history
 - mTLS support for remote verifier channel

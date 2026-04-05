@@ -14,7 +14,7 @@ mod transport;
 use std::process::ExitCode;
 
 use clap::Parser;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::session::SessionConfig;
@@ -70,6 +70,17 @@ async fn main() -> ExitCode {
         share_interval_ms = cli.share_interval_ms,
         "starting test-miner",
     );
+
+    // Warn if gateway address appears non-loopback.
+    if let Some(host) = cli.gateway_addr.rsplit(':').nth(1) {
+        let is_loopback = host == "127.0.0.1" || host == "::1" || host == "localhost";
+        if !is_loopback {
+            warn!(
+                addr = %cli.gateway_addr,
+                "gateway address is not loopback; traffic traverses the network",
+            );
+        }
+    }
 
     // Validate authority pubkey format.
     if cli.authority_pubkey.len() != 64 {

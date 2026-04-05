@@ -68,6 +68,7 @@ services:
       VELDRA_LOG_FILTER: info
       VELDRA_VERIFIER_ADDR: "0.0.0.0:9090"
       VELDRA_HTTP_ADDR: "0.0.0.0:8081"
+      VELDRA_API_SECRET_OPTIONAL: "1"
       VELDRA_POLICY_FILE: /config/policy.toml
       VELDRA_VERIFIER_CONFIG: /config/verifier.toml
       VELDRA_MODE: shadow
@@ -95,6 +96,8 @@ services:
       VELDRA_MANAGER_CONFIG: /config/manager-shadow.toml
       VELDRA_MANAGER_HTTP_ADDR: "0.0.0.0:8082"
       VELDRA_VERIFIER_ADDR: "pool-verifier:9090"
+      VELDRA_API_SECRET_OPTIONAL: "1"
+      VELDRA_SHARE_HMAC_OPTIONAL: "1"
     volumes:
       - ./dev:/config:rw
     ports:

@@ -23,11 +23,20 @@ const MAX_HEADER_COUNT: usize = 64;
 /// Maximum size of any single header value in bytes.
 const MAX_HEADER_VALUE_BYTES: usize = 8192;
 
+/// Default maximum request body size in bytes (1 MiB).
+/// Callers can override this via `input_validation_layer_with_limit`.
+const DEFAULT_MAX_BODY_BYTES: u64 = 1_048_576;
+
 /// Middleware that validates request-level properties.
 ///
 /// This runs before deserialization and catches oversized payloads,
-/// wrong content types, and header abuse.
+/// wrong content types, and header abuse. Enforces `Content-Length`
+/// against `DEFAULT_MAX_BODY_BYTES`.
 pub async fn input_validation_layer(req: Request<Body>, next: Next) -> Response {
+    validate_request(req, next, DEFAULT_MAX_BODY_BYTES).await
+}
+
+async fn validate_request(req: Request<Body>, next: Next, max_body_bytes: u64) -> Response {
     // ── Header count limit ──
     if req.headers().len() > MAX_HEADER_COUNT {
         return reject(ReasonCode::PayloadTooLarge, "too many headers");
@@ -38,6 +47,17 @@ pub async fn input_validation_layer(req: Request<Body>, next: Next) -> Response 
         if value.len() > MAX_HEADER_VALUE_BYTES {
             return reject(ReasonCode::PayloadTooLarge, "header value too large");
         }
+    }
+
+    // ── Content-Length enforcement ──
+    if req
+        .headers()
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .is_some_and(|cl| cl > max_body_bytes)
+    {
+        return reject(ReasonCode::PayloadTooLarge, "request body too large");
     }
 
     // ── Content-Type enforcement (only on methods with a body) ──
@@ -129,6 +149,21 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[tokio::test]
+    async fn oversized_content_length_rejected() {
+        let app = test_app();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api")
+            .header("content-type", "application/json")
+            .header("content-length", (DEFAULT_MAX_BODY_BYTES + 1).to_string())
+            .body(Body::from("{}"))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]

@@ -99,10 +99,11 @@ impl ShareWal {
         }
 
         // Read existing entries to build the pending index.
-        let pending = if path.exists() {
-            Self::read_pending_index(path)?
-        } else {
-            HashMap::new()
+        // Use direct open instead of exists() check to avoid TOCTOU races.
+        let pending = match Self::read_pending_index(path) {
+            Ok(idx) => idx,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+            Err(e) => return Err(e),
         };
 
         // Open for append.

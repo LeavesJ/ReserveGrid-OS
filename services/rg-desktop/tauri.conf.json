@@ -59,7 +59,7 @@
       "endpoints": [
         "https://github.com/LeavesJ/veldra/releases/latest/download/update.json"
       ],
-      "pubkey": ""
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IENFMkIzNDlFMzg5NzZCQQpSV1M2ZG9ualNiUGlETERkNWdyT284WnRhRkFkSERKQmlvM3pqU005SWMwMzFLWGtCWmFVcnlUeAo="
     }
   }
 }

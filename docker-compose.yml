@@ -57,6 +57,8 @@ services:
       VELDRA_VERIFIER_ADDR: "pool-verifier:9090"
       VELDRA_BITCOIND_RPC_USER: "${VELDRA_BITCOIND_RPC_USER:-reservegrid}"
       VELDRA_BITCOIND_RPC_PASS: "${VELDRA_BITCOIND_RPC_PASS:?Set VELDRA_BITCOIND_RPC_PASS in .env}"
+      VELDRA_API_SECRET_OPTIONAL: "${VELDRA_API_SECRET_OPTIONAL:-1}"
+      VELDRA_SHARE_HMAC_OPTIONAL: "${VELDRA_SHARE_HMAC_OPTIONAL:-1}"
     volumes:
       - ./dev:/config:rw
     ports:
@@ -84,6 +86,7 @@ services:
       VELDRA_VERIFIER_ADDR: "0.0.0.0:9090"
       VELDRA_HTTP_ADDR: "0.0.0.0:8081"
       VELDRA_API_SECRET: "${VELDRA_API_SECRET:-}"
+      VELDRA_API_SECRET_OPTIONAL: "${VELDRA_API_SECRET_OPTIONAL:-1}"
       VELDRA_POLICY_FILE: /config/policy.toml
       VELDRA_VERIFIER_CONFIG: /config/verifier.toml
     volumes:
@@ -113,6 +116,8 @@ services:
       VELDRA_GATEWAY_CONFIG: /config/gateway.toml
       VELDRA_TEMPLATE_URL: "http://template-manager:8082"
       VELDRA_ALLOW_REMOTE_VERIFIER: "1"
+      VELDRA_API_SECRET_OPTIONAL: "${VELDRA_API_SECRET_OPTIONAL:-1}"
+      VELDRA_SHARE_HMAC_OPTIONAL: "${VELDRA_SHARE_HMAC_OPTIONAL:-1}"
     ports:
       - "3333:3333"
       - "8080:8080"

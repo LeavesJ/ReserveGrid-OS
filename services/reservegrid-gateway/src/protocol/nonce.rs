@@ -11,6 +11,10 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Maximum allowed nonce length in bytes. Prevents memory abuse from
+/// oversized nonce strings.
+pub const MAX_NONCE_LENGTH: usize = 256;
+
 /// Nonce cache for replay prevention.
 ///
 /// Bounded by `max_entries`. Oldest entries are evicted when the cache is full.
@@ -49,6 +53,11 @@ impl NonceCache {
     /// Returns `NonceResult::Valid` if the request should be accepted,
     /// or an appropriate rejection reason otherwise.
     pub fn validate(&mut self, nonce: &str, request_timestamp: u64) -> NonceResult {
+        // Reject oversized nonces to prevent memory abuse.
+        if nonce.len() > MAX_NONCE_LENGTH {
+            return NonceResult::Expired; // Reuse Expired to avoid adding a new variant
+        }
+
         let now = current_epoch_secs();
 
         // Check timestamp window
@@ -147,6 +156,15 @@ mod tests {
         let mut cache = NonceCache::new(100, 30);
         let future = current_epoch_secs() + 60;
         assert_eq!(cache.validate("abc123", future), NonceResult::Expired);
+    }
+
+    #[test]
+    fn oversized_nonce_rejected() {
+        let mut cache = NonceCache::new(100, 30);
+        let now = current_epoch_secs();
+        let big_nonce = "x".repeat(MAX_NONCE_LENGTH + 1);
+        assert_eq!(cache.validate(&big_nonce, now), NonceResult::Expired);
+        assert!(cache.is_empty(), "oversized nonce must not be stored");
     }
 
     #[test]

@@ -195,7 +195,7 @@ pub enum ConfigError {
     #[error("policy.nonce_cache_size must be > 0, got {0}")]
     NonceCacheZero(u32),
 
-    #[error("TOML parse error: {0}")]
+    #[error("invalid policy configuration")]
     TomlParse(String),
 
     #[error(

@@ -32,21 +32,31 @@ pub struct FeedSection {
 
     #[serde(default = "default_channel_capacity")]
     pub channel_capacity: usize,
+
+    /// Maximum concurrent WebSocket connections. Default 256.
+    /// Set to 0 to disable the limit (not recommended for production).
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
 }
 
 #[derive(Debug, Default, Deserialize)]
 pub struct AuthSection {
+    /// Base64url encoded Ed25519 public key for offline license key verification.
+    /// Loaded from `VELDRA_LICENSE_PUBKEY` env var or `auth.license_pubkey` config.
+    #[serde(default)]
+    pub license_pubkey: String,
+
     /// Comma-separated static key list for dev/local use.
     #[serde(default)]
     pub valid_keys: String,
 
-    /// Optional rg-auth URL for dynamic key validation.
+    /// Optional rg-auth URL for dynamic key validation (legacy fallback).
     #[serde(default)]
     pub auth_url: String,
 }
 
 fn default_listen() -> String {
-    "0.0.0.0:9200".into()
+    "127.0.0.1:9200".into()
 }
 
 fn default_poll_interval() -> u64 {
@@ -61,13 +71,16 @@ fn default_channel_capacity() -> usize {
     64
 }
 
+fn default_max_connections() -> usize {
+    256
+}
+
 /// Load config from TOML file with env var overrides.
 pub fn load(path: &str) -> Result<FeedServerConfig, String> {
-    let text =
-        std::fs::read_to_string(path).map_err(|e| format!("cannot read config {path}: {e}"))?;
+    let text = std::fs::read_to_string(path).map_err(|_| "cannot read config file".to_string())?;
 
     let mut cfg: FeedServerConfig =
-        toml::from_str(&text).map_err(|e| format!("cannot parse config {path}: {e}"))?;
+        toml::from_str(&text).map_err(|_| "cannot parse config TOML".to_string())?;
 
     // Env var overrides (VELDRA_ prefix per repo convention).
     if let Ok(v) = std::env::var("VELDRA_FEED_LISTEN") {
@@ -88,11 +101,20 @@ pub fn load(path: &str) -> Result<FeedServerConfig, String> {
     {
         cfg.feed.poll_interval_ms = n;
     }
+    if let Ok(v) = std::env::var("VELDRA_LICENSE_PUBKEY") {
+        cfg.auth.license_pubkey = v;
+    }
     if let Ok(v) = std::env::var("VELDRA_FEED_VALID_KEYS") {
         cfg.auth.valid_keys = v;
     }
     if let Ok(v) = std::env::var("VELDRA_FEED_AUTH_URL") {
         cfg.auth.auth_url = v;
+    }
+    if let Some(n) = std::env::var("VELDRA_FEED_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        cfg.feed.max_connections = n;
     }
 
     // Validate: rpc_url is required.
@@ -122,7 +144,7 @@ rpc_url = "http://localhost:8332"
 "#;
         let cfg = parse_toml(toml).expect("should parse minimal config");
         assert_eq!(cfg.feed.rpc_url, "http://localhost:8332");
-        assert_eq!(cfg.feed.listen, "0.0.0.0:9200");
+        assert_eq!(cfg.feed.listen, "127.0.0.1:9200");
         assert_eq!(cfg.feed.poll_interval_ms, 3000);
         assert_eq!(cfg.feed.heartbeat_interval_ms, 15000);
         assert_eq!(cfg.feed.channel_capacity, 64);

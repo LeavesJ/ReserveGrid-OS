@@ -69,12 +69,32 @@ docs/TESTLOG.md
 docs/DASHBOARD_SMOKE_TEST.md
 docs/architecture-comparison.md
 docs/MEETING_PREP.md
+docs/DEEP_SCAN_REPORT_2026-04-02.md
+docs/DEEP_SCAN_PART2_2026-04-02.md
+docs/linkedin-playbook.md
 
-# Private assets (local only)
+# Private assets and design drafts (local only)
+ReserveGrid-OS-Founders-Guide.md
+ReserveGrid-OS-Founders-Guide.pdf
+ReserveGrid-OS-Pitchdeck.pptx
+generate_guide_pdf.py
+veldra-roadmap.jsx
 rg-os-wireframes.html
+/index.html
+/account-index.html
+/product-index.html
+/shadow-vs-observe.html
+/license-page.html
+/section-redesign-preview.html
+/script.js
+/style.css
+Cargo.lock.bak.old
 pdf-export/
 TEST_COVERAGE_AUDIT.md
 /Dockerfile
+/Dockerfile.gateway
+/Dockerfile.rg-auth
+/tauri.conf.json
 
 # Website lives in LeavesJ/veldra-site (cloned locally as veldra-site/)
 veldra-site/

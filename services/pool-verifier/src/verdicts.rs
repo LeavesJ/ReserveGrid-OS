@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use reservegrid_common::DeployMode;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 /// Represents a single verdict logged to memory and disk.
 #[derive(Clone, Serialize, Deserialize)]
@@ -83,6 +84,17 @@ pub(crate) const VERDICT_LOG_MAX_BYTES: u64 = 50 * 1024 * 1024;
 /// Number of rotated verdict log files to keep.
 pub(crate) const VERDICT_LOG_ROTATIONS: usize = 5;
 
+/// Default maximum entries in the in-memory verdict log.
+pub(crate) const DEFAULT_VERDICT_LOG_MAX_ENTRIES: usize = 1000;
+
+/// Resolve the in-memory verdict log max entries from env or default.
+pub(crate) fn verdict_log_max_entries() -> usize {
+    std::env::var("VELDRA_VERDICT_LOG_MAX_ENTRIES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_VERDICT_LOG_MAX_ENTRIES)
+}
+
 /// Load verdicts from disk into memory.
 pub(crate) fn load_verdict_log() -> (VerdictLog, LogIdCounter) {
     let mut list = Vec::new();
@@ -100,6 +112,13 @@ pub(crate) fn load_verdict_log() -> (VerdictLog, LogIdCounter) {
                 list.push(v);
             }
         }
+    }
+
+    // Cap to configured max entries on load (FIFO eviction of oldest).
+    let max_entries = verdict_log_max_entries();
+    if list.len() > max_entries {
+        let excess = list.len() - max_entries;
+        list.drain(0..excess);
     }
 
     let log = Arc::new(Mutex::new(list));
@@ -125,9 +144,20 @@ pub(crate) fn rotate_verdict_log_if_needed() {
         };
         let dst = format!("{VERDICT_LOG_PATH}.{i}");
 
-        if std::path::Path::new(&src).exists() {
-            let _ = std::fs::remove_file(&dst);
-            let _ = std::fs::rename(&src, &dst);
+        // Skip exists() check to avoid TOCTOU; try rename directly.
+        if let Err(e) = std::fs::remove_file(&dst) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!(dst, error = %e, "verdict log rotation: remove_file failed");
+            }
+        }
+        match std::fs::rename(&src, &dst) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // src does not exist for this rotation slot, expected.
+            }
+            Err(e) => {
+                warn!(src, dst, error = %e, "verdict log rotation: rename failed");
+            }
         }
     }
 }

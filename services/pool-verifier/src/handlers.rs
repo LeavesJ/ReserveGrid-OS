@@ -5,8 +5,8 @@ use std::fs::File;
 use std::io::BufRead;
 use std::io::BufReader as StdBufReader;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
 use axum::{
@@ -19,6 +19,48 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::time::Duration;
 use tracing::{error, info, warn};
+
+// ── Write throttle for mutation endpoints ────────────
+
+/// Global write throttle: max 10 mutation requests per 60 second window.
+/// Prevents rapid-fire policy/settings changes even from authenticated callers.
+static WRITE_THROTTLE: std::sync::LazyLock<Mutex<VecDeque<Instant>>> =
+    std::sync::LazyLock::new(|| Mutex::new(VecDeque::new()));
+
+const WRITE_THROTTLE_WINDOW_SECS: u64 = 60;
+const WRITE_THROTTLE_MAX: usize = 10;
+
+/// Check and record a write operation. Returns `Err(StatusCode)` if throttled.
+fn check_write_throttle() -> Result<(), (StatusCode, String)> {
+    let now = Instant::now();
+    let window = std::time::Duration::from_secs(WRITE_THROTTLE_WINDOW_SECS);
+    let mut guard = WRITE_THROTTLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    // Evict expired entries.
+    while guard
+        .front()
+        .is_some_and(|t| now.duration_since(*t) > window)
+    {
+        guard.pop_front();
+    }
+
+    if guard.len() >= WRITE_THROTTLE_MAX {
+        warn!(
+            event = "write_throttled",
+            count = guard.len(),
+            "mutation endpoint rate limited"
+        );
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many write requests; try again later".to_string(),
+        ));
+    }
+
+    guard.push_back(now);
+    Ok(())
+}
 
 use pool_verifier::policy::PolicyConfig;
 use reservegrid_common::DeployMode;
@@ -113,6 +155,17 @@ pub(crate) fn default_log_format() -> String {
 
 pub(crate) type BootConfigSnapshot = Arc<VerifierDiskConfig>;
 
+/// Resolved CLI addresses, shared via Extension so handlers never re-read env
+/// vars with potentially different defaults.
+#[derive(Debug, Clone)]
+pub(crate) struct BootAddrs {
+    pub(crate) tcp_addr: String,
+    pub(crate) http_addr: String,
+    pub(crate) policy_file: String,
+}
+
+pub(crate) type SharedBootAddrs = Arc<BootAddrs>;
+
 #[derive(Deserialize)]
 pub(crate) struct PolicyTomlWrapper {
     pub(crate) policy: PolicyConfig,
@@ -182,34 +235,43 @@ pub(crate) async fn get_verdicts(
 pub(crate) async fn get_verdict_log(Query(q): Query<TailQuery>) -> impl IntoResponse {
     use crate::verdicts::VERDICT_LOG_PATH;
 
-    let Ok(f) = File::open(VERDICT_LOG_PATH) else {
-        let body = "no verdicts yet\n".to_string();
-        return (StatusCode::OK, [("Content-Type", "text/plain")], body);
-    };
+    let tail = q.tail.unwrap_or(2000).min(10_000);
 
-    let tail = q.tail.unwrap_or(2000).min(50_000);
-
-    let reader = StdBufReader::new(f);
-    let mut buf: VecDeque<String> = VecDeque::with_capacity(tail);
-
-    for line in reader.lines().map_while(Result::ok) {
-        if buf.len() == tail {
-            buf.pop_front();
+    // File open + full read runs on the blocking thread pool so dashboard
+    // polls do not stall the tokio executor.
+    let result = tokio::task::spawn_blocking(move || {
+        let Ok(f) = File::open(VERDICT_LOG_PATH) else {
+            return None;
+        };
+        let reader = StdBufReader::new(f);
+        let mut buf: VecDeque<String> = VecDeque::with_capacity(tail);
+        for line in reader.lines().map_while(Result::ok) {
+            if buf.len() == tail {
+                buf.pop_front();
+            }
+            buf.push_back(line);
         }
-        buf.push_back(line);
-    }
+        let mut out = String::new();
+        for line in buf {
+            out.push_str(&line);
+            out.push('\n');
+        }
+        Some(out)
+    })
+    .await;
 
-    let mut out = String::new();
-    for line in buf {
-        out.push_str(&line);
-        out.push('\n');
+    match result {
+        Ok(Some(out)) => (
+            StatusCode::OK,
+            [("Content-Type", "application/x-ndjson")],
+            out,
+        ),
+        _ => (
+            StatusCode::OK,
+            [("Content-Type", "text/plain")],
+            "no verdicts yet\n".to_string(),
+        ),
     }
-
-    (
-        StatusCode::OK,
-        [("Content-Type", "application/x-ndjson")],
-        out,
-    )
 }
 
 pub(crate) async fn get_verdicts_csv(
@@ -221,7 +283,7 @@ pub(crate) async fn get_verdicts_csv(
     let log = log
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let limit = q.limit.unwrap_or(1000).min(50_000);
+    let limit = q.limit.unwrap_or(1000).min(10_000);
     let start = log.len().saturating_sub(limit);
 
     let mut out = String::new();
@@ -281,6 +343,9 @@ pub(crate) async fn apply_policy(
     Extension(metrics): Extension<crate::metrics::SharedVerifierMetrics>,
     Json(req): Json<ApplyPolicyReq>,
 ) -> impl IntoResponse {
+    if let Err(e) = check_write_throttle() {
+        return e;
+    }
     let base_cfg = {
         let holder = app_state
             .policy
@@ -367,6 +432,11 @@ pub(crate) async fn apply_policy(
             result: "success".into(),
         })
         .inc();
+    info!(
+        event = "policy_applied",
+        source = "json",
+        "policy updated via JSON API"
+    );
     (StatusCode::OK, "ok".to_string())
 }
 
@@ -376,7 +446,6 @@ pub(crate) async fn get_policy(State(app_state): State<AppState>) -> Json<serde_
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let policy = &holder.config;
-    let dbg = format!("{policy:?}");
 
     let body = json!({
         "protocol_version": policy.protocol_version,
@@ -400,8 +469,6 @@ pub(crate) async fn get_policy(State(app_state): State<AppState>) -> Json<serde_
         "reject_empty_templates": policy.reject_empty_templates,
         "reject_coinbase_zero": policy.reject_coinbase_zero,
         "unknown_mempool_as_high": policy.unknown_mempool_as_high,
-
-        "debug": dbg
     });
 
     Json(body)
@@ -412,6 +479,7 @@ pub(crate) async fn get_settings(
     Extension(runtime): Extension<SharedRuntimeSettings>,
     Extension(boot_snapshot): Extension<BootConfigSnapshot>,
     Extension(config_path): Extension<ConfigFilePath>,
+    Extension(boot_addrs): Extension<SharedBootAddrs>,
 ) -> Json<serde_json::Value> {
     let rt = runtime
         .read()
@@ -430,10 +498,9 @@ pub(crate) async fn get_settings(
     let tls_enabled = tls_cert.is_some() && tls_key.is_some();
     let tls_self_signed = env::var("VELDRA_TLS_SELF_SIGNED").as_deref() == Ok("1");
     let mtls_client_ca_set = env::var("VELDRA_VERIFIER_TLS_CLIENT_CA").is_ok();
-    let tcp_addr = env::var("VELDRA_VERIFIER_ADDR").unwrap_or_else(|_| "127.0.0.1:5001".into());
-    let http_addr = env::var("VELDRA_HTTP_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
-    let policy_file =
-        env::var("VELDRA_POLICY_FILE").unwrap_or_else(|_| "config/policy.toml".into());
+    let tcp_addr = &boot_addrs.tcp_addr;
+    let http_addr = &boot_addrs.http_addr;
+    let policy_file = &boot_addrs.policy_file;
 
     // Detect pending_restart: compare boot snapshot against on-disk config.
     let pending_restart = match reservegrid_common::config_io::read_toml::<VerifierDiskConfig>(
@@ -466,6 +533,9 @@ pub(crate) async fn apply_settings(
     Extension(runtime): Extension<SharedRuntimeSettings>,
     Json(req): Json<ApplySettingsReq>,
 ) -> impl IntoResponse {
+    if let Err(e) = check_write_throttle() {
+        return e;
+    }
     if let Some(ref level) = req.log_level {
         let allowed = ["trace", "debug", "info", "warn", "error"];
         if !allowed.contains(&level.as_str()) {
@@ -517,6 +587,12 @@ pub(crate) async fn save_settings(
     Extension(config_path): Extension<ConfigFilePath>,
     Json(req): Json<SaveSettingsReq>,
 ) -> impl IntoResponse {
+    if check_write_throttle().is_err() {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "ok": false, "error": "too many write requests; try again later" })),
+        );
+    }
     // Validate log_level if provided.
     if let Some(ref level) = req.log_level {
         let allowed = ["trace", "debug", "info", "warn", "error"];
@@ -629,7 +705,9 @@ pub(crate) async fn get_mempool_proxy() -> Json<serde_json::Value> {
     };
 
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(900))
+        .timeout(Duration::from_millis(
+            crate::mempool_client::mempool_timeout_ms(),
+        ))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
 
@@ -692,6 +770,12 @@ pub(crate) async fn apply_policy_toml(
     State(app_state): State<AppState>,
     bytes: Bytes,
 ) -> impl IntoResponse {
+    if check_write_throttle().is_err() {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "ok": false, "error": "too many write requests; try again later" })),
+        );
+    }
     let body = match std::str::from_utf8(&bytes) {
         Ok(s) => s.to_string(),
         Err(e) => {
@@ -708,11 +792,19 @@ pub(crate) async fn apply_policy_toml(
     let parsed: PolicyTomlWrapper = match toml::from_str(&body) {
         Ok(v) => v,
         Err(e) => {
+            let detail = format!("{e}");
+            // Truncate verbose TOML parse details to avoid leaking structure.
+            let sanitized = if detail.len() > 200 {
+                format!("{}...", &detail[..200])
+            } else {
+                detail.clone()
+            };
+            tracing::warn!(error = %detail, "toml_parse_failed");
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({
                     "ok": false,
-                    "error": format!("toml parse failed: {e}"),
+                    "error": format!("toml parse failed: {sanitized}"),
                 })),
             );
         }
@@ -737,5 +829,10 @@ pub(crate) async fn apply_policy_toml(
         holder.toml_text = body;
     }
 
+    info!(
+        event = "policy_applied",
+        source = "toml",
+        "policy updated via TOML API"
+    );
     (StatusCode::OK, Json(json!({ "ok": true })))
 }

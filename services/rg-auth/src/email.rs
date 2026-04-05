@@ -129,3 +129,72 @@ pub fn denial_body() -> String {
      — Veldra"
         .to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+
+    #[test]
+    fn smtp_config_from_env_returns_none_when_unset() {
+        // In a clean test environment without SMTP env vars, from_env returns None.
+        // This test is safe because test runners do not set VELDRA_AUTH_SMTP_HOST.
+        if std::env::var("VELDRA_AUTH_SMTP_HOST").is_err() {
+            assert!(SmtpConfig::from_env().is_none());
+        }
+    }
+
+    #[test]
+    fn send_without_smtp_succeeds() {
+        // Dev mode: send() with None config just logs and returns Ok.
+        let result = send(None, "test@example.com", "test subject", "test body");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn verification_body_contains_token_and_url() {
+        let body = verification_body("https://reservegrid.io", "abc123");
+        assert!(body.contains("https://reservegrid.io/verify/?token=abc123"));
+        assert!(body.contains("Veldra"));
+    }
+
+    #[test]
+    fn admin_notification_body_contains_all_fields() {
+        let body = admin_notification_body(
+            "https://reservegrid.io",
+            "Alice",
+            "alice@example.com",
+            "Acme Corp",
+            "approve_tok",
+            "deny_tok",
+        );
+        assert!(body.contains("Alice"));
+        assert!(body.contains("alice@example.com"));
+        assert!(body.contains("Acme Corp"));
+        assert!(body.contains("approve_tok"));
+        assert!(body.contains("deny_tok"));
+        assert!(body.contains("/auth/approve?token=approve_tok"));
+        assert!(body.contains("/auth/deny?token=deny_tok"));
+    }
+
+    #[test]
+    fn approval_body_contains_login_url() {
+        let body = approval_body("https://reservegrid.io");
+        assert!(body.contains("https://reservegrid.io/login/"));
+        assert!(body.contains("approved"));
+    }
+
+    #[test]
+    fn password_reset_body_contains_token_and_url() {
+        let body = password_reset_body("https://reservegrid.io", "reset_tok_42");
+        assert!(body.contains("https://reservegrid.io/reset-password/?token=reset_tok_42"));
+        assert!(body.contains("1 hour"));
+    }
+
+    #[test]
+    fn denial_body_contains_denied_message() {
+        let body = denial_body();
+        assert!(body.contains("denied"));
+        assert!(body.contains("Veldra"));
+    }
+}

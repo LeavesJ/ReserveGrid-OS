@@ -61,14 +61,29 @@ pub async fn auth_layer(
     req: Request<Body>,
     next: Next,
 ) -> Response {
+    let path = req.uri().path().to_string();
+    let method = req.method().clone();
+
     match state.mode {
         ApiAuthMode::BearerToken => {
             if !verify_bearer(req.headers(), &state) {
+                warn!(
+                    method = %method,
+                    path = %path,
+                    auth_mode = "bearer_token",
+                    "auth_failed"
+                );
                 return reject_auth();
             }
         }
         ApiAuthMode::HmacSha256 => {
             if !verify_hmac(&req, &state) {
+                warn!(
+                    method = %method,
+                    path = %path,
+                    auth_mode = "hmac_sha256",
+                    "auth_failed"
+                );
                 return reject_auth();
             }
         }

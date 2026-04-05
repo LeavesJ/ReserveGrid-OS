@@ -6,8 +6,7 @@ mod rate_limit;
 mod session;
 
 use axum::{
-    Json, Router,
-    extract::State,
+    Router,
     http::HeaderValue,
     routing::{get, post},
 };
@@ -16,6 +15,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
+use tower_http::limit::RequestBodyLimitLayer;
 use tracing::{error, info, warn};
 
 /// Shared application state passed to all handlers.
@@ -34,9 +34,14 @@ pub struct AppState {
     /// When true, trust `x-forwarded-for` header for client IP extraction.
     /// Enable only when rg-auth sits behind a trusted reverse proxy.
     pub trust_proxy: bool,
+    /// Ed25519 signing key for license key generation. Loaded from
+    /// `VELDRA_LICENSE_SIGNING_KEY` (base64url encoded 32 byte seed).
+    /// When `None`, the `/auth/keys/generate` endpoint returns 503.
+    pub signing_key: Option<ed25519_dalek::SigningKey>,
 }
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)]
 async fn main() -> anyhow::Result<()> {
     // Structured logging via tracing. Respects VELDRA_LOG_FILTER (default: info).
     let filter = env::var("VELDRA_LOG_FILTER").unwrap_or_else(|_| "info".to_string());
@@ -102,6 +107,8 @@ async fn main() -> anyhow::Result<()> {
         rate_global_ceiling,
     ));
 
+    let signing_key = load_signing_key_from_env();
+
     let state = AppState {
         db: pool.clone(),
         smtp,
@@ -112,6 +119,7 @@ async fn main() -> anyhow::Result<()> {
         rate_limiter: rate_limiter.clone(),
         rate_limit_multiplier,
         trust_proxy,
+        signing_key,
     };
 
     // Start background cleanup tasks
@@ -126,11 +134,17 @@ async fn main() -> anyhow::Result<()> {
         .route("/auth/login", post(handlers::login))
         .route("/auth/logout", post(handlers::logout))
         .route("/auth/session", get(handlers::session_check))
-        .route("/auth/approve", get(handlers::approve))
-        .route("/auth/deny", get(handlers::deny))
+        .route(
+            "/auth/approve",
+            get(handlers::approve).post(handlers::approve_confirm),
+        )
+        .route(
+            "/auth/deny",
+            get(handlers::deny).post(handlers::deny_confirm),
+        )
         .route("/auth/forgot-password", post(handlers::forgot_password))
         .route("/auth/reset-password", post(handlers::reset_password))
-        .route("/auth/settings", get(auth_get_settings))
+        .route("/auth/settings", get(handlers::admin_settings))
         // License key endpoints
         .route("/api/keys/validate", post(handlers::validate_key))
         .route("/auth/keys", get(handlers::list_keys))
@@ -138,6 +152,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/auth/keys/revoke", post(handlers::revoke_key))
         .with_state(state)
         .layer(cors)
+        // Reject request bodies larger than 1 MB to prevent memory exhaustion.
+        .layer(RequestBodyLimitLayer::new(1024 * 1024))
         .into_make_service_with_connect_info::<SocketAddr>();
 
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
@@ -147,53 +163,38 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn auth_get_settings(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let log_level = env::var("VELDRA_LOG_FILTER").unwrap_or_else(|_| "info".into());
-    let log_format = env::var("VELDRA_LOG_FORMAT").unwrap_or_else(|_| "json".into());
-    let smtp_host = env::var("VELDRA_AUTH_SMTP_HOST").unwrap_or_default();
-    let smtp_port: u16 = env::var("VELDRA_AUTH_SMTP_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let smtp_user = env::var("VELDRA_AUTH_SMTP_USER").unwrap_or_default();
-    let smtp_pass_set = env::var("VELDRA_AUTH_SMTP_PASS").is_ok();
+// auth_get_settings moved to handlers::admin_settings (admin-gated).
 
-    let bind_addr = env::var("VELDRA_AUTH_ADDR").unwrap_or_else(|_| "127.0.0.1:3030".into());
-    let db_path = env::var("VELDRA_AUTH_DB").unwrap_or_else(|_| "data/auth.db".into());
-
-    Json(serde_json::json!({
-        "log_level": log_level,
-        "log_format": log_format,
-        "bind_addr": bind_addr,
-        "db_path": db_path,
-        "session_ttl_hours": state.session_ttl_hours,
-        "admin_email": state.admin_email,
-        "site_url": state.site_url,
-        "auth_url": state.auth_url,
-        "allowed_origin": env::var("VELDRA_AUTH_ALLOWED_ORIGIN").unwrap_or_else(|_| "http://localhost:8084".into()),
-        "smtp_host": smtp_host,
-        "smtp_port": smtp_port,
-        "smtp_user": smtp_user,
-        "smtp_pass_set": smtp_pass_set,
-        "smtp_configured": state.smtp.is_some(),
-        "rate_max_ips": env::var("VELDRA_AUTH_RATE_MAX_IPS").unwrap_or_else(|_| "10000".into()),
-        "rate_global_ceiling": env::var("VELDRA_AUTH_RATE_GLOBAL_CEILING").unwrap_or_else(|_| "none".into()),
-        "trust_proxy": state.trust_proxy,
-    }))
+/// Load the Ed25519 license signing key from `VELDRA_LICENSE_SIGNING_KEY`.
+/// Returns `None` with a log message if the var is unset or invalid.
+fn load_signing_key_from_env() -> Option<ed25519_dalek::SigningKey> {
+    let Ok(b64) = env::var("VELDRA_LICENSE_SIGNING_KEY") else {
+        warn!("VELDRA_LICENSE_SIGNING_KEY not set; license key generation will be unavailable");
+        return None;
+    };
+    let Some(sk) = session::load_signing_key(&b64) else {
+        error!("VELDRA_LICENSE_SIGNING_KEY is set but invalid (must be base64url 32 bytes)");
+        return None;
+    };
+    info!("license signing key loaded");
+    Some(sk)
 }
 
 /// Background task that periodically cleans up expired sessions and stale rate limit entries.
 async fn cleanup_task(pool: db::DbPool, rate_limiter: Arc<rate_limit::RateLimiter>) {
-    // Cleanup expired sessions every hour
+    // Cleanup expired sessions and stale email tokens every hour.
     let session_cleanup = tokio::spawn({
         let pool = pool.clone();
         async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
-                if let Ok(conn) = pool.lock()
-                    && let Err(e) = db::cleanup_expired_sessions(&conn)
-                {
-                    error!(error = ?e, "session cleanup failed");
+                if let Ok(conn) = pool.lock() {
+                    if let Err(e) = db::cleanup_expired_sessions(&conn) {
+                        error!(error = ?e, "session cleanup failed");
+                    }
+                    if let Err(e) = db::cleanup_stale_email_tokens(&conn) {
+                        error!(error = ?e, "email token cleanup failed");
+                    }
                 }
             }
         }

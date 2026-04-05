@@ -39,7 +39,10 @@ pub async fn proxy_request(
             };
             url
         }
-        other => return Err(format!("unknown service: {other}")),
+        other => {
+            warn!(service = %other, "unknown service requested");
+            return Err("unknown service".to_string());
+        }
     };
 
     let url = format!("{base_url}/{path}");
@@ -52,7 +55,10 @@ pub async fn proxy_request(
         "GET" => state.client.get(&url),
         "PUT" => state.client.put(&url),
         "DELETE" => state.client.delete(&url),
-        other => return Err(format!("unsupported method: {other}")),
+        other => {
+            warn!(method = %other, "unsupported HTTP method");
+            return Err("unsupported method".to_string());
+        }
     };
 
     req = req.header("content-type", "application/json");
@@ -67,7 +73,8 @@ pub async fn proxy_request(
             let text = resp.text().await.unwrap_or_default();
 
             if status >= 400 {
-                return Err(format!("upstream returned {status}: {text}"));
+                warn!(service = %service, path = %path, %status, "upstream returned error");
+                return Err(format!("upstream returned {status}"));
             }
 
             // Try to parse as JSON; if not, wrap in a value.
@@ -78,7 +85,7 @@ pub async fn proxy_request(
         }
         Err(e) => {
             warn!(service = %service, path = %path, error = %e, "upstream request failed");
-            Err(format!("upstream unavailable: {e}"))
+            Err("upstream unavailable".to_string())
         }
     }
 }
@@ -93,8 +100,14 @@ pub async fn health_check(
 
     // Core services.
     let checks = vec![
-        ("pool-verifier", format!("{}/health", state.config.verifier_url)),
-        ("template-manager", format!("{}/health", state.config.template_url)),
+        (
+            "pool-verifier",
+            format!("{}/health", state.config.verifier_url),
+        ),
+        (
+            "template-manager",
+            format!("{}/health", state.config.template_url),
+        ),
     ];
 
     for (name, url) in &checks {
@@ -121,20 +134,19 @@ pub async fn health_check(
 /// Dashboard settings exposed to the frontend.
 /// Replaces `dashboard_get_settings` from `rg-dashboard`.
 #[tauri::command]
-pub fn get_dashboard_settings(
-    state: tauri::State<'_, Arc<AppState>>,
-) -> serde_json::Value {
+#[allow(clippy::needless_pass_by_value)] // tauri::command requires owned params
+pub fn get_dashboard_settings(state: tauri::State<'_, Arc<AppState>>) -> serde_json::Value {
     let log_level = std::env::var("VELDRA_LOG_FILTER").unwrap_or_else(|_| "info".into());
     let log_format = std::env::var("VELDRA_LOG_FORMAT").unwrap_or_else(|_| "pretty".into());
     let deploy_mode = std::env::var("VELDRA_MODE").unwrap_or_else(|_| "shadow".into());
 
+    // Internal service URLs are intentionally omitted; infrastructure
+    // details should not be exposed to the webview frontend.
     serde_json::json!({
         "log_level": log_level,
         "log_format": log_format,
         "deploy_mode": deploy_mode,
-        "verifier_url": state.config.verifier_url,
-        "template_url": state.config.template_url,
-        "gateway_url": state.config.gateway_url.as_deref().unwrap_or(""),
+        "gateway_configured": state.config.gateway_url.is_some(),
         "client": "rg-desktop",
     })
 }

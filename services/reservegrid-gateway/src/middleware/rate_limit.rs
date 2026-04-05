@@ -15,7 +15,7 @@ use axum::{
 use http::{HeaderValue, StatusCode};
 use reservegrid_common::{ErrorResponse, ReasonCode};
 use tokio::sync::Mutex;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Default maximum number of per-IP token buckets kept in memory.
 /// When the map exceeds this count, the least recently used entry is evicted.
@@ -94,31 +94,35 @@ pub async fn rate_limit_layer(
         .get::<ConnectInfo<std::net::SocketAddr>>()
         .map(|ci| ci.0.ip());
 
-    if let Some(ip) = client_ip {
-        let mut buckets = state.buckets.lock().await;
+    let Some(ip) = client_ip else {
+        warn!("rate limiter bypassed: no ConnectInfo available on request");
+        return next.run(req).await;
+    };
 
-        // Evict the least recently used entry when at capacity and the
-        // incoming IP is not already tracked.
-        if buckets.len() >= state.max_entries
-            && !buckets.contains_key(&ip)
-            && let Some(oldest_ip) = buckets
-                .iter()
-                .min_by_key(|(_, b)| b.last_refill)
-                .map(|(ip, _)| *ip)
-        {
-            debug!(evicted_ip = %oldest_ip, map_size = buckets.len(), "IP rate limiter LRU eviction");
-            buckets.remove(&oldest_ip);
-        }
+    let mut buckets = state.buckets.lock().await;
 
-        let bucket = buckets
-            .entry(ip)
-            .or_insert_with(|| TokenBucket::new(state.burst));
-
-        if !bucket.try_consume(state.requests_per_sec, state.burst) {
-            return reject_rate_limited(state.requests_per_sec);
-        }
+    // Evict the least recently used entry when at capacity and the
+    // incoming IP is not already tracked.
+    if buckets.len() >= state.max_entries
+        && !buckets.contains_key(&ip)
+        && let Some(oldest_ip) = buckets
+            .iter()
+            .min_by_key(|(_, b)| b.last_refill)
+            .map(|(ip, _)| *ip)
+    {
+        debug!(evicted_ip = %oldest_ip, map_size = buckets.len(), "IP rate limiter LRU eviction");
+        buckets.remove(&oldest_ip);
     }
 
+    let bucket = buckets
+        .entry(ip)
+        .or_insert_with(|| TokenBucket::new(state.burst));
+
+    if !bucket.try_consume(state.requests_per_sec, state.burst) {
+        return reject_rate_limited(state.requests_per_sec);
+    }
+
+    drop(buckets);
     next.run(req).await
 }
 

@@ -38,7 +38,7 @@ pub struct HealthProbe {
 }
 
 fn default_listen() -> String {
-    "0.0.0.0:8084".to_string()
+    "127.0.0.1:8084".to_string()
 }
 
 impl DashboardConfig {
@@ -85,8 +85,15 @@ pub enum ConfigError {
 impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Io { path, source } => write!(f, "cannot read config {path}: {source}"),
-            Self::Parse { path, source } => write!(f, "invalid config {path}: {source}"),
+            Self::Io { path, source } => {
+                // Log the full detail server-side; public message omits path and OS error.
+                tracing::warn!(path, error = %source, "config I/O error");
+                write!(f, "cannot read config file")
+            }
+            Self::Parse { path, source } => {
+                tracing::warn!(path, error = %source, "config parse error");
+                write!(f, "invalid config file")
+            }
             Self::Missing(field) => write!(f, "missing required config field: {field}"),
         }
     }
@@ -107,7 +114,7 @@ template_url = "http://template:8082"
 auth_url = "http://auth:8083"
 "#;
         let cfg: DashboardConfig = toml::from_str(toml).expect("parse");
-        assert_eq!(cfg.listen, "0.0.0.0:8084");
+        assert_eq!(cfg.listen, "127.0.0.1:8084");
         assert_eq!(cfg.verifier_url, "http://verifier:8080");
         assert!(cfg.health_probes.is_empty());
     }

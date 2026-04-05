@@ -21,7 +21,7 @@
 //! signature verification is skipped if no public key is configured.
 //! Release builds require a valid public key and signature.
 
-use ed25519_dalek::{Signature, VerifyingKey, PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH};
+use ed25519_dalek::{PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH, Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::sync::RwLock;
 use tracing::{info, warn};
@@ -83,7 +83,6 @@ impl LicenseInfo {
     fn validate_and_store(&self, key: &str) -> Result<(), LicenseError> {
         let payload = Self::parse_key(key)?;
         Self::check_expiry(&payload)?;
-        // TODO: Ed25519 signature verification (EX-028 week 1)
         Self::verify_signature(key)?;
 
         let Ok(mut raw) = self.raw_key.write() else {
@@ -102,14 +101,15 @@ impl LicenseInfo {
 
     /// Parse the key prefix and extract the JSON payload.
     fn parse_key(key: &str) -> Result<LicensePayload, LicenseError> {
-        let body = key.strip_prefix("veldra_lic_").ok_or(LicenseError::InvalidPrefix)?;
+        let body = key
+            .strip_prefix("veldra_lic_")
+            .ok_or(LicenseError::InvalidPrefix)?;
 
         let dot_pos = body.rfind('.').ok_or(LicenseError::MissingSignature)?;
         let payload_b64 = &body[..dot_pos];
 
-        // base64url decode the payload.
-        use base64url_decode as decode;
-        let payload_bytes = decode(payload_b64).map_err(|_| LicenseError::InvalidBase64)?;
+        let payload_bytes =
+            base64url_decode(payload_b64).map_err(|()| LicenseError::InvalidBase64)?;
         let payload: LicensePayload =
             serde_json::from_slice(&payload_bytes).map_err(|_| LicenseError::InvalidPayload)?;
 
@@ -139,13 +139,17 @@ impl LicenseInfo {
     /// Release builds fail hard if the key is missing or the signature
     /// does not verify.
     fn verify_signature(key: &str) -> Result<(), LicenseError> {
+        use ed25519_dalek::Verifier;
+
         // Public key embedded at compile time. Empty string means not configured.
         const PUBKEY_B64: &str = env_or_empty!("VELDRA_LICENSE_PUBKEY");
 
         if PUBKEY_B64.is_empty() {
             #[cfg(debug_assertions)]
             {
-                warn!("VELDRA_LICENSE_PUBKEY not set, skipping signature verification (debug build)");
+                warn!(
+                    "VELDRA_LICENSE_PUBKEY not set, skipping signature verification (debug build)"
+                );
                 return Ok(());
             }
             #[cfg(not(debug_assertions))]
@@ -157,10 +161,12 @@ impl LicenseInfo {
         }
 
         let pubkey_bytes = base64url_decode(PUBKEY_B64)
-            .map_err(|_| LicenseError::Internal("compiled-in public key is invalid base64"))?;
+            .map_err(|()| LicenseError::Internal("compiled-in public key is invalid base64"))?;
 
         if pubkey_bytes.len() != PUBLIC_KEY_LENGTH {
-            return Err(LicenseError::Internal("compiled-in public key has wrong length"));
+            return Err(LicenseError::Internal(
+                "compiled-in public key has wrong length",
+            ));
         }
 
         let mut pk_array = [0u8; PUBLIC_KEY_LENGTH];
@@ -169,13 +175,14 @@ impl LicenseInfo {
             .map_err(|_| LicenseError::Internal("compiled-in public key is invalid"))?;
 
         // Extract payload and signature from the key string.
-        let body = key.strip_prefix("veldra_lic_").ok_or(LicenseError::InvalidPrefix)?;
+        let body = key
+            .strip_prefix("veldra_lic_")
+            .ok_or(LicenseError::InvalidPrefix)?;
         let dot_pos = body.rfind('.').ok_or(LicenseError::MissingSignature)?;
         let payload_b64 = &body[..dot_pos];
         let sig_b64 = &body[dot_pos + 1..];
 
-        let sig_bytes = base64url_decode(sig_b64)
-            .map_err(|_| LicenseError::SignatureInvalid)?;
+        let sig_bytes = base64url_decode(sig_b64).map_err(|()| LicenseError::SignatureInvalid)?;
 
         if sig_bytes.len() != SIGNATURE_LENGTH {
             return Err(LicenseError::SignatureInvalid);
@@ -187,7 +194,6 @@ impl LicenseInfo {
 
         // The signed message is the base64url-encoded payload (not the decoded JSON).
         // This ensures the signature covers the exact bytes the issuer signed.
-        use ed25519_dalek::Verifier;
         verifying_key
             .verify(payload_b64.as_bytes(), &signature)
             .map_err(|_| LicenseError::SignatureInvalid)?;
@@ -222,7 +228,7 @@ impl LicenseInfo {
         }
     }
 
-    /// Get the current license tier (observe_free, observe_paid, inline_licensed).
+    /// Get the current license tier (`observe_free`, `observe_paid`, `inline_licensed`).
     pub fn tier(&self) -> Option<String> {
         let Ok(pl) = self.payload.read() else {
             return None;
@@ -233,6 +239,7 @@ impl LicenseInfo {
 
 /// Tauri IPC command: get current license status.
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // tauri::command requires owned params
 pub fn get_license_status(
     state: tauri::State<'_, std::sync::Arc<crate::AppState>>,
 ) -> serde_json::Value {
@@ -254,6 +261,7 @@ pub fn get_license_status(
 
 /// Tauri IPC command: set a new license key (from onboarding UI).
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // tauri::command requires owned params
 pub fn set_license_key(
     state: tauri::State<'_, std::sync::Arc<crate::AppState>>,
     key: String,
@@ -261,22 +269,37 @@ pub fn set_license_key(
     match state.license.validate_and_store(&key) {
         Ok(()) => {
             info!("license key updated via onboarding");
-            // TODO: Persist to config file so the key survives app restart.
+            if let Err(e) = DesktopConfig::save_license_key(&key) {
+                warn!(error = %e, "failed to persist license key to config file");
+            }
             Ok(serde_json::json!({
                 "ok": true,
                 "tier": state.license.tier(),
             }))
         }
-        Err(e) => Err(format!("{e}")),
+        Err(e) => {
+            warn!(error = %e, "license key validation failed via IPC");
+            // Validation errors (prefix, base64, payload, expired, signature)
+            // are safe for the user. Internal errors are not.
+            let msg = match &e {
+                LicenseError::Internal(_) => "license validation error".to_string(),
+                other => format!("{other}"),
+            };
+            Err(msg)
+        }
     }
 }
 
 /// Tauri IPC command: clear the license key (sign out).
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // tauri::command requires owned params
 pub fn clear_license(
     state: tauri::State<'_, std::sync::Arc<crate::AppState>>,
 ) -> serde_json::Value {
     state.license.clear();
+    if let Err(e) = DesktopConfig::clear_license_key() {
+        warn!(error = %e, "failed to remove license key from config file");
+    }
     info!("license key cleared (sign out)");
     serde_json::json!({ "ok": true })
 }
@@ -287,7 +310,9 @@ pub enum LicenseError {
     MissingSignature,
     InvalidBase64,
     InvalidPayload,
-    Expired { expired_at: u64 },
+    Expired {
+        expired_at: u64,
+    },
     #[allow(dead_code)]
     SignatureInvalid,
     Internal(&'static str),
@@ -337,8 +362,13 @@ fn base64url_decode(input: &str) -> Result<Vec<u8>, ()> {
 fn base64_decode_standard(input: &str) -> Result<Vec<u8>, ()> {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
+    #[allow(clippy::cast_possible_truncation)] // TABLE has 64 entries; index always fits u8
     fn lookup(c: u8) -> Result<u8, ()> {
-        TABLE.iter().position(|&x| x == c).map(|p| p as u8).ok_or(())
+        TABLE
+            .iter()
+            .position(|&x| x == c)
+            .map(|p| p as u8)
+            .ok_or(())
     }
 
     let bytes = input.as_bytes();
@@ -385,7 +415,8 @@ mod tests {
 
     #[test]
     fn parse_valid_key() {
-        let payload = r#"{"org_id":"org_test","tier":"inline","issued_at":0,"expires_at":9999999999}"#;
+        let payload =
+            r#"{"org_id":"org_test","tier":"inline","issued_at":0,"expires_at":9999999999}"#;
         let encoded = base64url_encode(payload.as_bytes());
         let key = format!("veldra_lic_{encoded}.fakesig");
         let result = LicenseInfo::parse_key(&key);
@@ -485,8 +516,16 @@ mod tests {
         let mut out = String::new();
         for chunk in input.chunks(3) {
             let b0 = chunk[0] as usize;
-            let b1 = if chunk.len() > 1 { chunk[1] as usize } else { 0 };
-            let b2 = if chunk.len() > 2 { chunk[2] as usize } else { 0 };
+            let b1 = if chunk.len() > 1 {
+                chunk[1] as usize
+            } else {
+                0
+            };
+            let b2 = if chunk.len() > 2 {
+                chunk[2] as usize
+            } else {
+                0
+            };
             out.push(TABLE[b0 >> 2] as char);
             out.push(TABLE[((b0 & 0x03) << 4) | (b1 >> 4)] as char);
             if chunk.len() > 1 {

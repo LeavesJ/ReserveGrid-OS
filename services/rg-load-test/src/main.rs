@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use rand::SeedableRng;
 use rand_chacha::ChaCha12Rng;
@@ -210,6 +210,27 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    // Validate inputs before any arithmetic.
+    if args.concurrency == 0 {
+        error!("--concurrency must be at least 1");
+        std::process::exit(1);
+    }
+    if args.rate == 0 {
+        error!("--rate must be at least 1");
+        std::process::exit(1);
+    }
+
+    // Warn if target address appears non-loopback.
+    if let Some(host) = args.target.rsplit(':').nth(1) {
+        let is_loopback = host == "127.0.0.1" || host == "::1" || host == "localhost";
+        if !is_loopback {
+            warn!(
+                target = %args.target,
+                "target address is not loopback; traffic traverses the network",
+            );
+        }
+    }
+
     info!(
         target = %args.target,
         concurrency = args.concurrency,
@@ -219,7 +240,7 @@ async fn main() -> Result<()> {
         scenario = ?args.scenario,
         reject_ratio = args.reject_ratio,
         stale_offset_ms = args.stale_offset_ms,
-        "Starting load test"
+        "starting load test",
     );
 
     let metrics = Metrics::new();
@@ -259,11 +280,11 @@ async fn main() -> Result<()> {
         match result {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                error!("Worker error: {}", e);
+                error!(error = %e, "worker error");
                 any_error = true;
             }
             Err(e) => {
-                error!("Task join error: {}", e);
+                error!(error = %e, "task join error");
                 any_error = true;
             }
         }
@@ -309,11 +330,12 @@ async fn run_worker(
     reject_ratio: f64,
     stale_offset_ms: u64,
 ) -> Result<()> {
-    let stream = TcpStream::connect(&target)
-        .await
-        .context(format!("Worker {worker_id}: failed to connect to {target}"))?;
+    let stream = TcpStream::connect(&target).await.map_err(|e| {
+        warn!(worker_id, target = %target, error = %e, "TCP connect failed");
+        anyhow::anyhow!("worker {worker_id}: TCP connect failed")
+    })?;
 
-    info!(worker_id = worker_id, target = %target, "Connected");
+    info!(worker_id, target = %target, "connected");
 
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -352,7 +374,7 @@ async fn run_worker(
                                     match serde_json::from_value::<TemplateVerdict>(env.payload) {
                                         Ok(v) => Some(v),
                                         Err(e) => {
-                                            warn!("Failed to parse verdict payload: {}", e);
+                                            warn!(error = %e, "failed to parse verdict payload");
                                             None
                                         }
                                     }
@@ -385,7 +407,7 @@ async fn run_worker(
                         }
                     }
                     Err(e) => {
-                        warn!("Reader error: {}", e);
+                        warn!(error = %e, "reader I/O error");
                         break;
                     }
                 }
@@ -423,17 +445,17 @@ async fn run_worker(
         match writer.write_all(json_line.as_bytes()).await {
             Ok(()) => {
                 if let Err(e) = writer.write_all(b"\n").await {
-                    warn!("Failed to write newline: {}", e);
+                    warn!(worker_id, error = %e, "write failed");
                     break;
                 }
                 if let Err(e) = writer.flush().await {
-                    warn!("Failed to flush: {}", e);
+                    warn!(worker_id, error = %e, "flush failed");
                     break;
                 }
                 metrics.increment_sent();
             }
             Err(e) => {
-                warn!("Failed to write: {}", e);
+                warn!(worker_id, error = %e, "write failed");
                 break;
             }
         }
@@ -513,6 +535,7 @@ fn generate_valid(template_id: u64, rng: &mut ChaCha12Rng) -> TemplatePropose {
         total_sigops: Some(5000),
         coinbase_sigops: Some(100),
         template_weight: Some(3_000_000),
+        gateway_instance_id: Some("rg-load-test".to_string()),
     }
 }
 

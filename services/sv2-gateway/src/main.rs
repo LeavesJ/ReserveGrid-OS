@@ -8,13 +8,17 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::{
     Extension, Json, Router,
+    body::Body,
+    extract::Request,
     http::StatusCode,
-    response::IntoResponse,
+    middleware as axum_mw,
+    middleware::Next,
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use clap::Parser;
@@ -23,7 +27,9 @@ use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
+use subtle::ConstantTimeEq;
 use tokio::sync::{broadcast, mpsc, watch};
+use tower_http::limit::RequestBodyLimitLayer;
 use tracing::{debug, error, info, warn};
 
 use reservegrid_common::reason::GatewayReason;
@@ -45,6 +51,99 @@ struct Cli {
     /// Path to the gateway TOML configuration file.
     #[arg(short, long, env = "VELDRA_GATEWAY_CONFIG")]
     config: String,
+}
+
+/// Maximum request body size for the HTTP management API (1 MiB).
+const MAX_BODY_BYTES: usize = 1024 * 1024;
+
+/// Write throttle: maximum settings save requests per window.
+const WRITE_THROTTLE_MAX: usize = 10;
+
+/// Write throttle window duration.
+const WRITE_THROTTLE_WINDOW: Duration = Duration::from_secs(60);
+
+/// Global write throttle timestamps for `/settings/save`.
+static WRITE_TIMESTAMPS: LazyLock<Mutex<VecDeque<Instant>>> =
+    LazyLock::new(|| Mutex::new(VecDeque::with_capacity(WRITE_THROTTLE_MAX + 1)));
+
+/// Enforce that `VELDRA_API_SECRET` is set (or explicitly opted out).
+fn enforce_api_secret() {
+    let api_secret_set = std::env::var("VELDRA_API_SECRET")
+        .ok()
+        .is_some_and(|s| !s.is_empty());
+    let api_secret_optional = std::env::var("VELDRA_API_SECRET_OPTIONAL").as_deref() == Ok("1");
+    if !api_secret_set && !api_secret_optional {
+        error!(
+            "VELDRA_API_SECRET is not set. Set it to protect management endpoints, \
+             or set VELDRA_API_SECRET_OPTIONAL=1 to acknowledge the risk"
+        );
+        std::process::exit(1);
+    }
+    if !api_secret_set && api_secret_optional {
+        warn!(
+            "VELDRA_API_SECRET is not set but VELDRA_API_SECRET_OPTIONAL=1; \
+             management endpoints are unauthenticated"
+        );
+    }
+}
+
+/// Enforce that `VELDRA_SHARE_UPSTREAM_SECRET` is set when share upstream is configured.
+fn enforce_hmac_secret(has_share_upstream: bool) {
+    let hmac_set = std::env::var("VELDRA_SHARE_UPSTREAM_SECRET")
+        .ok()
+        .is_some_and(|s| !s.is_empty());
+    let hmac_optional = std::env::var("VELDRA_SHARE_HMAC_OPTIONAL").as_deref() == Ok("1");
+    if has_share_upstream && !hmac_set && !hmac_optional {
+        error!(
+            "VELDRA_SHARE_UPSTREAM_SECRET is not set but [share_upstream] is configured. \
+             Set the secret, or set VELDRA_SHARE_HMAC_OPTIONAL=1 to acknowledge the risk"
+        );
+        std::process::exit(1);
+    }
+    if has_share_upstream && !hmac_set && hmac_optional {
+        warn!(
+            "VELDRA_SHARE_UPSTREAM_SECRET is not set but VELDRA_SHARE_HMAC_OPTIONAL=1; \
+             share HMAC signatures will use an empty key"
+        );
+    }
+}
+
+/// Bearer token middleware for protected management endpoints.
+///
+/// When `VELDRA_API_SECRET` is set, requires `Authorization: Bearer <token>`.
+/// Comparison uses constant time equality to prevent timing side channels.
+async fn api_key_middleware(req: Request<Body>, next: Next) -> Response {
+    let expected = match std::env::var("VELDRA_API_SECRET") {
+        Ok(k) if !k.is_empty() => k,
+        _ => return next.run(req).await,
+    };
+
+    let authorized = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            let stripped = v.strip_prefix("Bearer ").unwrap_or(v);
+            stripped.as_bytes().ct_eq(expected.as_bytes()).into()
+        });
+
+    if !authorized {
+        warn!(
+            method = %req.method(),
+            path = %req.uri().path(),
+            "api_key_middleware: unauthorized request"
+        );
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "reason_code": "unauthorized",
+                "reason_detail": "missing or invalid bearer token"
+            })),
+        )
+            .into_response();
+    }
+
+    next.run(req).await
 }
 
 fn main() -> ExitCode {
@@ -85,6 +184,12 @@ fn main() -> ExitCode {
     }
 
     info!(mode = %cfg.mode, "configuration loaded");
+
+    // Enforce management API secret at startup.
+    enforce_api_secret();
+
+    // Enforce HMAC secret when share upstream is configured.
+    enforce_hmac_secret(cfg.share_upstream.is_some());
 
     // Build the tokio runtime and run the async entry point.
     let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -246,15 +351,37 @@ async fn gw_save_settings(
     Extension(config_path): Extension<GwConfigPath>,
     Json(req): Json<GwSaveSettingsReq>,
 ) -> impl IntoResponse {
+    // Write throttle: reject if too many saves in the window.
+    {
+        let mut timestamps = WRITE_TIMESTAMPS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cutoff = Instant::now().checked_sub(WRITE_THROTTLE_WINDOW);
+        if let Some(cutoff) = cutoff {
+            timestamps.retain(|t| *t > cutoff);
+        }
+        if timestamps.len() >= WRITE_THROTTLE_MAX {
+            warn!("settings save throttled");
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "reason_code": "rate_limited",
+                    "reason_detail": "settings save rate limit exceeded"
+                })),
+            );
+        }
+        timestamps.push_back(Instant::now());
+    }
+
     // Read current TOML from disk.
     let toml_text = match std::fs::read_to_string(config_path.as_ref().as_path()) {
         Ok(t) => t,
         Err(e) => {
+            warn!(error = %e, "settings: failed to read config from disk");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(
-                    serde_json::json!({ "ok": false, "error": format!("failed to read config: {e}") }),
-                ),
+                Json(serde_json::json!({ "ok": false, "error": "failed to read config" })),
             );
         }
     };
@@ -262,11 +389,10 @@ async fn gw_save_settings(
     let mut doc: toml::Value = match toml::from_str(&toml_text) {
         Ok(v) => v,
         Err(e) => {
+            warn!(error = %e, "settings: failed to parse config TOML");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(
-                    serde_json::json!({ "ok": false, "error": format!("failed to parse config: {e}") }),
-                ),
+                Json(serde_json::json!({ "ok": false, "error": "failed to parse config" })),
             );
         }
     };
@@ -330,10 +456,11 @@ async fn gw_save_settings(
     let patched_text = match toml::to_string_pretty(&doc) {
         Ok(t) => t,
         Err(e) => {
+            warn!(error = %e, "settings: failed to serialize patched config");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(
-                    serde_json::json!({ "ok": false, "error": format!("failed to serialize: {e}") }),
+                    serde_json::json!({ "ok": false, "error": "failed to serialize patched config" }),
                 ),
             );
         }
@@ -344,18 +471,19 @@ async fn gw_save_settings(
         Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(
-                    serde_json::json!({ "ok": false, "error": format!("invalid config after patch: {e}") }),
-                ),
+                Json({
+                    let msg = format!("invalid config after patch: {e}");
+                    serde_json::json!({ "ok": false, "error": &msg[..msg.len().min(200)] })
+                }),
             );
         }
     };
 
     if let Err(e) = config::validate(&patched_cfg) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "ok": false, "error": format!("validation failed: {e}") })),
-        );
+        return (StatusCode::BAD_REQUEST, {
+            let msg = format!("validation failed: {e}");
+            Json(serde_json::json!({ "ok": false, "error": &msg[..msg.len().min(200)] }))
+        });
     }
 
     // Atomic write to disk.
@@ -363,9 +491,7 @@ async fn gw_save_settings(
         error!(error = %e, "failed to save gateway config to disk");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(
-                serde_json::json!({ "ok": false, "error": format!("failed to write config: {e}") }),
-            ),
+            Json(serde_json::json!({ "ok": false, "error": "failed to write config" })),
         );
     }
 
@@ -554,48 +680,58 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
     // ── Global channel registry (for /channels API) ──
     let channel_registry: SharedChannelRegistry = Arc::new(GlobalChannelRegistry::new());
 
-    let health_router = if requires_listener {
-        Router::new()
-            .route("/healthz", get(health::healthz))
-            .route("/readyz", get(health::readyz))
-            .route("/settings", get(gw_get_settings))
-            .route("/settings/save", post(gw_save_settings))
-            .route("/metrics", get(gw_metrics_handler))
-            .route("/channels", get(get_channels))
-            .with_state(health_readiness.as_ref().clone())
-            .layer(Extension(settings_snapshot))
-            .layer(Extension(gw_config_path))
-            .layer(Extension(shared_registry))
-            .layer(Extension(channel_registry.clone()))
+    // Non-loopback warning for the management HTTP API.
+    if !config::is_loopback_addr_public(&health_addr) {
+        warn!(
+            addr = %health_addr,
+            "health/management API binding to non-loopback address; \
+             ensure network access is intentional"
+        );
+    }
+
+    // Protected routes require bearer token when VELDRA_API_SECRET is set.
+    let protected = Router::new()
+        .route("/settings", get(gw_get_settings))
+        .route("/settings/save", post(gw_save_settings))
+        .route("/channels", get(get_channels))
+        .layer(axum_mw::from_fn(api_key_middleware))
+        .layer(Extension(settings_snapshot))
+        .layer(Extension(gw_config_path))
+        .layer(Extension(channel_registry.clone()));
+
+    // Public routes (healthz, readyz, metrics) are unauthenticated.
+    let readyz_handler = if requires_listener {
+        get(health::readyz)
     } else {
-        Router::new()
-            .route("/healthz", get(health::healthz))
-            .route("/readyz", get(health::readyz_shadow))
-            .route("/settings", get(gw_get_settings))
-            .route("/settings/save", post(gw_save_settings))
-            .route("/metrics", get(gw_metrics_handler))
-            .route("/channels", get(get_channels))
-            .with_state(health_readiness.as_ref().clone())
-            .layer(Extension(settings_snapshot))
-            .layer(Extension(gw_config_path))
-            .layer(Extension(shared_registry))
-            .layer(Extension(channel_registry.clone()))
+        get(health::readyz_shadow)
     };
 
-    let health_listener = match tokio::net::TcpListener::bind(&health_addr).await {
-        Ok(l) => l,
+    let health_router = Router::new()
+        .route("/healthz", get(health::healthz))
+        .route("/readyz", readyz_handler)
+        .route("/metrics", get(gw_metrics_handler))
+        .merge(protected)
+        .with_state(health_readiness.as_ref().clone())
+        .layer(Extension(shared_registry))
+        .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES));
+
+    match tokio::net::TcpListener::bind(&health_addr).await {
+        Ok(health_listener) => {
+            info!(addr = %health_addr, "health server listening");
+            tokio::spawn(async move {
+                if let Err(e) = axum::serve(health_listener, health_router).await {
+                    error!(error = %e, "health server error");
+                }
+            });
+        }
         Err(e) => {
-            error!(addr = %health_addr, error = %e, "failed to bind health server");
-            return ExitCode::FAILURE;
+            warn!(
+                addr = %health_addr,
+                error = %e,
+                "failed to bind health server; continuing without health endpoint",
+            );
         }
     };
-    info!(addr = %health_addr, "health server listening");
-
-    tokio::spawn(async move {
-        if let Err(e) = axum::serve(health_listener, health_router).await {
-            error!(error = %e, "health server error");
-        }
-    });
 
     // ── 2. Connect to verifier NDJSON stream ──
     let (verifier_outbound_tx, verifier_outbound_rx) = mpsc::channel::<VerifierOutbound>(256);
@@ -615,8 +751,8 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
 
     let verifier_config = VerifierStreamConfig {
         addr: cfg.verifier.addr.clone(),
-        reconnect_delay: Duration::from_secs(2),
-        heartbeat_interval: Duration::from_secs(5),
+        reconnect_delay: Duration::from_millis(cfg.verifier.reconnect_delay_ms),
+        heartbeat_interval: Duration::from_millis(cfg.verifier.heartbeat_interval_ms),
         health_probe_staleness_ms: cfg.verifier.health_probe_staleness_ms,
         tls_config: verifier_tls,
     };
@@ -719,40 +855,41 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
     }
 
     // ── 4b. Share forward WAL (crash durability) ──
-    let mut share_wal: Option<sv2_gateway::wal::ShareWal> = if cfg.gateway.wal_path.is_empty() {
-        debug!("share wal: disabled (wal_path is empty)");
-        None
-    } else {
-        match sv2_gateway::wal::ShareWal::open(
-            std::path::Path::new(&cfg.gateway.wal_path),
-            cfg.gateway.wal_compaction_threshold,
-        ) {
-            Ok(mut wal) => {
-                let recovery = wal.recover();
-                if !recovery.synthetic_events.is_empty() {
-                    for evt in &recovery.synthetic_events {
-                        if let Ok(line) = serde_json::to_string(evt) {
-                            info!(target: "share_events", "{}", line);
+    let share_wal: Option<Arc<Mutex<sv2_gateway::wal::ShareWal>>> =
+        if cfg.gateway.wal_path.is_empty() {
+            debug!("share wal: disabled (wal_path is empty)");
+            None
+        } else {
+            match sv2_gateway::wal::ShareWal::open(
+                std::path::Path::new(&cfg.gateway.wal_path),
+                cfg.gateway.wal_compaction_threshold,
+            ) {
+                Ok(mut wal) => {
+                    let recovery = wal.recover();
+                    if !recovery.synthetic_events.is_empty() {
+                        for evt in &recovery.synthetic_events {
+                            if let Ok(line) = serde_json::to_string(evt) {
+                                info!(target: "share_events", "{}", line);
+                            }
                         }
+                        info!(
+                            orphans = recovery.synthetic_events.len(),
+                            "share wal: emitted synthetic process_crash_recovery events"
+                        );
                     }
-                    info!(
-                        orphans = recovery.synthetic_events.len(),
-                        "share wal: emitted synthetic process_crash_recovery events"
-                    );
+                    info!(path = %cfg.gateway.wal_path, "share wal: opened");
+                    Some(Arc::new(Mutex::new(wal)))
                 }
-                info!(path = %cfg.gateway.wal_path, "share wal: opened");
-                Some(wal)
+                Err(e) => {
+                    error!(
+                        path = %cfg.gateway.wal_path,
+                        error = %e,
+                        "share wal: failed to open; continuing without crash durability"
+                    );
+                    None
+                }
             }
-            Err(e) => {
-                error!(
-                    path = %cfg.gateway.wal_path,
-                    error = %e,
-                    "share wal: failed to open; continuing without crash durability"
-                );
-                None
-            }
-        }
-    };
+        };
 
     // ── 5. Job broadcast channel (main loop -> connection handlers) ──
     let (job_broadcast_tx, _) = broadcast::channel::<Arc<JobBroadcast>>(64);
@@ -854,7 +991,7 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
         let handler_config = Arc::new(HandlerConfig {
             max_channels_per_conn: cfg.gateway.max_channels_per_conn,
             channel_target,
-            channel_open_timeout: Duration::from_secs(30),
+            channel_open_timeout: Duration::from_millis(cfg.gateway.channel_open_timeout_ms),
             ntime_elapsed_slack_seconds: cfg.gateway.ntime_elapsed_slack_seconds,
             max_future_block_time_seconds: cfg.gateway.max_future_block_time_seconds,
             share_dedup_window_size: cfg.gateway.share_dedup_window_size,
@@ -963,10 +1100,14 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                 );
 
                 // Send to verifier for evaluation.
-                let propose = build_template_propose(&template);
-                let _ = verifier_outbound_tx
+                let propose =
+                    build_template_propose(&template, &cfg.gateway.gateway_instance_id);
+                if let Err(e) = verifier_outbound_tx
                     .send(VerifierOutbound::TemplatePropose(propose))
-                    .await;
+                    .await
+                {
+                    warn!(error = %e, "verifier_outbound_tx send failed; template propose dropped");
+                }
 
                 if cfg.mode.enforces_verdicts() {
                     // Inline mode: store template as pending, wait for verdict.
@@ -1083,8 +1224,20 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                     }).inc();
 
                     // WAL: mark forward complete (removes pending entry).
-                    if let Some(ref mut wal) = share_wal {
-                        wal.mark_completed(&result.share_id_hex, &result.event_id_hex);
+                    // Runs on the blocking thread pool to avoid stalling
+                    // the tokio executor on disk I/O.
+                    if let Some(ref wal) = share_wal {
+                        let wal = Arc::clone(wal);
+                        let sid = result.share_id_hex.clone();
+                        let eid = result.event_id_hex.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            if let Ok(mut w) = wal.lock() {
+                                w.mark_completed(&sid, &eid);
+                            } else {
+                                error!("wal: mutex poisoned in mark_completed");
+                            }
+                        })
+                        .await;
                     }
 
                     let forward_evt = sv2_gateway::shares::ShareForwardResultEvent::from_relay(
@@ -1135,10 +1288,22 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                     channel_registry.update_share(evt.channel_id, accepted, evt.difficulty_u64).await;
 
                     // WAL: track accepted shares that require a forward result.
-                    if evt.sv2_response == "success"
-                        && let Some(ref mut wal) = share_wal
-                    {
-                        wal.mark_pending(&evt.share_id_hex, &evt.event_id_hex);
+                    // Must complete before downstream SV2 ACK so a crash
+                    // between here and the forward result is recoverable.
+                    if evt.sv2_response == "success" {
+                        if let Some(ref wal) = share_wal {
+                            let wal = Arc::clone(wal);
+                            let sid = evt.share_id_hex.clone();
+                            let eid = evt.event_id_hex.clone();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                if let Ok(mut w) = wal.lock() {
+                                    w.mark_pending(&sid, &eid);
+                                } else {
+                                    error!("wal: mutex poisoned in mark_pending");
+                                }
+                            })
+                            .await;
+                        }
                     }
                     if let Ok(line) = serde_json::to_string(&evt) {
                         info!(target: "share_events", "{}", line);
@@ -1378,7 +1543,10 @@ fn parse_merkle_path(hex_elements: &[String], template_id: u64) -> Option<Vec<[u
 }
 
 /// Build a `TemplatePropose` from a `TemplateResponse`.
-fn build_template_propose(template: &TemplateResponse) -> rg_protocol::TemplatePropose {
+fn build_template_propose(
+    template: &TemplateResponse,
+    gateway_instance_id: &str,
+) -> rg_protocol::TemplatePropose {
     rg_protocol::TemplatePropose {
         version: rg_protocol::PROTOCOL_VERSION,
         id: template.template_id,
@@ -1398,6 +1566,7 @@ fn build_template_propose(template: &TemplateResponse) -> rg_protocol::TemplateP
         total_sigops: template.total_sigops,
         coinbase_sigops: template.coinbase_sigops,
         template_weight: template.template_weight,
+        gateway_instance_id: Some(gateway_instance_id.to_string()),
     }
 }
 

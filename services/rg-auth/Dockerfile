@@ -21,6 +21,7 @@ COPY services/rg-feed-adapter/Cargo.toml services/rg-feed-adapter/Cargo.toml
 COPY services/rg-demo-feed/Cargo.toml services/rg-demo-feed/Cargo.toml
 COPY services/rg-feed-server/Cargo.toml services/rg-feed-server/Cargo.toml
 COPY services/rg-load-test/Cargo.toml services/rg-load-test/Cargo.toml
+COPY services/rg-desktop/Cargo.toml services/rg-desktop/Cargo.toml
 
 # Create dummy src files for other workspace members so cargo resolves
 RUN mkdir -p services/pool-verifier/src && echo "fn main(){}" > services/pool-verifier/src/main.rs \
@@ -35,7 +36,9 @@ RUN mkdir -p services/pool-verifier/src && echo "fn main(){}" > services/pool-ve
     && mkdir -p services/rg-feed-adapter/src && echo "fn main(){}" > services/rg-feed-adapter/src/main.rs \
     && mkdir -p services/rg-demo-feed/src && echo "fn main(){}" > services/rg-demo-feed/src/main.rs \
     && mkdir -p services/rg-feed-server/src && echo "fn main(){}" > services/rg-feed-server/src/main.rs \
-    && mkdir -p services/rg-load-test/src && echo "fn main(){}" > services/rg-load-test/src/main.rs
+    && mkdir -p services/rg-load-test/src && echo "fn main(){}" > services/rg-load-test/src/main.rs \
+    && mkdir -p services/rg-desktop/src && echo "fn main(){}" > services/rg-desktop/src/main.rs \
+    && echo "fn main(){}" > services/rg-desktop/build.rs
 
 RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=cargo-target,target=/build/target,sharing=locked \

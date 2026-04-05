@@ -71,6 +71,7 @@ services:
       VELDRA_LOG_FILTER: info
       VELDRA_VERIFIER_ADDR: "0.0.0.0:9090"
       VELDRA_HTTP_ADDR: "0.0.0.0:8081"
+      VELDRA_API_SECRET_OPTIONAL: "1"
       VELDRA_POLICY_FILE: /config/policy.toml
       VELDRA_VERIFIER_CONFIG: /config/verifier.toml
       VELDRA_MODE: observe
@@ -98,6 +99,8 @@ services:
       VELDRA_MANAGER_CONFIG: /config/manager-shadow.toml
       VELDRA_MANAGER_HTTP_ADDR: "0.0.0.0:8082"
       VELDRA_VERIFIER_ADDR: "pool-verifier:9090"
+      VELDRA_API_SECRET_OPTIONAL: "1"
+      VELDRA_SHARE_HMAC_OPTIONAL: "1"
     volumes:
       - ./dev:/config:rw
     ports:
@@ -130,6 +133,9 @@ services:
       VELDRA_AUTH_ALLOWED_ORIGIN: "http://localhost:8084"
       VELDRA_AUTH_RATE_LIMIT_MULTIPLIER: "${VELDRA_AUTH_RATE_LIMIT_MULTIPLIER:-1}"
       VELDRA_AUTH_TRUST_PROXY: "1"
+      # Demo-only Ed25519 signing key (seed=0x2a*32). Required for license key
+      # generation. Replace with a real secret in production deployments.
+      VELDRA_LICENSE_SIGNING_KEY: "${VELDRA_LICENSE_SIGNING_KEY:-KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio}"
     ports:
       - "3030:3030"
     healthcheck:
@@ -148,6 +154,9 @@ services:
       VELDRA_LOG_FORMAT: json
       VELDRA_LOG_FILTER: info
       VELDRA_FEED_SERVER_CONFIG: /config/feed-server-observe.toml
+      # Ed25519 public key matching the demo signing key above. Enables offline
+      # license key verification. Falls back to rg-auth remote validation when unset.
+      VELDRA_LICENSE_PUBKEY: "${VELDRA_LICENSE_PUBKEY:-GX9rI-FshTLGq8g4-s1ep4m-DHaykgM0A5v6iz02jWE}"
     volumes:
       - ./dev:/config:ro
     ports:

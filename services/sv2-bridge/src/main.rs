@@ -1,19 +1,23 @@
 use std::{
     env,
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Result;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tokio::time::sleep;
-use tracing::{error, info};
+use tracing::{error, info, warn};
+use tracing_subscriber::{EnvFilter, fmt};
 
 use rg_protocol::{PROTOCOL_VERSION, TemplatePropose};
 
-fn init_tracing() {
-    use tracing_subscriber::{EnvFilter, fmt};
+/// Maximum concurrent client connections.
+const MAX_CONNECTIONS: usize = 64;
 
+fn init_tracing() {
     let filter =
         EnvFilter::try_from_env("VELDRA_LOG_FILTER").unwrap_or_else(|_| EnvFilter::new("info"));
 
@@ -47,7 +51,8 @@ impl BridgeConfig {
         let interval_secs = env::var("VELDRA_BRIDGE_INTERVAL_SECS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(5);
+            .unwrap_or(5)
+            .max(1); // Prevent busy-loop when set to 0
 
         let start_height = env::var("VELDRA_BRIDGE_START_HEIGHT")
             .ok()
@@ -87,6 +92,13 @@ async fn main() -> Result<()> {
     init_tracing();
     let cfg = BridgeConfig::from_env();
 
+    if !cfg.listen_addr.starts_with("127.0.0.1") && !cfg.listen_addr.starts_with("[::1]") {
+        warn!(
+            addr = %cfg.listen_addr,
+            "binding to a non-loopback address; ensure network access is intentional"
+        );
+    }
+
     info!(
         addr = %cfg.listen_addr,
         interval_secs = cfg.interval_secs,
@@ -98,14 +110,21 @@ async fn main() -> Result<()> {
     );
 
     let listener = TcpListener::bind(&cfg.listen_addr).await?;
+    let semaphore = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
         let (stream, addr) = listener.accept().await?;
+        let Ok(permit) = semaphore.clone().try_acquire_owned() else {
+            warn!(peer = %addr, "connection rejected: max concurrent limit reached");
+            drop(stream);
+            continue;
+        };
         info!(peer = %addr, "new template-manager connection");
         let cfg_clone = cfg.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_client(stream, cfg_clone).await {
                 error!(error = ?e, "client handler error");
             }
+            drop(permit);
         });
     }
 }
@@ -117,12 +136,11 @@ async fn handle_client(mut stream: TcpStream, cfg: BridgeConfig) -> Result<()> {
     let prev_hash = "0000000000000000000000000000000000000000000000000000000000000000".to_string();
 
     loop {
+        #[allow(clippy::cast_possible_truncation)]
+        // Safe: Unix milliseconds fit in u64 until year 584 million.
         let now_ms: u64 = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0)
-            .try_into()
-            .unwrap_or(u64::MAX);
+            .map_or(0, |d| d.as_millis() as u64);
 
         let subsidy_sats = cfg
             .subsidy_override_sats
@@ -148,6 +166,7 @@ async fn handle_client(mut stream: TcpStream, cfg: BridgeConfig) -> Result<()> {
             total_sigops: None,
             coinbase_sigops: None,
             template_weight: None,
+            gateway_instance_id: None,
         };
 
         let json = serde_json::to_string(&tpl)?;

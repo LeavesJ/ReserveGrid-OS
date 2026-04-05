@@ -291,7 +291,10 @@ where
                     warn!(error = %e, "heartbeat write failed");
                     return IoLoopOutcome::Disconnected;
                 }
-                let _ = writer.flush().await;
+                if let Err(e) = writer.flush().await {
+                    warn!(error = %e, "heartbeat flush failed");
+                    return IoLoopOutcome::Disconnected;
+                }
                 debug!("heartbeat sent");
             }
 
@@ -318,7 +321,9 @@ fn dispatch_inbound(
                         accepted = verdict.accepted,
                         "received template verdict"
                     );
-                    let _ = verdict_tx.send(VerifierInbound::TemplateVerdict(verdict));
+                    if verdict_tx.send(VerifierInbound::TemplateVerdict(verdict)).is_err() {
+                        warn!("verdict_tx has no receivers; template verdict dropped");
+                    }
                 }
                 Err(e) => {
                     warn!(error = %e, "failed to parse template_verdict payload");
@@ -330,7 +335,9 @@ fn dispatch_inbound(
             readiness
                 .policy_loaded
                 .store(true, std::sync::atomic::Ordering::SeqCst);
-            let _ = verdict_tx.send(VerifierInbound::HeartbeatAck);
+            if verdict_tx.send(VerifierInbound::HeartbeatAck).is_err() {
+                warn!("verdict_tx has no receivers; heartbeat ack dropped");
+            }
         }
         other => {
             debug!(msg_type = other, "unknown verifier message type; ignoring");
@@ -389,6 +396,7 @@ mod tests {
             total_sigops: Some(10000),
             coinbase_sigops: Some(4),
             template_weight: Some(3_950_000),
+            gateway_instance_id: Some("test-gw-01".to_string()),
         };
         let msg = VerifierOutbound::TemplatePropose(tp);
         let line = serialize_outbound(&msg).unwrap();

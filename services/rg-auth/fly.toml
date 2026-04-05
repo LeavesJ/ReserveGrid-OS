@@ -3,8 +3,7 @@ primary_region = "sjc"
 
 [build]
   dockerfile = "Dockerfile"
-  # Dockerfile expects workspace root as build context
-  # Deploy with: fly deploy --dockerfile services/rg-auth/Dockerfile .
+  # Deploy from repo root: scripts/fly-deploy.sh rg-auth --remote-only
 
 [env]
   VELDRA_AUTH_ADDR = "0.0.0.0:3030"

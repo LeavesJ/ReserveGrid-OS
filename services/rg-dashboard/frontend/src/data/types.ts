@@ -275,10 +275,7 @@ export interface DashboardSettings {
   log_format: string;
   deploy_mode: DeployMode;
   listen: string;
-  verifier_url: string;
-  template_url: string;
-  auth_url: string;
-  gateway_url: string;
+  gateway_configured: boolean;
 }
 
 /* ── Derived: acceptance rate computed client-side ── */

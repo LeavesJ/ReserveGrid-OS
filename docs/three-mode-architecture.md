@@ -122,10 +122,10 @@ Veldra-hosted service that streams real mainnet Bitcoin data over WebSocket. Thi
 - Data is IDENTICAL to what the operator's own bitcoind would produce
 
 **Auth flow:**
-1. Operator registers at veldra.org, gets approved, retrieves license key from /account/
-2. Operator sets `VELDRA_FEED_LICENSE_KEY` in their local config
+1. Operator registers at veldra.org, gets approved, receives a signed license key (format: `veldra_lic_<base64url_payload>.<base64url_signature>`)
+2. Operator sets `VELDRA_FEED_LICENSE_KEY` in their local config (same key used for OS tier gating)
 3. rg-feed-adapter connects to feed.veldra.org and sends key in the WebSocket handshake header (`Authorization: Bearer <key>`)
-4. rg-feed-server validates key against rg-auth's license database
+4. rg-feed-server validates key by verifying the Ed25519 signature and checking that the embedded tier is >= `observe_paid`
 5. On success, streaming begins. On failure, connection closes with reason.
 
 **Backend data source:** A dedicated mainnet bitcoind node operated by Veldra. Polls `getblocktemplate` and `getmempoolinfo` at configurable interval (default: 2 seconds) and fans out to all connected WebSocket clients.
@@ -263,8 +263,8 @@ No bitcoind. No account. No license key. No miners.
 
 ### Observe (evaluate with real mainnet data)
 
-1. Register at veldra.org, get admin approval, retrieve license key from /account/
-2. Configure rg-feed-adapter: `feed_url = "wss://feed.veldra.org/ws"`, `license_key = "..."`
+1. Register at veldra.org, get admin approval, receive signed license key via email (or retrieve from /license/)
+2. Configure rg-feed-adapter: `feed_url = "wss://feed.veldra.org/ws"`, `license_key = "veldra_lic_..."`
 3. Set `mode = "observe"` in all service configs
 4. Start the stack (same binaries as shadow)
 5. See real mainnet templates, real verdicts, real policy behavior
@@ -428,15 +428,15 @@ All items below are complete as of 2026-03-10.
 3. **Mode gating in pool-verifier and sv2-gateway** — DONE. Enforcement behavior per mode.
 4. **Dashboard feature gating** — DONE. React SPA reads VELDRA_MODE, gates UI accordingly. Auth flow with registration, email verification, and admin approval.
 5. **rg-feed-server** — DONE. Wraps a real mainnet bitcoind for observe mode.
-6. **License key model in rg-auth** — DONE. Key generation, storage, validation, and `/keys/*` endpoints.
+6. **License key model in rg-auth** — DONE. Key generation produces signed `veldra_lic_<base64url_payload>.<base64url_sig>` format (EX-046, EX-047). Ed25519 signing key loaded from `VELDRA_LICENSE_SIGNING_KEY` Fly secret. Validation endpoint verifies signature, expiry, and revocation status. Old `veldra_<hex>` format retired.
 
 ## Version Targets
 
 All work in this spec is v1.0.0 scope. The three mode architecture, feed services, mode gating, and dashboard feature gates are pre-release design that must land before the initial publish.
 
-- **v1.0.0:** rg-feed-adapter, rg-demo-feed, rg-feed-server, license key model, mode gating across all services, dashboard feature gates. Shadow, observe, and inline all functional.
-- **v1.0.1+:** Post-publish refinements driven by reviewer feedback: verifier decomposition, durability contract formalization, type boundary tightening, secure-by-default deployment profiles.
-- **v1.1.0:** Extended channels + vardiff (PB-6), policy model economic improvements (hysteresis, smoothing, regime-aware thresholds).
+- **v1.0.0:** rg-feed-adapter, rg-demo-feed, rg-feed-server, mode gating across all services, dashboard feature gates. Shadow, observe, and inline all functional.
+- **v1.0.1:** Security hardening (111 findings across 14 services, done), unified signed license key format (EX-046/047/048, rg-auth done, rg-feed-server done), desktop key persistence (done), website license page copy-to-clipboard (done), auth.veldra.org deployment (done).
+- **v1.1.0:** Extended channels + vardiff (PB-6), full per-IP rate limiter module, gateway Phase 1, policy model economic improvements, tier rename (`observe_free` → `shadow`).
 
 ## Risks and Edge Cases
 

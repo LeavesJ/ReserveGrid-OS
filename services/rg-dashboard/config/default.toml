@@ -4,7 +4,7 @@
 # via volume mount or VELDRA_DASHBOARD_CONFIG env pointing at the real
 # config path.
 
-listen = "0.0.0.0:8084"
+listen = "127.0.0.1:8084"
 
 auth_url     = "http://127.0.0.1:8088"
 verifier_url = "http://127.0.0.1:8080"

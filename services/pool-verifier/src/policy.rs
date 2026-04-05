@@ -436,16 +436,22 @@ impl PolicyConfig {
             ));
         }
 
-        if !(self.safety.max_weight_ratio > 0.0 && self.safety.max_weight_ratio <= 1.0) {
+        if !(self.safety.max_weight_ratio.is_finite()
+            && self.safety.max_weight_ratio > 0.0
+            && self.safety.max_weight_ratio <= 1.0)
+        {
             return Err(anyhow!(
-                "safety.max_weight_ratio ({}) must be in (0, 1]",
+                "safety.max_weight_ratio ({}) must be a finite number in (0, 1]",
                 self.safety.max_weight_ratio
             ));
         }
 
-        if !(self.safety.warn_sigops_ratio > 0.0 && self.safety.warn_sigops_ratio <= 1.0) {
+        if !(self.safety.warn_sigops_ratio.is_finite()
+            && self.safety.warn_sigops_ratio > 0.0
+            && self.safety.warn_sigops_ratio <= 1.0)
+        {
             return Err(anyhow!(
-                "safety.warn_sigops_ratio ({}) must be in (0, 1]",
+                "safety.warn_sigops_ratio ({}) must be a finite number in (0, 1]",
                 self.safety.warn_sigops_ratio
             ));
         }
@@ -547,6 +553,7 @@ mod tests {
             total_sigops: None,
             coinbase_sigops: None,
             template_weight: None,
+            gateway_instance_id: None,
         }
     }
 

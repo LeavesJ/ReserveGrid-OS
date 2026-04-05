@@ -53,8 +53,10 @@ pub async fn run_poller(
 
     let has_auth = !rpc_user.is_empty();
 
+    // Redact any embedded credentials from the RPC URL before logging.
+    let safe_url = redact_url_credentials(&rpc_url);
     info!(
-        rpc_url = %rpc_url,
+        rpc_url = %safe_url,
         poll_ms = u64::try_from(poll_interval.as_millis()).unwrap_or(u64::MAX),
         auth = has_auth,
         "bitcoind poller started"
@@ -174,6 +176,22 @@ async fn rpc_call(
         .get("result")
         .cloned()
         .ok_or_else(|| "rpc response missing 'result' field".into())
+}
+
+/// Strip `user:pass@` from a URL to prevent credential leakage in logs.
+fn redact_url_credentials(url: &str) -> String {
+    // Look for "://" then everything up to "@" is credentials.
+    if let Some(scheme_end) = url.find("://") {
+        let after_scheme = &url[scheme_end + 3..];
+        if let Some(at_pos) = after_scheme.find('@') {
+            return format!(
+                "{}://***@{}",
+                &url[..scheme_end],
+                &after_scheme[at_pos + 1..]
+            );
+        }
+    }
+    url.to_string()
 }
 
 pub fn now_ts() -> u64 {

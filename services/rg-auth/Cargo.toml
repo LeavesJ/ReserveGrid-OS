@@ -19,7 +19,10 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 argon2 = "0.5"
 lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder"] }
 rand = "0.8"
-tower-http = { version = "0.5", features = ["cors"] }
+sha2 = "0.10"
+ed25519-dalek = { version = "2", features = ["std", "rand_core"] }
+base64 = "0.22"
+tower-http = { version = "0.5", features = ["cors", "limit"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

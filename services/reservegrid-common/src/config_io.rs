@@ -12,36 +12,40 @@ use serde::de::DeserializeOwned;
 use thiserror::Error;
 
 /// Errors that can occur when reading or writing config TOML files.
+///
+/// Display messages are intentionally generic to avoid leaking file paths
+/// or OS error details to external callers. Use the struct fields for
+/// server-side structured logging.
 #[derive(Debug, Error)]
 pub enum ConfigIoError {
-    #[error("failed to read config from {path}: {source}")]
+    #[error("failed to read config file")]
     Read {
         path: String,
         source: std::io::Error,
     },
 
-    #[error("failed to parse TOML from {path}: {source}")]
+    #[error("failed to parse config file")]
     Parse {
         path: String,
         source: toml::de::Error,
     },
 
-    #[error("failed to serialize config to TOML: {source}")]
+    #[error("failed to serialize config")]
     Serialize { source: toml::ser::Error },
 
-    #[error("failed to write config to {path}: {source}")]
+    #[error("failed to write config file")]
     Write {
         path: String,
         source: std::io::Error,
     },
 
-    #[error("failed to rename temp file to {path}: {source}")]
+    #[error("failed to rename config file")]
     Rename {
         path: String,
         source: std::io::Error,
     },
 
-    #[error("failed to create backup at {path}: {source}")]
+    #[error("failed to create config backup")]
     Backup {
         path: String,
         source: std::io::Error,

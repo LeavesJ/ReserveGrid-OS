@@ -6,6 +6,7 @@
 mod config;
 mod proxy;
 
+use axum::extract::DefaultBodyLimit;
 use axum::{
     Json, Router,
     extract::State,
@@ -19,7 +20,7 @@ use reqwest::Client;
 use rust_embed::Embed;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tower_http::compression::CompressionLayer;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Embedded frontend assets built by Vite.
 ///
@@ -115,6 +116,7 @@ async fn main() -> std::process::ExitCode {
         // SPA: serve embedded static files, fallback to index.html
         .fallback(get(serve_spa))
         .layer(CompressionLayer::new())
+        .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MiB; proxy_to enforces the same cap
         .with_state(state);
 
     let addr: SocketAddr = match listen.parse() {
@@ -133,6 +135,13 @@ async fn main() -> std::process::ExitCode {
         }
     };
 
+    if !addr.ip().is_loopback() {
+        warn!(
+            %addr,
+            "dashboard binding to non-loopback address; ensure network access is intentional"
+        );
+    }
+
     info!(addr = %addr, "rg-dashboard listening");
 
     let app = app.into_make_service_with_connect_info::<SocketAddr>();
@@ -149,15 +158,14 @@ async fn dashboard_get_settings(State(state): State<Arc<AppState>>) -> Json<serd
     let log_level = std::env::var("VELDRA_LOG_FILTER").unwrap_or_else(|_| "info".into());
     let log_format = std::env::var("VELDRA_LOG_FORMAT").unwrap_or_else(|_| "pretty".into());
     let deploy_mode = std::env::var("VELDRA_MODE").unwrap_or_else(|_| "shadow".into());
+    // Internal service URLs are intentionally omitted; they are infrastructure
+    // details that the browser has no need to know and should not be exposed.
     Json(serde_json::json!({
         "log_level": log_level,
         "log_format": log_format,
         "deploy_mode": deploy_mode,
         "listen": state.config.listen,
-        "verifier_url": state.config.verifier_url,
-        "template_url": state.config.template_url,
-        "auth_url": state.config.auth_url,
-        "gateway_url": state.config.gateway_url.as_deref().unwrap_or(""),
+        "gateway_configured": state.config.gateway_url.is_some(),
     }))
 }
 

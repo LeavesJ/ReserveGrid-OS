@@ -356,6 +356,15 @@ async fn handle_setup_connection(
         .await
         .map_err(HandlerExit::TransportError)?;
 
+    // Reject non-base-protocol extension types (lower 15 bits must be 0).
+    if header.extension_type & 0x7FFF != 0 {
+        let reason = format!(
+            "unsupported extension_type 0x{:04x}; only base mining protocol (0x0000/0x8000) is supported",
+            header.extension_type,
+        );
+        return Err(HandlerExit::SetupRejected(reason));
+    }
+
     if header.msg_type != MESSAGE_TYPE_SETUP_CONNECTION {
         let reason = format!(
             "expected SetupConnection (0x{:02x}), got 0x{:02x}",
@@ -376,7 +385,24 @@ async fn handle_setup_connection(
         return Err(HandlerExit::SetupRejected(reason));
     }
 
-    let setup = sv2_codec::SetupConnection::decode(&payload).map_err(HandlerExit::CodecError)?;
+    let setup = match sv2_codec::SetupConnection::decode(&payload) {
+        Ok(s) => s,
+        Err(e) => {
+            // Best effort: inform the peer before disconnecting.
+            let err_msg = sv2_codec::SetupConnectionError {
+                flags: 0,
+                error_code: "unsupported-protocol".to_string(),
+            };
+            if let Ok(err_payload) = err_msg.encode()
+                && let Err(we) = transport
+                    .write_frame(0x0000, MESSAGE_TYPE_SETUP_CONNECTION_ERROR, &err_payload)
+                    .await
+            {
+                debug!(error = %we, "best-effort SetupConnection.Error write failed");
+            }
+            return Err(HandlerExit::CodecError(e));
+        }
+    };
 
     // Validate: protocol must be MiningProtocol (0), version range must include 2.
     if setup.protocol != 0 {
@@ -463,6 +489,19 @@ async fn wait_for_channel_open(
             .await
             .map_err(HandlerExit::TransportError)?;
 
+        // Reject non-base-protocol extension types.
+        if header.extension_type & 0x7FFF != 0 {
+            warn!(
+                peer = %peer_state.peer_addr,
+                extension_type = header.extension_type,
+                "unsupported extension_type; disconnecting",
+            );
+            return Err(HandlerExit::SetupRejected(format!(
+                "unsupported extension_type 0x{:04x}",
+                header.extension_type,
+            )));
+        }
+
         match header.msg_type {
             MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL => {
                 handle_open_standard_channel(
@@ -525,8 +564,25 @@ async fn handle_open_standard_channel(
     peer: SocketAddr,
     opened_ids: &mut Vec<u32>,
 ) -> Result<(), HandlerExit> {
-    let open_req =
-        sv2_codec::OpenStandardMiningChannel::decode(payload).map_err(HandlerExit::CodecError)?;
+    let open_req = match sv2_codec::OpenStandardMiningChannel::decode(payload) {
+        Ok(r) => r,
+        Err(e) => {
+            // Best effort: send OpenMiningChannel.Error with request_id=0 since
+            // the decode failed and we cannot extract the real request_id.
+            let err = sv2_codec::OpenMiningChannelError {
+                request_id: 0,
+                error_code: "unsupported-protocol".to_string(),
+            };
+            if let Ok(err_payload) = err.encode()
+                && let Err(we) = transport
+                    .write_frame(0x0000, MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR, &err_payload)
+                    .await
+            {
+                debug!(error = %we, "best-effort OpenMiningChannel.Error write failed");
+            }
+            return Err(HandlerExit::CodecError(e));
+        }
+    };
 
     // Allocate channel ID and extranonce.
     let Some(channel_id) = channel_id_alloc.allocate() else {
@@ -732,6 +788,19 @@ async fn handle_miner_frame(
     peer: SocketAddr,
     opened_ids: &mut Vec<u32>,
 ) -> FrameAction {
+    // Reject non-base-protocol extension types.
+    if header.extension_type & 0x7FFF != 0 {
+        warn!(
+            peer = %peer_state.peer_addr,
+            extension_type = header.extension_type,
+            "unsupported extension_type in steady-state frame; disconnecting",
+        );
+        return FrameAction::Disconnect(HandlerExit::SetupRejected(format!(
+            "unsupported extension_type 0x{:04x}",
+            header.extension_type,
+        )));
+    }
+
     match header.msg_type {
         MESSAGE_TYPE_SUBMIT_SHARES_STANDARD => {
             match handle_submit_shares(
@@ -811,11 +880,12 @@ async fn handle_miner_frame(
                     }
                 }
                 Err(e) => {
-                    debug!(
+                    warn!(
                         peer = %peer_state.peer_addr,
                         error = %e,
-                        "failed to decode CloseChannel",
+                        "failed to decode CloseChannel; disconnecting",
                     );
+                    return FrameAction::Disconnect(HandlerExit::CodecError(e));
                 }
             }
             FrameAction::Continue
@@ -851,8 +921,28 @@ async fn handle_submit_shares(
     share_forward_tx: &mpsc::Sender<ShareSubmission>,
     payload: &[u8],
 ) -> Result<(), HandlerExit> {
-    let share =
-        sv2_codec::SubmitSharesStandard::decode(payload).map_err(HandlerExit::CodecError)?;
+    let share = match sv2_codec::SubmitSharesStandard::decode(payload) {
+        Ok(s) => s,
+        Err(e) => {
+            // Best effort: send SubmitShares.Error with zeroed IDs since the
+            // decode failed and we cannot extract channel_id or sequence_number.
+            let err = sv2_codec::SubmitSharesError {
+                channel_id: 0,
+                sequence_number: 0,
+                error_code: GatewayReason::FrameDecodeError
+                    .to_sv2_error_code()
+                    .to_string(),
+            };
+            if let Ok(err_payload) = err.encode()
+                && let Err(we) = transport
+                    .write_frame(0x8000, MESSAGE_TYPE_SUBMIT_SHARES_ERROR, &err_payload)
+                    .await
+            {
+                debug!(error = %we, "best-effort SubmitShares.Error write failed");
+            }
+            return Err(HandlerExit::CodecError(e));
+        }
+    };
 
     // ── Step 0: Validate channel exists ──
     let Some(_channel) = channels.get(share.channel_id) else {
@@ -862,7 +952,9 @@ async fn handle_submit_shares(
             share.sequence_number,
             share.job_id,
         );
-        let _ = share_event_tx.try_send(evt);
+        if let Err(e) = share_event_tx.try_send(evt) {
+            warn!(error = %e, "share_event_tx full; share event dropped");
+        }
         return send_share_error(
             transport,
             share.channel_id,
@@ -889,7 +981,9 @@ async fn handle_submit_shares(
             share.sequence_number,
             share.job_id,
         );
-        let _ = share_event_tx.try_send(evt);
+        if let Err(e) = share_event_tx.try_send(evt) {
+            warn!(error = %e, "share_event_tx full; share event dropped");
+        }
         return send_share_error(
             transport,
             share.channel_id,
@@ -931,7 +1025,9 @@ async fn handle_submit_shares(
             share.sequence_number,
             share.job_id,
         );
-        let _ = share_event_tx.try_send(evt);
+        if let Err(e) = share_event_tx.try_send(evt) {
+            warn!(error = %e, "share_event_tx full; share event dropped");
+        }
         return send_share_error(
             transport,
             share.channel_id,
@@ -969,7 +1065,9 @@ async fn handle_submit_shares(
             share.sequence_number,
             share.job_id,
         );
-        let _ = share_event_tx.try_send(evt);
+        if let Err(e) = share_event_tx.try_send(evt) {
+            warn!(error = %e, "share_event_tx full; share event dropped");
+        }
         return send_share_error(
             transport,
             share.channel_id,
@@ -1006,7 +1104,9 @@ async fn handle_submit_shares(
             share.sequence_number,
             share.job_id,
         );
-        let _ = share_event_tx.try_send(evt);
+        if let Err(e) = share_event_tx.try_send(evt) {
+            warn!(error = %e, "share_event_tx full; share event dropped");
+        }
         return send_share_error(
             transport,
             share.channel_id,
@@ -1061,7 +1161,9 @@ async fn handle_submit_shares(
             timestamp_ms: unix_ms_now(),
             difficulty_u64: 0,
         };
-        let _ = share_event_tx.try_send(evt);
+        if let Err(e) = share_event_tx.try_send(evt) {
+            warn!(error = %e, "share_event_tx full; share event dropped");
+        }
         return send_share_error(
             transport,
             share.channel_id,
@@ -1096,7 +1198,9 @@ async fn handle_submit_shares(
             timestamp_ms: unix_ms_now(),
             difficulty_u64: 0,
         };
-        let _ = share_event_tx.try_send(evt);
+        if let Err(e) = share_event_tx.try_send(evt) {
+            warn!(error = %e, "share_event_tx full; share event dropped");
+        }
         return send_share_error(
             transport,
             share.channel_id,
@@ -1140,7 +1244,9 @@ async fn handle_submit_shares(
         timestamp_ms: unix_ms_now(),
         difficulty_u64: difficulty,
     };
-    let _ = share_event_tx.try_send(evt);
+    if let Err(e) = share_event_tx.try_send(evt) {
+        warn!(error = %e, "share_event_tx full; share event dropped");
+    }
 
     // Enqueue for upstream relay.
     let prev_hash_wire = job_prev_hash;
@@ -1182,7 +1288,9 @@ async fn handle_submit_shares(
                 .unwrap_or_default()
         },
     };
-    let _ = share_forward_tx.try_send(submission);
+    if let Err(e) = share_forward_tx.try_send(submission) {
+        warn!(error = %e, "share_forward_tx full; share submission dropped");
+    }
 
     let success = sv2_codec::SubmitSharesSuccess {
         channel_id: share.channel_id,

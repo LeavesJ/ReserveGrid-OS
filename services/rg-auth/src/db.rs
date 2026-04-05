@@ -22,6 +22,15 @@ pub fn init(path: &str) -> Result<DbPool> {
     conn.execute_batch("PRAGMA journal_mode = WAL;")?;
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
 
+    // Verify database integrity on startup. Catches corruption from
+    // unclean shutdowns or disk errors before we attempt migrations.
+    let integrity: String = conn
+        .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+        .with_context(|| "integrity_check query failed")?;
+    if integrity != "ok" {
+        anyhow::bail!("sqlite integrity_check failed: {integrity}");
+    }
+
     migrate(&conn)?;
 
     Ok(Arc::new(Mutex::new(conn)))
@@ -328,44 +337,72 @@ pub fn consume_email_token_ttl(
 
 // ── Session queries ─────────────────────────────────────────────
 
-pub fn insert_session(conn: &Connection, token: &str, user_id: i64, ttl_hours: u64) -> Result<()> {
-    // Compute expiry as a modifier string and pass it as a parameter to avoid
-    // format!() SQL interpolation.
+/// Insert a session using the SHA-256 hash of the token. The raw token is
+/// never stored; only the hash is persisted. Callers must hash before storing.
+pub fn insert_session(
+    conn: &Connection,
+    token_hash: &str,
+    user_id: i64,
+    ttl_hours: u64,
+) -> Result<()> {
     let modifier = format!("+{ttl_hours} hours");
     conn.execute(
         "INSERT INTO sessions (token, user_id, expires_at)
          VALUES (?1, ?2, datetime('now', ?3))",
-        rusqlite::params![token, user_id, modifier],
+        rusqlite::params![token_hash, user_id, modifier],
     )
     .context("insert session")?;
     Ok(())
 }
 
-pub fn validate_session(conn: &Connection, token: &str) -> Result<Option<i64>> {
+/// Validate a session by looking up the SHA-256 hash of the provided token.
+pub fn validate_session(conn: &Connection, token_hash: &str) -> Result<Option<i64>> {
     let mut stmt = conn.prepare(
         "SELECT user_id FROM sessions
          WHERE token = ?1 AND datetime(expires_at) > datetime('now')",
     )?;
 
     let user_id: Option<i64> = stmt
-        .query_map(rusqlite::params![token], |row| row.get(0))?
+        .query_map(rusqlite::params![token_hash], |row| row.get(0))?
         .next()
         .and_then(Result::ok);
 
     Ok(user_id)
 }
 
-pub fn delete_session(conn: &Connection, token: &str) -> Result<()> {
+/// Delete a session by its token hash.
+pub fn delete_session(conn: &Connection, token_hash: &str) -> Result<()> {
     conn.execute(
         "DELETE FROM sessions WHERE token = ?1",
-        rusqlite::params![token],
+        rusqlite::params![token_hash],
     )?;
     Ok(())
+}
+
+/// Delete all sessions for a user. Called after password reset to invalidate
+/// any sessions an attacker may have obtained with the old credentials.
+pub fn delete_sessions_for_user(conn: &Connection, user_id: i64) -> Result<usize> {
+    let n = conn.execute(
+        "DELETE FROM sessions WHERE user_id = ?1",
+        rusqlite::params![user_id],
+    )?;
+    Ok(n)
 }
 
 pub fn cleanup_expired_sessions(conn: &Connection) -> Result<usize> {
     let n = conn.execute(
         "DELETE FROM sessions WHERE datetime(expires_at) <= datetime('now')",
+        [],
+    )?;
+    Ok(n)
+}
+
+/// Delete email tokens older than 30 days. Used tokens accumulate over time
+/// and serve no purpose after their TTL window (7 days for verify/approve,
+/// 1 hour for password reset). A 30 day retention provides ample margin.
+pub fn cleanup_stale_email_tokens(conn: &Connection) -> Result<usize> {
+    let n = conn.execute(
+        "DELETE FROM email_tokens WHERE datetime(created_at, '+30 days') <= datetime('now')",
         [],
     )?;
     Ok(n)
@@ -581,15 +618,18 @@ mod tests {
 
     #[test]
     fn session_round_trip() {
+        use crate::session;
         let pool = test_db();
         let conn = pool.lock().unwrap();
         let uid = insert_user(&conn, "a@b.com", "A", "O", "h").unwrap();
 
-        insert_session(&conn, "sess_abc", uid, 168).unwrap();
-        assert_eq!(validate_session(&conn, "sess_abc").unwrap(), Some(uid));
+        let raw_token = "sess_abc";
+        let token_hash = session::hash_token(raw_token);
+        insert_session(&conn, &token_hash, uid, 168).unwrap();
+        assert_eq!(validate_session(&conn, &token_hash).unwrap(), Some(uid));
 
-        delete_session(&conn, "sess_abc").unwrap();
-        assert!(validate_session(&conn, "sess_abc").unwrap().is_none());
+        delete_session(&conn, &token_hash).unwrap();
+        assert!(validate_session(&conn, &token_hash).unwrap().is_none());
     }
 
     #[test]

@@ -17,6 +17,9 @@ heartbeat_interval_ms = 15000
 channel_capacity = 64
 
 [auth]
+# Ed25519 public key for offline signed key verification (base64url, 32 bytes).
+# Overridden by VELDRA_LICENSE_PUBKEY env var in docker-compose.observe.yml.
+license_pubkey = ""
 valid_keys = ""
-# Validate keys dynamically against rg-auth.
+# Validate keys dynamically against rg-auth (fallback for legacy keys).
 auth_url = "http://rg-auth:3030"

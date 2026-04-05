@@ -1,4 +1,4 @@
-//! `rg-desktop`: ReserveGrid OS native desktop client.
+//! `rg-desktop`: `ReserveGrid` OS native desktop client.
 //!
 //! Tauri application that replaces `rg-dashboard` (HTTP reverse proxy + embedded SPA)
 //! with native IPC commands. The React frontend calls Tauri commands instead of
@@ -27,9 +27,7 @@ pub struct AppState {
 fn main() {
     // Structured logging — same env vars as the rest of the stack.
     let filter = std::env::var("VELDRA_LOG_FILTER").unwrap_or_else(|_| String::from("info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(&filter)
-        .init();
+    tracing_subscriber::fmt().with_env_filter(&filter).init();
 
     let cfg = match config::DesktopConfig::load() {
         Ok(c) => c,
@@ -40,8 +38,8 @@ fn main() {
     };
 
     info!(
-        verifier = %cfg.verifier_url,
-        templates = %cfg.template_url,
+        verifier = %redact_url_credentials(&cfg.verifier_url),
+        templates = %redact_url_credentials(&cfg.template_url),
         "starting rg-desktop"
     );
 
@@ -133,6 +131,21 @@ fn main() {
                 _ => {}
             }
         });
+}
+
+/// Redact userinfo from URLs so credentials never appear in logs.
+fn redact_url_credentials(url: &str) -> String {
+    if let Some(scheme_end) = url.find("://") {
+        let after_scheme = &url[scheme_end + 3..];
+        if let Some(at_pos) = after_scheme.find('@') {
+            return format!(
+                "{}://***@{}",
+                &url[..scheme_end],
+                &after_scheme[at_pos + 1..]
+            );
+        }
+    }
+    url.to_string()
 }
 
 #[cfg(test)]

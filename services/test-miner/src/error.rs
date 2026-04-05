@@ -1,4 +1,8 @@
 //! Error types for the test-miner.
+//!
+//! Error messages exposed via `Display` are intentionally generic.
+//! Detailed diagnostics are emitted through `tracing::warn` at the
+//! call site before the error is constructed.
 
 use thiserror::Error;
 
@@ -13,6 +17,6 @@ pub enum MinerError {
     #[error("protocol error: {0}")]
     Protocol(String),
 
-    #[error("codec error: {0}")]
+    #[error("codec error")]
     Codec(#[from] sv2_gateway::sv2_codec::Sv2CodecError),
 }

@@ -5,16 +5,22 @@ use tracing::warn;
 
 static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
+/// Default mempool HTTP client timeout in milliseconds.
+const DEFAULT_MEMPOOL_TIMEOUT_MS: u64 = 900;
+
+pub(crate) fn mempool_timeout_ms() -> u64 {
+    std::env::var("VELDRA_MEMPOOL_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MEMPOOL_TIMEOUT_MS)
+}
+
 fn client() -> &'static reqwest::Client {
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
-            .timeout(Duration::from_millis(900))
+            .timeout(Duration::from_millis(mempool_timeout_ms()))
             .build()
-            .unwrap_or_else(|_| {
-                // Fallback to a default client if builder fails
-                // This should never happen in practice with these settings
-                reqwest::Client::new()
-            })
+            .unwrap_or_else(|_| reqwest::Client::new())
     })
 }
 

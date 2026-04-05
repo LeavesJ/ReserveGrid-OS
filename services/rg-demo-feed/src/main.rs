@@ -15,6 +15,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tracing::{error, info, warn};
 
 mod scenarios;
@@ -30,7 +31,11 @@ mod scenarios;
 )]
 struct Cli {
     /// Listen address for WebSocket connections.
-    #[arg(long, env = "VELDRA_DEMO_FEED_LISTEN", default_value = "0.0.0.0:9100")]
+    #[arg(
+        long,
+        env = "VELDRA_DEMO_FEED_LISTEN",
+        default_value = "127.0.0.1:9100"
+    )]
     listen: String,
 
     /// Interval between template emissions in milliseconds.
@@ -80,6 +85,13 @@ async fn main() {
         std::process::exit(1);
     });
 
+    if !addr.ip().is_loopback() {
+        warn!(
+            %addr,
+            "demo feed binding to non-loopback address; ensure network access is intentional"
+        );
+    }
+
     info!(%addr, interval_ms = cli.interval_ms, "rg-demo-feed listening");
 
     loop {
@@ -105,7 +117,13 @@ async fn handle_client(
     mut rx: broadcast::Receiver<Arc<String>>,
     peer: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let ws_stream = tokio_tungstenite::accept_async(stream).await?;
+    let ws_config = WebSocketConfig {
+        max_message_size: Some(1024 * 1024), // 1 MiB
+        max_frame_size: Some(256 * 1024),    // 256 KiB
+        ..WebSocketConfig::default()
+    };
+
+    let ws_stream = tokio_tungstenite::accept_async_with_config(stream, Some(ws_config)).await?;
     info!(%peer, "client connected");
 
     let (mut writer, mut reader) = ws_stream.split();

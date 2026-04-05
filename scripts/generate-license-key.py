@@ -12,7 +12,7 @@ Usage:
     python3 generate-license-key.py \
         --private-key ~/.veldra/license-signing.key \
         --org-id org_acme \
-        --tier inline \
+        --tier inline_licensed \
         --features gateway,exporter,dashboard \
         --days 365
 
@@ -190,8 +190,8 @@ def main():
     parser.add_argument("--org-id", help="Organization ID (e.g., org_acme)")
     parser.add_argument(
         "--tier",
-        choices=["observe_free", "observe_paid", "shadow", "inline"],
-        help="License tier",
+        choices=["observe_free", "observe_paid", "inline_licensed"],
+        help="License tier (must match rg-auth/src/db.rs tier constants)",
     )
     parser.add_argument(
         "--features",

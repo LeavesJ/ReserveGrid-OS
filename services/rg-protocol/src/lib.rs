@@ -35,6 +35,13 @@ pub struct TemplatePropose {
 
     #[serde(default)]
     pub template_weight: Option<u64>,
+
+    /// Identity of the gateway instance that sent this proposal. Enables the
+    /// verifier to route verdicts correctly in multi-gateway deployments and
+    /// prevents split-brain where verdicts from one gateway are consumed by
+    /// another. Optional for backward compatibility.
+    #[serde(default)]
+    pub gateway_instance_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
