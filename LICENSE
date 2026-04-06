@@ -1,7 +1,7 @@
 VELDRA SOURCE AVAILABLE LICENSE
-Version 1.0
+Version 1.1
 
-Copyright (c) 2026 Veldra, Inc. and Jarron Wan Deng. All rights reserved.
+Copyright (c) 2025-2026 Veldra, Inc. and Jarron Wan Deng. All rights reserved.
 
 This license governs access to and use of the software, documentation, and other materials made available in this repository (the “Materials”).
 
@@ -31,7 +31,8 @@ Except as expressly permitted in Section 3, you may not:
 (b) modify, translate, adapt, create derivative works of, or prepare patches for the Materials
 (c) reverse engineer, decompile, or disassemble any compiled artifacts distributed by Owner, except to the extent prohibited by applicable law
 (d) remove or alter copyright, trademark, or attribution notices
-(e) use the Materials to train, fine tune, or improve machine learning models, or to generate code, policies, or rules intended to reproduce substantially similar functionality
+(e) use the Materials to train, fine tune, distill, embed, index, or improve machine learning or artificial intelligence models, retrieval systems, or automated analysis pipelines, or to generate code, policies, configurations, or rules intended to reproduce substantially similar functionality
+(f) use the Materials as input to any automated system that produces competing software, services, or operational tooling for mining pool infrastructure
 
 6. FEEDBACK AND CONTRIBUTIONS
 Do not submit pull requests or code contributions unless Owner agrees otherwise in writing.
@@ -45,7 +46,7 @@ The Materials may include or depend on third party software subject to separate 
 
 9. TERMINATION
 This license remains effective until terminated. Owner may terminate it immediately upon your breach.
-Upon termination, you must cease all use of the Materials and delete all copies in your possession or control, except where retention is required by law. Sections 2, 5, 6, 7, 8, 10, 11, 13, and 14 survive termination.
+Upon termination, you must cease all use of the Materials and delete all copies in your possession or control, except where retention is required by law. Sections 2, 5, 6, 7, 8, 10, 11, 13, 14, and 15 survive termination.
 
 10. NO WARRANTY
 THE MATERIALS ARE PROVIDED “AS IS” AND “AS AVAILABLE.”
@@ -62,6 +63,9 @@ You are responsible for complying with applicable laws and regulations, includin
 This license is governed by the laws of the State of Delaware, USA, without regard to conflict of law principles.
 Any dispute will be brought exclusively in the state or federal courts located in New Castle County, Delaware, and you consent to their jurisdiction.
 
-14. CONTACT AND COMMERCIAL LICENSING
+14. SOURCE CONTINUITY
+Licensees holding a separate commercial license may be entitled to source continuity provisions, including escrow release under defined cessation conditions. Those provisions are governed exclusively by the applicable commercial license agreement and are not granted under this public license.
+
+15. CONTACT AND COMMERCIAL LICENSING
 For commercial licensing, Production Use, partnerships, or permissions not granted here, contact:
 jarrondeng@veldra.org
