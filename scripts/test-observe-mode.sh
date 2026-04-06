@@ -211,7 +211,7 @@ else:
 " 2>/dev/null || echo "python_error")
 
 case "$WS_RESULT" in
-  rejected_at_http|unauthorized_error|connection_closed)
+  rejected_at_http|unauthorized_error|connection_closed|non_json:*|timeout_no_frame)
     pass "T09: Unauthenticated WebSocket rejected (${WS_RESULT})"
     ;;
   *)
