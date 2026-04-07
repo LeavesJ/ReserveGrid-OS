@@ -1,7 +1,7 @@
 # Three Mode Architecture Spec
 
 **Status:** Implemented
-**Version:** v1.0.0
+**Version:** v1.0.2
 **Date:** 2026-03-10
 
 ## Overview
@@ -436,7 +436,8 @@ All work in this spec is v1.0.0 scope. The three mode architecture, feed service
 
 - **v1.0.0:** rg-feed-adapter, rg-demo-feed, rg-feed-server, mode gating across all services, dashboard feature gates. Shadow, observe, and inline all functional.
 - **v1.0.1:** Security hardening (111 findings across 14 services, done), unified signed license key format (EX-046/047/048, rg-auth done, rg-feed-server done), desktop key persistence (done), website license page copy-to-clipboard (done), auth.veldra.org deployment (done).
-- **v1.1.0:** Extended channels + vardiff (PB-6), full per-IP rate limiter module, gateway Phase 1, policy model economic improvements, tier rename (`observe_free` → `shadow`).
+- **v1.0.2:** Config.rs unsafe lint fix, dev passkey bypass (SHA-256 hashed, debug-only), in-app auto-updater (Tauri updater + Settings card + tray menu), stale-diff bug fix across all 4 dashboard save handlers, version bumps, website content refresh.
+- **v1.1.0:** Automatic mode degradation (inline→observe on verifier unreachable), extended channels + vardiff (PB-6), full per-IP rate limiter module, gateway Phase 1, policy model economic improvements.
 
 ## Risks and Edge Cases
 

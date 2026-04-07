@@ -12,6 +12,7 @@ mod config;
 mod license;
 mod proxy;
 mod tray;
+mod update;
 
 use std::sync::Arc;
 use tauri::{Manager, RunEvent, WindowEvent};
@@ -75,6 +76,8 @@ fn main() {
             license::get_license_status,
             license::set_license_key,
             license::clear_license,
+            update::check_for_update,
+            update::install_update,
         ])
         .setup(|app| {
             let state = app.state::<Arc<AppState>>();

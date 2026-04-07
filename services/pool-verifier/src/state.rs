@@ -62,7 +62,7 @@ pub fn safe_initial_policy(path: &str) -> PolicyHolder {
         Ok(h) => h,
         Err(e) => {
             error!(error = ?e, "policy load failed");
-            warn!("entering degraded mode with built-in default policy");
+            error!("entering degraded mode with built-in default policy — all templates will be accepted without fee enforcement");
 
             // Use the repo-provided constructor (PolicyConfig is not Default).
             let mut cfg: PolicyConfig = PolicyConfig::default_with_protocol(PROTOCOL_VERSION);

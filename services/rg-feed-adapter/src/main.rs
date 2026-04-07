@@ -145,10 +145,22 @@ async fn main() {
         std::process::exit(1);
     });
 
+    // SEC-006: block non-loopback bind unless explicitly opted in.
     if !addr.ip().is_loopback() {
+        let allow_non_loopback = std::env::var("VELDRA_ALLOW_NON_LOOPBACK")
+            .ok()
+            .as_deref()
+            == Some("1");
+        if !allow_non_loopback {
+            error!(
+                %addr,
+                "refusing to bind to non-loopback address; set VELDRA_ALLOW_NON_LOOPBACK=1 to override"
+            );
+            std::process::exit(1);
+        }
         warn!(
             %addr,
-            "feed adapter binding to non-loopback address; ensure network access is intentional"
+            "feed adapter binding to non-loopback address (VELDRA_ALLOW_NON_LOOPBACK=1)"
         );
     }
 

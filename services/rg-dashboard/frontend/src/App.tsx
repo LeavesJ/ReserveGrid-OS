@@ -16,7 +16,7 @@ import {
   register, verifyEmail,
   forgotPassword, resetPassword,
 } from "./hooks/useApi";
-import { isTauri, tauriFetch, getLicenseStatus, setLicenseKey, clearLicense } from "./tauri-bridge";
+import { isTauri, tauriFetch, getLicenseStatus, setLicenseKey, clearLicense, checkForUpdate, installUpdate } from "./tauri-bridge";
 import type {
   ServiceHealth, VerdictStats, Verdict, PolicyConfig,
   LatestTemplate, MempoolStats, DeployMode, ModeCapabilities,
@@ -431,10 +431,17 @@ function PolicyPage({ policy, verdicts, mempool, live, caps }: {
   }).length;
   const delta = wouldReject - currentRejects;
 
+  /* Tracks the last state the server acknowledged.  Starts as the prop
+     value and updates after each successful apply so diffs stay correct
+     even before the next poll overwrites the prop. */
+  const serverStateRef = useRef(policy);
+  useEffect(() => { serverStateRef.current = policy; }, [policy]);
+
   const handleApply = async () => {
     setApplying(true);
     setApplyResult(null);
-    /* Send only fields that differ from the live server state */
+    /* Diff against the last known server state, not the possibly stale prop */
+    const baseline = serverStateRef.current;
     const patch: Record<string, number | boolean> = {};
     const diffKeys: (keyof PolicyConfig)[] = [
       "low_mempool_tx", "high_mempool_tx",
@@ -446,7 +453,7 @@ function PolicyPage({ policy, verdicts, mempool, live, caps }: {
       "warn_sigops_ratio", "warn_coinbase_sigops_max",
     ];
     for (const k of diffKeys) {
-      if (local[k] !== policy[k]) {
+      if (local[k] !== baseline[k]) {
         patch[k] = local[k] as number | boolean;
       }
     }
@@ -455,6 +462,10 @@ function PolicyPage({ policy, verdicts, mempool, live, caps }: {
     const msg = result.ok ? "Policy applied." : (result.error ?? "Unknown error");
     setApplyResult(msg);
     if (result.ok) {
+      /* Advance the server baseline so the next diff is correct even
+         before the poll returns. */
+      serverStateRef.current = { ...local };
+      prevPolicyRef.current = { ...local };
       setUserEdited(false);
       setTimeout(() => setApplyResult(null), 4000);
     }
@@ -857,13 +868,18 @@ function SettingsPage({ caps }: { caps: ModeCapabilities }) {
 
   const handleSaveVerifierSettings = async () => {
     const patch: Record<string, unknown> = {};
-    if (editVsLogLevel !== vs.log_level) patch.log_level = editVsLogLevel;
-    if (editVsLogFormat !== vs.log_format) patch.log_format = editVsLogFormat;
-    if (editVsMempool !== vs.mempool_url) patch.mempool_url = editVsMempool;
+    if (editVsLogLevel !== prevVsLogLevelRef.current) patch.log_level = editVsLogLevel;
+    if (editVsLogFormat !== prevVsLogFormatRef.current) patch.log_format = editVsLogFormat;
+    if (editVsMempool !== prevVsMempoolRef.current) patch.mempool_url = editVsMempool;
     const result = await saveVerifierSettings(patch);
     const msg = result.ok ? "Settings saved." : (result.error ?? "Unknown error");
     setVsSaveResult(msg);
-    if (result.ok) setTimeout(() => setVsSaveResult(null), 4000);
+    if (result.ok) {
+      prevVsLogLevelRef.current = editVsLogLevel;
+      prevVsLogFormatRef.current = editVsLogFormat;
+      prevVsMempoolRef.current = editVsMempool;
+      setTimeout(() => setVsSaveResult(null), 4000);
+    }
   };
 
   /* ── SV2 Gateway editable state ── */
@@ -921,28 +937,33 @@ function SettingsPage({ caps }: { caps: ModeCapabilities }) {
     prevGsRef.current = { max_connections: gs.max_connections, max_channels_per_conn: gs.max_channels_per_conn };
   }, [gs.max_connections, gs.max_channels_per_conn, editGsMaxConnections, editGsMaxChannelsPerConn]);
 
+  /* Baseline snapshot of gateway settings for accurate diffing between polls */
+  const gsBaselineRef = useRef(gs);
+  useEffect(() => { gsBaselineRef.current = gs; }, [gs]);
+
   const handleSaveGatewaySettings = async () => {
+    const b = gsBaselineRef.current;
     const patch: Record<string, unknown> = {};
-    if (editGsMaxConnections !== String(gs.max_connections)) patch.max_connections = parseInt(editGsMaxConnections, 10);
-    if (editGsMaxChannelsPerConn !== String(gs.max_channels_per_conn)) patch.max_channels_per_conn = parseInt(editGsMaxChannelsPerConn, 10);
-    if (editGsMaxWorkerIdBytes !== String(gs.max_worker_id_bytes)) patch.max_worker_id_bytes = parseInt(editGsMaxWorkerIdBytes, 10);
-    if (editGsTemplatePollMs !== String(gs.template_poll_interval_ms)) patch.template_poll_interval_ms = parseInt(editGsTemplatePollMs, 10);
-    if (editGsMaxTemplateAgeMs !== String(gs.max_template_age_ms)) patch.max_template_age_ms = parseInt(editGsMaxTemplateAgeMs, 10);
-    if (editGsPrevhashVerdictMs !== String(gs.prevhash_verdict_timeout_ms)) patch.prevhash_verdict_timeout_ms = parseInt(editGsPrevhashVerdictMs, 10);
-    if (editGsPrevhashStaleHoldMs !== String(gs.prevhash_stale_hold_ms)) patch.prevhash_stale_hold_ms = parseInt(editGsPrevhashStaleHoldMs, 10);
-    if (editGsUpstreamStaleMaxMs !== String(gs.upstream_stale_max_ms)) patch.upstream_stale_max_ms = parseInt(editGsUpstreamStaleMaxMs, 10);
-    if (editGsUpstreamFailurePolicy !== gs.upstream_failure_policy) patch.upstream_failure_policy = editGsUpstreamFailurePolicy;
-    if (editGsShareDedupWindow !== String(gs.share_dedup_window_size)) patch.share_dedup_window_size = parseInt(editGsShareDedupWindow, 10);
-    if (editGsNtimeSlackSecs !== String(gs.ntime_elapsed_slack_seconds)) patch.ntime_elapsed_slack_seconds = parseInt(editGsNtimeSlackSecs, 10);
-    if (editGsMaxFutureBlockSecs !== String(gs.max_future_block_time_seconds)) patch.max_future_block_time_seconds = parseInt(editGsMaxFutureBlockSecs, 10);
-    if (editGsJobRetentionMs !== String(gs.job_retention_ms)) patch.job_retention_ms = parseInt(editGsJobRetentionMs, 10);
-    if (editGsChannelTargetHex !== (gs.channel_target_hex || "")) patch.channel_target_hex = editGsChannelTargetHex || null;
-    if (editGsMaxSharesPerSec !== String(gs.max_shares_per_second_per_channel)) patch.max_shares_per_second_per_channel = parseInt(editGsMaxSharesPerSec, 10);
-    if (editGsNoiseCertValiditySecs !== String(gs.noise_cert_validity_secs)) patch.noise_cert_validity_secs = parseInt(editGsNoiseCertValiditySecs, 10);
-    if (editGsNoiseHandshakeMs !== String(gs.noise_handshake_timeout_ms)) patch.noise_handshake_timeout_ms = parseInt(editGsNoiseHandshakeMs, 10);
-    if (editGsNoiseKeypairReloadSighup !== gs.noise_keypair_reload_sighup) patch.noise_keypair_reload_sighup = editGsNoiseKeypairReloadSighup;
-    if (editGsNoiseKeypairPollSecs !== String(gs.noise_keypair_poll_interval_secs)) patch.noise_keypair_poll_interval_secs = parseInt(editGsNoiseKeypairPollSecs, 10);
-    if (editGsWalCompactionThreshold !== String(gs.wal_compaction_threshold)) patch.wal_compaction_threshold = parseInt(editGsWalCompactionThreshold, 10);
+    if (editGsMaxConnections !== String(b.max_connections)) patch.max_connections = parseInt(editGsMaxConnections, 10);
+    if (editGsMaxChannelsPerConn !== String(b.max_channels_per_conn)) patch.max_channels_per_conn = parseInt(editGsMaxChannelsPerConn, 10);
+    if (editGsMaxWorkerIdBytes !== String(b.max_worker_id_bytes)) patch.max_worker_id_bytes = parseInt(editGsMaxWorkerIdBytes, 10);
+    if (editGsTemplatePollMs !== String(b.template_poll_interval_ms)) patch.template_poll_interval_ms = parseInt(editGsTemplatePollMs, 10);
+    if (editGsMaxTemplateAgeMs !== String(b.max_template_age_ms)) patch.max_template_age_ms = parseInt(editGsMaxTemplateAgeMs, 10);
+    if (editGsPrevhashVerdictMs !== String(b.prevhash_verdict_timeout_ms)) patch.prevhash_verdict_timeout_ms = parseInt(editGsPrevhashVerdictMs, 10);
+    if (editGsPrevhashStaleHoldMs !== String(b.prevhash_stale_hold_ms)) patch.prevhash_stale_hold_ms = parseInt(editGsPrevhashStaleHoldMs, 10);
+    if (editGsUpstreamStaleMaxMs !== String(b.upstream_stale_max_ms)) patch.upstream_stale_max_ms = parseInt(editGsUpstreamStaleMaxMs, 10);
+    if (editGsUpstreamFailurePolicy !== b.upstream_failure_policy) patch.upstream_failure_policy = editGsUpstreamFailurePolicy;
+    if (editGsShareDedupWindow !== String(b.share_dedup_window_size)) patch.share_dedup_window_size = parseInt(editGsShareDedupWindow, 10);
+    if (editGsNtimeSlackSecs !== String(b.ntime_elapsed_slack_seconds)) patch.ntime_elapsed_slack_seconds = parseInt(editGsNtimeSlackSecs, 10);
+    if (editGsMaxFutureBlockSecs !== String(b.max_future_block_time_seconds)) patch.max_future_block_time_seconds = parseInt(editGsMaxFutureBlockSecs, 10);
+    if (editGsJobRetentionMs !== String(b.job_retention_ms)) patch.job_retention_ms = parseInt(editGsJobRetentionMs, 10);
+    if (editGsChannelTargetHex !== (b.channel_target_hex || "")) patch.channel_target_hex = editGsChannelTargetHex || null;
+    if (editGsMaxSharesPerSec !== String(b.max_shares_per_second_per_channel)) patch.max_shares_per_second_per_channel = parseInt(editGsMaxSharesPerSec, 10);
+    if (editGsNoiseCertValiditySecs !== String(b.noise_cert_validity_secs)) patch.noise_cert_validity_secs = parseInt(editGsNoiseCertValiditySecs, 10);
+    if (editGsNoiseHandshakeMs !== String(b.noise_handshake_timeout_ms)) patch.noise_handshake_timeout_ms = parseInt(editGsNoiseHandshakeMs, 10);
+    if (editGsNoiseKeypairReloadSighup !== b.noise_keypair_reload_sighup) patch.noise_keypair_reload_sighup = editGsNoiseKeypairReloadSighup;
+    if (editGsNoiseKeypairPollSecs !== String(b.noise_keypair_poll_interval_secs)) patch.noise_keypair_poll_interval_secs = parseInt(editGsNoiseKeypairPollSecs, 10);
+    if (editGsWalCompactionThreshold !== String(b.wal_compaction_threshold)) patch.wal_compaction_threshold = parseInt(editGsWalCompactionThreshold, 10);
 
     if (Object.keys(patch).length === 0) {
       setGsSaveResult("No changes to save.");
@@ -953,7 +974,10 @@ function SettingsPage({ caps }: { caps: ModeCapabilities }) {
     const result = await saveGatewaySettings(patch);
     const msg = result.ok ? "Settings saved." : (result.error ?? "Unknown error");
     setGsSaveResult(msg);
-    if (result.ok) setTimeout(() => setGsSaveResult(null), 4000);
+    if (result.ok) {
+      gsBaselineRef.current = { ...b, ...Object.fromEntries(Object.entries(patch).map(([k, v]) => [k, v])) } as typeof gs;
+      setTimeout(() => setGsSaveResult(null), 4000);
+    }
   };
 
   /* ── Template Manager editable state ── */
@@ -975,6 +999,8 @@ function SettingsPage({ caps }: { caps: ModeCapabilities }) {
     || editTmplStratumAddr !== (tmpl.stratum_addr || "");
 
   const prevTmplRef = useRef({ backend: tmpl.backend, poll_interval_secs: tmpl.poll_interval_secs });
+  const tmplBaselineRef = useRef(tmpl);
+  useEffect(() => { tmplBaselineRef.current = tmpl; }, [tmpl]);
   useEffect(() => {
     if (tmpl.backend !== prevTmplRef.current.backend && editTmplBackend === prevTmplRef.current.backend) {
       setEditTmplBackend(tmpl.backend);
@@ -986,14 +1012,15 @@ function SettingsPage({ caps }: { caps: ModeCapabilities }) {
   }, [tmpl.backend, tmpl.poll_interval_secs, editTmplBackend, editTmplPollIntervalSecs]);
 
   const handleSaveTemplateSettings = async () => {
+    const b = tmplBaselineRef.current;
     const patch: Record<string, unknown> = {};
-    if (editTmplBackend !== tmpl.backend) patch.backend = editTmplBackend;
-    if (editTmplPollIntervalSecs !== String(tmpl.poll_interval_secs)) patch.poll_interval_secs = parseInt(editTmplPollIntervalSecs, 10);
-    if (editTmplCoinbaseScriptHex !== tmpl.coinbase_output_script_hex) patch.coinbase_output_script_hex = editTmplCoinbaseScriptHex;
-    if (editTmplExtraNonceSize !== String(tmpl.extranonce_size)) patch.extranonce_size = parseInt(editTmplExtraNonceSize, 10);
-    if (editTmplRpcUrl !== tmpl.rpc_url) patch.rpc_url = editTmplRpcUrl;
-    if (editTmplRpcUser !== tmpl.rpc_user) patch.rpc_user = editTmplRpcUser;
-    if (editTmplStratumAddr !== (tmpl.stratum_addr || "")) patch.stratum_addr = editTmplStratumAddr || null;
+    if (editTmplBackend !== b.backend) patch.backend = editTmplBackend;
+    if (editTmplPollIntervalSecs !== String(b.poll_interval_secs)) patch.poll_interval_secs = parseInt(editTmplPollIntervalSecs, 10);
+    if (editTmplCoinbaseScriptHex !== b.coinbase_output_script_hex) patch.coinbase_output_script_hex = editTmplCoinbaseScriptHex;
+    if (editTmplExtraNonceSize !== String(b.extranonce_size)) patch.extranonce_size = parseInt(editTmplExtraNonceSize, 10);
+    if (editTmplRpcUrl !== b.rpc_url) patch.rpc_url = editTmplRpcUrl;
+    if (editTmplRpcUser !== b.rpc_user) patch.rpc_user = editTmplRpcUser;
+    if (editTmplStratumAddr !== (b.stratum_addr || "")) patch.stratum_addr = editTmplStratumAddr || null;
 
     if (Object.keys(patch).length === 0) {
       setTmplSaveResult("No changes to save.");
@@ -1004,7 +1031,10 @@ function SettingsPage({ caps }: { caps: ModeCapabilities }) {
     const result = await saveTemplateSettings(patch);
     const msg = result.ok ? "Settings saved." : (result.error ?? "Unknown error");
     setTmplSaveResult(msg);
-    if (result.ok) setTimeout(() => setTmplSaveResult(null), 4000);
+    if (result.ok) {
+      tmplBaselineRef.current = { ...b, ...patch } as typeof tmpl;
+      setTimeout(() => setTmplSaveResult(null), 4000);
+    }
   };
 
   const sectionHeader = (title: string, live: boolean, pendingRestart: boolean) => (
@@ -1408,7 +1438,101 @@ function SettingsPage({ caps }: { caps: ModeCapabilities }) {
           </SettingsRow>
         </div>
       </Card>
+
+      {/* ── Card 6: Software Update (Tauri only) ── */}
+      {isTauri() && <UpdateCard />}
     </div>
+  );
+}
+
+function UpdateCard() {
+  const [checking, setChecking] = useState(false);
+  const [installing, setInstalling] = useState(false);
+  const [result, setResult] = useState<{
+    update_available: boolean;
+    version: string | null;
+    body: string | null;
+    current_version: string;
+  } | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [installMsg, setInstallMsg] = useState<string | null>(null);
+
+  const handleCheck = async () => {
+    setChecking(true);
+    setError(null);
+    setInstallMsg(null);
+    try {
+      const res = await checkForUpdate();
+      setResult(res);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+    setChecking(false);
+  };
+
+  const handleInstall = async () => {
+    setInstalling(true);
+    setError(null);
+    try {
+      const msg = await installUpdate();
+      setInstallMsg(msg);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+    setInstalling(false);
+  };
+
+  return (
+    <Card>
+      <div className="flex items-center gap-3 px-5 py-3" style={{ borderBottom: `1px solid ${V.border}` }}>
+        <span className="font-semibold text-sm" style={{ color: V.ink }}>Software Update</span>
+        {result && !result.update_available && (
+          <span className="text-[10px] px-2 py-0.5 rounded-full" style={{ background: `${V.success}18`, color: V.success }}>
+            Up to date
+          </span>
+        )}
+        {result?.update_available && (
+          <span className="text-[10px] px-2 py-0.5 rounded-full" style={{ background: `${V.amber}18`, color: V.amber }}>
+            Update available
+          </span>
+        )}
+      </div>
+      <div className="px-5 pb-4 pt-3">
+        {result && (
+          <div className="mb-3 text-[11px]" style={{ color: V.steel }}>
+            <span>Current version: </span>
+            <span style={{ color: V.ink, fontFamily: "monospace" }}>v{result.current_version}</span>
+            {result.update_available && result.version && (
+              <>
+                <span className="mx-2">→</span>
+                <span style={{ color: V.amber, fontFamily: "monospace" }}>v{result.version}</span>
+              </>
+            )}
+          </div>
+        )}
+        {result?.update_available && result.body && (
+          <div className="mb-3 p-3 rounded text-[11px] leading-relaxed whitespace-pre-wrap" style={{ background: V.navyMid, color: V.steel, border: `1px solid ${V.border}` }}>
+            {result.body}
+          </div>
+        )}
+        {error && (
+          <div className="mb-3 text-[10px]" style={{ color: V.error }}>{error}</div>
+        )}
+        {installMsg && (
+          <div className="mb-3 text-[10px]" style={{ color: V.success }}>{installMsg}</div>
+        )}
+        <div className="flex items-center gap-3">
+          <Btn variant="default" onClick={handleCheck} disabled={checking || installing}>
+            {checking ? "Checking…" : "Check for Updates"}
+          </Btn>
+          {result?.update_available && !installMsg && (
+            <Btn variant="glow" onClick={handleInstall} disabled={installing}>
+              {installing ? "Installing…" : "Download & Install"}
+            </Btn>
+          )}
+        </div>
+      </div>
+    </Card>
   );
 }
 

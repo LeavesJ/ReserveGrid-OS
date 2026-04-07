@@ -12,7 +12,8 @@ use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
     tray::{TrayIconBuilder, TrayIconEvent},
 };
-use tracing::info;
+use tauri_plugin_updater::UpdaterExt;
+use tracing::{info, warn};
 
 /// Show and focus the main window. Handles the hidden state left by
 /// the `CloseRequested` handler in main.rs.
@@ -40,10 +41,12 @@ pub fn show_main_window(app: &AppHandle) {
 /// the icon remains visually present but inert.
 pub fn setup_tray(app: &AppHandle) -> Result<tauri::tray::TrayIcon, Box<dyn std::error::Error>> {
     let open_item = MenuItemBuilder::with_id("open", "Open Dashboard").build(app)?;
+    let update_item = MenuItemBuilder::with_id("check_update", "Check for Updates…").build(app)?;
     let quit_item = MenuItemBuilder::with_id("quit", "Quit ReserveGrid").build(app)?;
 
     let menu = MenuBuilder::new(app)
         .item(&open_item)
+        .item(&update_item)
         .separator()
         .item(&quit_item)
         .build()?;
@@ -55,6 +58,29 @@ pub fn setup_tray(app: &AppHandle) -> Result<tauri::tray::TrayIcon, Box<dyn std:
             match event.id().as_ref() {
                 "open" => {
                     show_main_window(app);
+                }
+                "check_update" => {
+                    info!("update check requested from tray");
+                    let handle = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        match handle.updater() {
+                            Ok(updater) => match updater.check().await {
+                                Ok(Some(update)) => {
+                                    info!(version = %update.version, "update available (from tray)");
+                                    show_main_window(&handle);
+                                }
+                                Ok(None) => {
+                                    info!("no update available (from tray)");
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "tray update check failed");
+                                }
+                            },
+                            Err(e) => {
+                                warn!(error = %e, "updater not available");
+                            }
+                        }
+                    });
                 }
                 "quit" => {
                     info!("quit requested from tray");

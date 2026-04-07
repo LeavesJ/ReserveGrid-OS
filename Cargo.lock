@@ -3638,7 +3638,7 @@ dependencies = [
 
 [[package]]
 name = "pool-verifier"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "axum 0.7.9",
@@ -4202,7 +4202,7 @@ dependencies = [
 
 [[package]]
 name = "reservegrid-common"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "prometheus-client",
  "rg-protocol",
@@ -4218,7 +4218,7 @@ dependencies = [
 
 [[package]]
 name = "reservegrid-gateway"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "axum 0.8.8",
  "axum-server",
@@ -4245,7 +4245,7 @@ dependencies = [
 
 [[package]]
 name = "rg-auth"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "argon2",
@@ -4267,7 +4267,7 @@ dependencies = [
 
 [[package]]
 name = "rg-dashboard"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "axum 0.8.8",
  "clap",
@@ -4287,7 +4287,7 @@ dependencies = [
 
 [[package]]
 name = "rg-demo-feed"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "clap",
  "futures-util",
@@ -4303,13 +4303,15 @@ dependencies = [
 
 [[package]]
 name = "rg-desktop"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "dirs",
  "ed25519-dalek",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2",
+ "subtle",
  "tauri",
  "tauri-build",
  "tauri-plugin-shell",
@@ -4322,7 +4324,7 @@ dependencies = [
 
 [[package]]
 name = "rg-feed-adapter"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "axum 0.7.9",
  "clap",
@@ -4339,7 +4341,7 @@ dependencies = [
 
 [[package]]
 name = "rg-feed-server"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -4358,7 +4360,7 @@ dependencies = [
 
 [[package]]
 name = "rg-load-test"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -4374,7 +4376,7 @@ dependencies = [
 
 [[package]]
 name = "rg-protocol"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -5224,7 +5226,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "sv2-bridge"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "rg-protocol",
@@ -5237,7 +5239,7 @@ dependencies = [
 
 [[package]]
 name = "sv2-gateway"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "axum 0.8.8",
  "clap",
@@ -5704,7 +5706,7 @@ dependencies = [
 
 [[package]]
 name = "template-manager"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5751,7 +5753,7 @@ dependencies = [
 
 [[package]]
 name = "test-miner"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "clap",
  "hex",

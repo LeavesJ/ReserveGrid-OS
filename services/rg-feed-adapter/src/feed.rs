@@ -10,8 +10,9 @@ use tracing::{info, warn};
 
 use crate::SharedBuffer;
 
-/// Maximum reconnect backoff in seconds.
-const MAX_BACKOFF_SECS: u64 = 30;
+/// Maximum reconnect backoff in seconds. Capped at 10s to limit the
+/// template gap miners experience during feed outages.
+const MAX_BACKOFF_SECS: u64 = 10;
 
 /// Run the feed reader loop forever. Reconnects on disconnect with
 /// exponential backoff capped at `MAX_BACKOFF_SECS`.

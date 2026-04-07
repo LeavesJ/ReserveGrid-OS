@@ -51,8 +51,20 @@ node_modules/
 
 # Scratch / temp files
 *.patch
+*.tmp
 dist/
 .tmp/
+
+# QA screenshots and slide exports from pitchdeck work
+qa-*.jpg
+slide-*.jpg
+
+# Pitchdeck unpack scratch directory
+pitchdeck_unpack/
+
+# Office lock files
+.~lock.*
+~$*
 
 # SQLite runtime databases
 *.db
@@ -72,12 +84,17 @@ docs/MEETING_PREP.md
 docs/DEEP_SCAN_REPORT_2026-04-02.md
 docs/DEEP_SCAN_PART2_2026-04-02.md
 docs/linkedin-playbook.md
+docs/pitch-prep.md
 
 # Private assets and design drafts (local only)
 ReserveGrid-OS-Founders-Guide.md
 ReserveGrid-OS-Founders-Guide.pdf
 ReserveGrid-OS-Pitchdeck.pptx
+ReserveGrid-OS-Pitchdeck-v2.pptx
+ReserveGrid-OS-Pitchdeck-v2.pdf
+ReserveGrid-OS-Security-Audit.pdf
 generate_guide_pdf.py
+security-audit-report.py
 veldra-roadmap.jsx
 rg-os-wireframes.html
 /index.html
@@ -102,6 +119,10 @@ veldra-site-v3/
 
 # Release note drafts (consumed by gh release create, not tracked)
 RELEASE_NOTES_*.md
+
+# Scan and audit scratch outputs
+detailed_findings.md
+resource_exhaustion_audit.md
 
 # Claude Code config
 CLAUDE.md

@@ -8,7 +8,8 @@
 //! Wire format is identical to `rg-demo-feed` so `rg-feed-adapter` works
 //! with either feed without configuration changes beyond the URL.
 
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -165,17 +166,32 @@ async fn main() {
         std::process::exit(1);
     });
 
+    // SEC-006: block non-loopback bind unless explicitly opted in.
     if !addr.ip().is_loopback() {
+        let allow_non_loopback = std::env::var("VELDRA_ALLOW_NON_LOOPBACK")
+            .ok()
+            .as_deref()
+            == Some("1");
+        if !allow_non_loopback {
+            error!(
+                %addr,
+                "refusing to bind to non-loopback address; set VELDRA_ALLOW_NON_LOOPBACK=1 to override"
+            );
+            std::process::exit(1);
+        }
         warn!(
             %addr,
-            "feed server binding to non-loopback address; ensure network access is intentional"
+            "feed server binding to non-loopback address (VELDRA_ALLOW_NON_LOOPBACK=1)"
         );
     }
 
     let max_conns = cfg.feed.max_connections;
+    let max_conns_per_ip: usize = cfg.feed.max_connections_per_ip;
     let active_conns = Arc::new(AtomicUsize::new(0));
+    let per_ip_conns: Arc<tokio::sync::Mutex<HashMap<IpAddr, usize>>> =
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
-    info!(%addr, max_connections = max_conns, "rg-feed-server listening");
+    info!(%addr, max_connections = max_conns, max_connections_per_ip = max_conns_per_ip, "rg-feed-server listening");
 
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -186,7 +202,7 @@ async fn main() {
             }
         };
 
-        // Enforce connection limit (0 = unlimited).
+        // Enforce global connection limit (0 = unlimited).
         if max_conns > 0 {
             let current = active_conns.load(Ordering::Relaxed);
             if current >= max_conns {
@@ -200,16 +216,44 @@ async fn main() {
                 continue;
             }
         }
+
+        // Enforce per-IP connection limit (0 = unlimited).
+        let peer_ip = peer.ip();
+        if max_conns_per_ip > 0 {
+            let mut ip_map = per_ip_conns.lock().await;
+            let count = ip_map.entry(peer_ip).or_insert(0);
+            if *count >= max_conns_per_ip {
+                warn!(
+                    %peer,
+                    ip_count = *count,
+                    max = max_conns_per_ip,
+                    "connection rejected: per-IP limit reached"
+                );
+                drop(stream);
+                continue;
+            }
+            *count += 1;
+        }
+
         active_conns.fetch_add(1, Ordering::Relaxed);
 
         let rx = tx.subscribe();
         let val = validator.clone();
         let state = feed_state.clone();
         let conns = active_conns.clone();
+        let ip_conns = per_ip_conns.clone();
 
         tokio::spawn(async move {
             handle_connection(stream, rx, peer, val, state).await;
             conns.fetch_sub(1, Ordering::Relaxed);
+            // Decrement per-IP counter; remove entry when zero to prevent map growth.
+            let mut ip_map = ip_conns.lock().await;
+            if let Some(count) = ip_map.get_mut(&peer_ip) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    ip_map.remove(&peer_ip);
+                }
+            }
         });
     }
 }

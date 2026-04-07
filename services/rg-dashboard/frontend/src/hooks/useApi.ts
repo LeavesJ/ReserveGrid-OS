@@ -176,10 +176,12 @@ const MOCK_POLICY_FULL: PolicyConfig = {
 };
 
 export function usePolicy(): { policy: PolicyConfig; live: boolean } {
+  // Synced to 5s to match verdict polling; avoids showing new rejections
+  // while the policy display is still 25s stale.
   const { data, live } = usePoll<PolicyConfig>(
     "/api/verifier/policy",
     MOCK_POLICY_FULL,
-    30_000,
+    5_000,
   );
   return { policy: data, live };
 }

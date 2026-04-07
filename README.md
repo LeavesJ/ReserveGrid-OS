@@ -2,7 +2,9 @@
 
 **ReserveGrid OS** is a policy driven verification, mining gateway, and observability stack for Bitcoin mining pools. It sits between the template source and miners, inspecting candidate block templates against operator defined policy and routing Stratum V2 work to connected workers. Operators get a full dashboard with live metrics, structured logs, and Prometheus instrumentation out of the box.
 
-Built in Rust. Ships as a single `docker compose up`.
+Built in Rust. Ships as a native macOS/Linux desktop app (`rg-desktop`) with embedded dashboard, or as a `docker compose up` server stack for headless deployment.
+
+**Current version:** v1.0.2
 
 ---
 
@@ -45,7 +47,7 @@ ReserveGrid OS supports three deployment modes for progressive rollout:
 
 **Observe** connects to a live bitcoind but does not enforce policy. The gateway distributes jobs to miners regardless of the verdict. Operators see what the verifier would reject without blocking any work.
 
-**Inline** enforces policy. The gateway only distributes jobs that the verifier accepts. Rejected templates are held until a passing template arrives or a configurable stale hold timer expires.
+**Inline** enforces policy. The gateway only distributes jobs that the verifier accepts. Rejected templates are held until a passing template arrives or a configurable stale hold timer expires. A dual prevhash buffer holds two pending templates simultaneously during block transitions, with a 50ms verdict window so miners never stall on a prevhash switch.
 
 ```
   Inline / Observe mode:
@@ -57,12 +59,12 @@ ReserveGrid OS supports three deployment modes for progressive rollout:
   (fetch templates) ------> (evaluate policy)
         |                         |
         v                         v
-  sv2-gateway               rg-dashboard
-  (SV2 Noise NX)            (operator UI)
-        |                         |
-        v                         v
-  miners (SV2)              rg-auth
-                            (login, registration, email)
+  sv2-gateway               rg-desktop (native app)
+  (SV2 Noise NX,             ├─ rg-dashboard (operator UI)
+   dual prevhash buffer)     └─ IPC · auto-update · license
+        |
+        v
+  miners (SV2)
 
   Shadow mode (non-invasive evaluation):
 
@@ -73,10 +75,10 @@ ReserveGrid OS supports three deployment modes for progressive rollout:
   (WS -> JSON-RPC bridge)
         |
         v
-  template-manager -------> pool-verifier -------> rg-dashboard
+  template-manager -------> pool-verifier -------> rg-desktop
 ```
 
-All services run in Docker Compose. The dashboard proxies API calls to each backend. Prometheus scrapes metrics from pool-verifier, template-manager, and sv2-gateway.
+The backend services run in Docker Compose. The `rg-desktop` native app (built with Tauri) wraps the dashboard, manages licensing, and includes an in-app auto-updater. For headless server deployments, `rg-dashboard` can run standalone in Docker without the desktop shell. Prometheus scrapes metrics from pool-verifier, template-manager, and sv2-gateway.
 
 ---
 
@@ -91,8 +93,11 @@ Fetches block templates from bitcoind (`getblocktemplate`) or a Stratum bridge a
 ### sv2-gateway
 Stratum V2 mining gateway with Noise NX encryption. Accepts miner connections, opens channels, distributes `NewMiningJob` messages, and validates submitted shares. Tracks per channel state including a sliding window hashrate estimator. Exposes channel snapshots via HTTP for the miners page.
 
+### rg-desktop
+Native desktop application (macOS/Linux) built with Tauri. Wraps rg-dashboard in a native window with IPC commands for license management, system tray integration, and in-app auto-updates (signed, with Tauri updater). The desktop app is the primary distribution format for operators. For headless or Docker deployments, rg-dashboard runs standalone.
+
 ### rg-dashboard
-Operator dashboard and API proxy. Vite/React frontend with live polling. Pages: overview, verdicts, templates, policy editor, miners, and settings. Proxies all API calls to the appropriate backend service. Includes the full auth gate (login, register, verify, forgot password, reset password).
+Operator dashboard and API proxy. Vite/React frontend with live polling. Pages: overview, verdicts, templates, policy editor, miners, and settings. Proxies all API calls to the appropriate backend service. Includes the full auth gate (login, register, verify, forgot password, reset password). Embedded inside rg-desktop for native deployments.
 
 ### rg-auth
 Authentication service. Argon2id password hashing, session tokens, email verification, admin approval workflow, forgot/reset password. Sends email via any STARTTLS SMTP provider. Falls back to stdout in dev mode when SMTP is not configured.
@@ -127,6 +132,7 @@ services/
   pool-verifier/       TCP verifier, HTTP API, policy evaluation
   template-manager/    template fetching, mempool stats
   sv2-gateway/         Stratum V2 gateway, share validation, hashrate
+  rg-desktop/          native desktop app (Tauri), license, auto-update
   rg-dashboard/        operator UI (Vite + React), API proxy
   rg-auth/             authentication, email, sessions
   rg-demo-feed/        synthetic GBT source for shadow testing
@@ -150,12 +156,18 @@ supply-chain/          cargo-vet audit configuration
 
 ## Quickstart
 
-### Prerequisites
+### Option A: Desktop app (recommended for evaluation)
+
+Download the latest `.dmg` (macOS) or `.AppImage` (Linux) from the GitHub releases page. The desktop app bundles the dashboard, license management, system tray, and in-app auto-updates. It connects to backend services running in Docker.
+
+### Option B: Docker only (headless / server deployment)
+
+#### Prerequisites
 
 - Docker and Docker Compose
 - A `.env` file at repo root (copy from `.env.example`)
 
-### Setup
+#### Setup
 
 1. Copy the environment template:
 
@@ -188,7 +200,7 @@ supply-chain/          cargo-vet audit configuration
          -rpcuser=reservegrid -rpcpassword=<your-rpc-pass> \
          -generate 1
 
-5. Open the dashboard at http://localhost:8084
+5. Open the dashboard at `http://localhost:8084` (Docker) or via the desktop app
 
 ### Port map
 
@@ -301,6 +313,9 @@ No secrets should appear in TOML config files, docker-compose.yml, or source cod
 - SV2 connections use Noise NX encryption
 - API key auth on protected verifier endpoints with automatic localhost bypass
 - Built in TLS termination (file based or self signed dev mode)
+- Desktop app auto-updater uses signed releases with a pinned public key
+- Per-IP connection limits on all WebSocket services (rg-feed-server, rg-demo-feed, sv2-gateway)
+- Non-loopback bind blocked by default; requires explicit `VELDRA_ALLOW_NON_LOOPBACK=1` override
 
 ---
 

@@ -17,9 +17,13 @@
 //! ```
 //!
 //! Ed25519 signature verification uses a public key embedded at compile
-//! time via `VELDRA_LICENSE_PUBKEY` env var (base64). In debug builds,
-//! signature verification is skipped if no public key is configured.
-//! Release builds require a valid public key and signature.
+//! time via `VELDRA_LICENSE_PUBKEY` env var (base64). Release builds
+//! require a valid public key and signature.
+//!
+//! Developer bypass (debug builds only): set `VELDRA_DEV_PASSKEY_HASH`
+//! to the hex-encoded SHA-256 of your chosen passkey. The plaintext
+//! never appears in env vars or logs. Constant-time comparison via
+//! `subtle::ConstantTimeEq`. Has zero effect on release builds.
 
 use ed25519_dalek::{PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH, Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -81,9 +85,15 @@ impl LicenseInfo {
 
     /// Validate a license key string and store it if valid.
     fn validate_and_store(&self, key: &str) -> Result<(), LicenseError> {
-        let payload = Self::parse_key(key)?;
-        Self::check_expiry(&payload)?;
-        Self::verify_signature(key)?;
+        let payload = self.try_dev_passkey(key).map_or_else(
+            || {
+                let p = Self::parse_key(key)?;
+                Self::check_expiry(&p)?;
+                Self::verify_signature(key)?;
+                Ok(p)
+            },
+            Ok,
+        )?;
 
         let Ok(mut raw) = self.raw_key.write() else {
             return Err(LicenseError::Internal("lock poisoned"));
@@ -97,6 +107,67 @@ impl LicenseInfo {
         *pl = Some(payload);
 
         Ok(())
+    }
+
+    /// Developer bypass (debug builds only, compiled out in release).
+    ///
+    /// Set `VELDRA_DEV_PASSKEY_HASH` to the hex-encoded SHA-256 digest of
+    /// your chosen passkey. The plaintext passkey never appears in env vars,
+    /// logs, or process memory beyond the transient hash computation.
+    ///
+    /// Generate the hash once:
+    /// ```sh
+    /// printf 'your-secret' | shasum -a 256 | cut -d' ' -f1
+    /// ```
+    ///
+    /// Then export:
+    /// ```sh
+    /// export VELDRA_DEV_PASSKEY_HASH="<hex digest>"
+    /// ```
+    ///
+    /// Entering your passkey in the license field will match against the
+    /// stored hash via constant-time comparison and inject a synthetic
+    /// inline payload with all features.
+    #[allow(unused_variables)]
+    fn try_dev_passkey(&self, key: &str) -> Option<LicensePayload> {
+        #[cfg(debug_assertions)]
+        {
+            use sha2::{Digest, Sha256};
+            use subtle::ConstantTimeEq;
+
+            let expected_hex = std::env::var("VELDRA_DEV_PASSKEY_HASH").ok()?;
+            if expected_hex.is_empty() {
+                return None;
+            }
+
+            let expected_bytes = hex_decode(&expected_hex)?;
+            if expected_bytes.len() != 32 {
+                tracing::warn!("VELDRA_DEV_PASSKEY_HASH is not 32 bytes, ignoring");
+                return None;
+            }
+
+            let mut hasher = Sha256::new();
+            hasher.update(key.as_bytes());
+            let input_digest = hasher.finalize();
+
+            if input_digest.ct_eq(&expected_bytes).into() {
+                tracing::error!(
+                    "DEV PASSKEY ACCEPTED — synthetic inline license active, \
+                     never ship a build with VELDRA_DEV_PASSKEY_HASH set"
+                );
+                return Some(LicensePayload {
+                    org_id: "org_dev_local".into(),
+                    tier: "inline".into(),
+                    issued_at: 0,
+                    expires_at: 9_999_999_999,
+                    features: vec!["gateway".into(), "exporter".into()],
+                });
+            }
+
+            return None;
+        }
+        #[cfg(not(debug_assertions))]
+        None
     }
 
     /// Parse the key prefix and extract the JSON payload.
@@ -145,19 +216,9 @@ impl LicenseInfo {
         const PUBKEY_B64: &str = env_or_empty!("VELDRA_LICENSE_PUBKEY");
 
         if PUBKEY_B64.is_empty() {
-            #[cfg(debug_assertions)]
-            {
-                warn!(
-                    "VELDRA_LICENSE_PUBKEY not set, skipping signature verification (debug build)"
-                );
-                return Ok(());
-            }
-            #[cfg(not(debug_assertions))]
-            {
-                return Err(LicenseError::Internal(
-                    "VELDRA_LICENSE_PUBKEY not compiled in, cannot verify license",
-                ));
-            }
+            return Err(LicenseError::Internal(
+                "VELDRA_LICENSE_PUBKEY not compiled in, cannot verify license",
+            ));
         }
 
         let pubkey_bytes = base64url_decode(PUBKEY_B64)
@@ -333,6 +394,29 @@ impl std::fmt::Display for LicenseError {
 }
 
 impl std::error::Error for LicenseError {}
+
+/// Decode a hex string to bytes. Returns `None` on invalid input.
+fn hex_decode(input: &str) -> Option<Vec<u8>> {
+    if input.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(input.len() / 2);
+    for pair in input.as_bytes().chunks(2) {
+        let hi = hex_nibble(pair[0])?;
+        let lo = hex_nibble(pair[1])?;
+        out.push((hi << 4) | lo);
+    }
+    Some(out)
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
 
 /// Minimal base64url decoder (no padding).
 /// Avoids adding a dependency for a trivial operation.

@@ -37,6 +37,11 @@ pub struct FeedSection {
     /// Set to 0 to disable the limit (not recommended for production).
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
+
+    /// Maximum concurrent connections from a single IP address. Default 16.
+    /// Set to 0 to disable per-IP limiting (not recommended for production).
+    #[serde(default = "default_max_connections_per_ip")]
+    pub max_connections_per_ip: usize,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -73,6 +78,10 @@ fn default_channel_capacity() -> usize {
 
 fn default_max_connections() -> usize {
     256
+}
+
+fn default_max_connections_per_ip() -> usize {
+    16
 }
 
 /// Load config from TOML file with env var overrides.
@@ -115,6 +124,12 @@ pub fn load(path: &str) -> Result<FeedServerConfig, String> {
         .and_then(|v| v.parse().ok())
     {
         cfg.feed.max_connections = n;
+    }
+    if let Some(n) = std::env::var("VELDRA_FEED_MAX_CONNECTIONS_PER_IP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        cfg.feed.max_connections_per_ip = n;
     }
 
     // Validate: rpc_url is required.

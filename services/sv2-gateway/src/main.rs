@@ -163,13 +163,28 @@ fn main() -> ExitCode {
         }
     };
 
-    let cfg: GatewayConfig = match toml::from_str(&config_text) {
+    let mut cfg: GatewayConfig = match toml::from_str(&config_text) {
         Ok(c) => c,
         Err(e) => {
             error!(error = %e, "failed to parse gateway config");
             return ExitCode::FAILURE;
         }
     };
+
+    // Environment variable override for mode, so `docker compose` comments
+    // that reference VELDRA_GATEWAY_MODE actually work.
+    if let Ok(mode_str) = std::env::var("VELDRA_GATEWAY_MODE") {
+        match mode_str.to_lowercase().as_str() {
+            "inline" => cfg.mode = rg_protocol::gateway::GatewayMode::Inline,
+            "observe" => cfg.mode = rg_protocol::gateway::GatewayMode::Observe,
+            "shadow" => cfg.mode = rg_protocol::gateway::GatewayMode::Shadow,
+            other => {
+                error!(value = %other, "VELDRA_GATEWAY_MODE must be inline, observe, or shadow");
+                return ExitCode::FAILURE;
+            }
+        }
+        info!(mode = %cfg.mode, "mode overridden by VELDRA_GATEWAY_MODE env var");
+    }
 
     match config::validate(&cfg) {
         Ok(warnings) => {
@@ -184,6 +199,34 @@ fn main() -> ExitCode {
     }
 
     info!(mode = %cfg.mode, "configuration loaded");
+
+    // Warn if file descriptor limit is low relative to max_connections.
+    // Each miner connection consumes one FD, plus listeners and internal
+    // channels. A low ulimit causes silent connection refusals.
+    //
+    // Reads /proc/self/limits (Linux) to avoid an `unsafe` libc call that
+    // the workspace `unsafe_code = "deny"` lint would reject.
+    #[cfg(target_os = "linux")]
+    if let Ok(limits) = std::fs::read_to_string("/proc/self/limits") {
+        for line in limits.lines() {
+            if line.starts_with("Max open files") {
+                let soft: Option<u64> = line.split_whitespace().nth(3).and_then(|s| s.parse().ok());
+                if let Some(cur) = soft {
+                    let needed = u64::from(cfg.gateway.max_connections) * 2 + 200;
+                    if cur < needed {
+                        warn!(
+                            current_limit = cur,
+                            recommended = needed,
+                            max_connections = cfg.gateway.max_connections,
+                            "file descriptor limit is low for configured max_connections; \
+                             raise with `ulimit -n {needed}` to avoid silent connection refusals"
+                        );
+                    }
+                }
+                break;
+            }
+        }
+    }
 
     // Enforce management API secret at startup.
     enforce_api_secret();
@@ -1062,6 +1105,13 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
     // prevhash verdict timeout in inline mode.
     let mut stale_hold_deadline: Option<tokio::time::Instant> = None;
 
+    // SEC-004: periodic sweep of pending templates that have exceeded max age.
+    // Fires every max_template_age_ms so stale entries are evicted even when no
+    // new templates arrive (verifier stall scenario).
+    let pending_sweep_interval = Duration::from_millis(cfg.gateway.max_template_age_ms.max(1000));
+    let mut pending_sweep_ticker = tokio::time::interval(pending_sweep_interval);
+    pending_sweep_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     // M-5 fix: proactive upstream staleness timer. Fires on a fixed
     // interval so the guard does not depend on arriving messages.
     let upstream_stale_check_interval =
@@ -1160,6 +1210,20 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                             if let Some(pending) = pending_templates.remove(&v.id) {
                                 pending_order.retain(|&id| id != v.id);
                                 if v.accepted {
+                                    // SEC-004: warn if template age exceeds threshold, but
+                                    // still broadcast. A stale verified template is better
+                                    // than no template (miners would hold on an even older
+                                    // unverified job otherwise). The sweep ticker handles
+                                    // true abandonment when no verdict arrives at all.
+                                    let age_ms = pending.received_at.elapsed().as_millis() as u64;
+                                    if age_ms > cfg.gateway.max_template_age_ms {
+                                        warn!(
+                                            template_id = v.id,
+                                            age_ms,
+                                            max_ms = cfg.gateway.max_template_age_ms,
+                                            "verdict accepted but template exceeded max age; broadcasting anyway"
+                                        );
+                                    }
                                     // Clear stale hold on successful verdict.
                                     stale_hold_deadline = None;
                                     broadcast_job_from_template(
@@ -1311,6 +1375,29 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                 }
             }
 
+            // SEC-004: periodic sweep of stale pending templates.
+            _ = pending_sweep_ticker.tick() => {
+                let max_age = Duration::from_millis(cfg.gateway.max_template_age_ms);
+                let before = pending_templates.len();
+                pending_templates.retain(|tid, pt| {
+                    let age = pt.received_at.elapsed();
+                    if age > max_age {
+                        warn!(
+                            template_id = tid,
+                            age_ms = age.as_millis() as u64,
+                            "evicting stale pending template (exceeded max_template_age_ms)"
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                });
+                let evicted = before - pending_templates.len();
+                if evicted > 0 {
+                    pending_order.retain(|id| pending_templates.contains_key(id));
+                }
+            }
+
             // Stale hold timer expiry (inline mode only).
             () = stale_hold_sleep => {
                 error!("stale hold timer expired; prevhash switch timed out");
@@ -1370,7 +1457,6 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
 /// A template awaiting verifier verdict before job distribution.
 struct PendingTemplate {
     template: TemplateResponse,
-    #[allow(dead_code)] // Used for staleness metrics in future.
     received_at: Instant,
 }
 
@@ -1556,13 +1642,11 @@ fn build_template_propose(
         tx_count: template.tx_count,
         total_fees: template.total_fees,
         observed_weight: template.observed_weight,
+        // Use bitcoind's curtime (block creation time) rather than gateway
+        // reception time so template age enforcement is accurate even when
+        // the RPC call or network introduces latency.
         #[allow(clippy::cast_possible_truncation)]
-        created_at_unix_ms: Some(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
-        ),
+        created_at_unix_ms: Some(u64::from(template.curtime) * 1000),
         total_sigops: template.total_sigops,
         coinbase_sigops: template.coinbase_sigops,
         template_weight: template.template_weight,

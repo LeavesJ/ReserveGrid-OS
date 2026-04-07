@@ -20,6 +20,8 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 dirs = "6"
 tauri-plugin-updater = "2"
 ed25519-dalek = { version = "2", features = ["std"] }
+sha2 = "0.10"
+subtle = "2"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

@@ -181,8 +181,18 @@ pub async fn run_verifier_stream(
             .policy_loaded
             .store(false, std::sync::atomic::Ordering::SeqCst);
 
+        // Add jitter (0..50% of base delay) to prevent thundering herd
+        // when multiple gateways reconnect after a verifier restart.
+        let jitter_ms = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::hash::DefaultHasher::new();
+            std::time::Instant::now().hash(&mut h);
+            (h.finish() % (config.reconnect_delay.as_millis() as u64 / 2).max(1)) as u64
+        };
+        let delay = config.reconnect_delay + Duration::from_millis(jitter_ms);
+
         tokio::select! {
-            () = tokio::time::sleep(config.reconnect_delay) => {}
+            () = tokio::time::sleep(delay) => {}
             _ = shutdown.changed() => return,
         }
     }

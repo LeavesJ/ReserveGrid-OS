@@ -145,3 +145,26 @@ export async function clearLicense(): Promise<void> {
   if (!isTauri()) return;
   await tauriInvoke("clear_license");
 }
+
+/* ── Update IPC commands ── */
+
+export interface UpdateCheckResult {
+  update_available: boolean;
+  version: string | null;
+  body: string | null;
+  current_version: string;
+}
+
+export async function checkForUpdate(): Promise<UpdateCheckResult> {
+  if (!isTauri()) {
+    return { update_available: false, version: null, body: null, current_version: "unknown" };
+  }
+  return tauriInvoke<UpdateCheckResult>("check_for_update");
+}
+
+export async function installUpdate(): Promise<string> {
+  if (!isTauri()) {
+    return "not running in desktop app";
+  }
+  return tauriInvoke<string>("install_update");
+}

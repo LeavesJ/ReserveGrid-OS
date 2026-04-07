@@ -277,7 +277,7 @@ impl std::fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, unsafe_code)]
 mod tests {
     use super::*;
 

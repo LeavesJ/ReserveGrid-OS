@@ -1,7 +1,7 @@
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
-use rand::Rng;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt::Write;
@@ -137,9 +137,12 @@ pub fn load_signing_key(b64_seed: &str) -> Option<SigningKey> {
 // ── Session token utilities (unchanged) ─────────────────────────
 
 /// Generate a cryptographically random 32-byte hex token (64 hex chars).
+///
+/// Uses `OsRng` directly for defense in depth: session tokens are
+/// security-critical and must use the OS CSPRNG without intermediary layers.
 pub fn generate_token() -> String {
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill(&mut bytes);
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
     hex_encode(&bytes)
 }
 

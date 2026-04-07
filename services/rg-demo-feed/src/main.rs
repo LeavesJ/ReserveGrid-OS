@@ -6,8 +6,10 @@
 // Templates cycle through normal and anomalous scenarios so every verifier
 // policy detection fires at least once per loop.
 
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use clap::Parser;
@@ -45,6 +47,16 @@ struct Cli {
     /// Broadcast channel capacity (number of buffered frames per client).
     #[arg(long, default_value = "64")]
     channel_capacity: usize,
+
+    /// Maximum concurrent WebSocket connections. Default 128.
+    /// Set to 0 to disable (not recommended for production).
+    #[arg(long, env = "VELDRA_DEMO_FEED_MAX_CONNECTIONS", default_value = "128")]
+    max_connections: usize,
+
+    /// Maximum concurrent connections from a single IP address. Default 8.
+    /// Set to 0 to disable per-IP limiting.
+    #[arg(long, env = "VELDRA_DEMO_FEED_MAX_CONNECTIONS_PER_IP", default_value = "8")]
+    max_connections_per_ip: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -85,14 +97,38 @@ async fn main() {
         std::process::exit(1);
     });
 
+    // SEC-006: block non-loopback bind unless explicitly opted in.
     if !addr.ip().is_loopback() {
+        let allow_non_loopback = std::env::var("VELDRA_ALLOW_NON_LOOPBACK")
+            .ok()
+            .as_deref()
+            == Some("1");
+        if !allow_non_loopback {
+            error!(
+                %addr,
+                "refusing to bind to non-loopback address; set VELDRA_ALLOW_NON_LOOPBACK=1 to override"
+            );
+            std::process::exit(1);
+        }
         warn!(
             %addr,
-            "demo feed binding to non-loopback address; ensure network access is intentional"
+            "demo feed binding to non-loopback address (VELDRA_ALLOW_NON_LOOPBACK=1)"
         );
     }
 
-    info!(%addr, interval_ms = cli.interval_ms, "rg-demo-feed listening");
+    let max_conns = cli.max_connections;
+    let max_conns_per_ip = cli.max_connections_per_ip;
+    let active_conns = Arc::new(AtomicUsize::new(0));
+    let per_ip_conns: Arc<tokio::sync::Mutex<HashMap<IpAddr, usize>>> =
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+    info!(
+        %addr,
+        interval_ms = cli.interval_ms,
+        max_connections = max_conns,
+        max_connections_per_ip = max_conns_per_ip,
+        "rg-demo-feed listening"
+    );
 
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -103,10 +139,56 @@ async fn main() {
             }
         };
 
+        // Enforce global connection limit (0 = unlimited).
+        if max_conns > 0 {
+            let current = active_conns.load(Ordering::Relaxed);
+            if current >= max_conns {
+                warn!(
+                    %peer,
+                    active = current,
+                    max = max_conns,
+                    "connection rejected: at capacity"
+                );
+                drop(stream);
+                continue;
+            }
+        }
+
+        // Enforce per-IP connection limit (0 = unlimited).
+        let peer_ip = peer.ip();
+        if max_conns_per_ip > 0 {
+            let mut ip_map = per_ip_conns.lock().await;
+            let count = ip_map.entry(peer_ip).or_insert(0);
+            if *count >= max_conns_per_ip {
+                warn!(
+                    %peer,
+                    ip_count = *count,
+                    max = max_conns_per_ip,
+                    "connection rejected: per-IP limit reached"
+                );
+                drop(stream);
+                continue;
+            }
+            *count += 1;
+        }
+
+        active_conns.fetch_add(1, Ordering::Relaxed);
+
         let rx = tx.subscribe();
+        let conns = active_conns.clone();
+        let ip_conns = per_ip_conns.clone();
+
         tokio::spawn(async move {
             if let Err(e) = handle_client(stream, rx, peer).await {
                 info!(%peer, error = %e, "client disconnected");
+            }
+            conns.fetch_sub(1, Ordering::Relaxed);
+            let mut ip_map = ip_conns.lock().await;
+            if let Some(count) = ip_map.get_mut(&peer_ip) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    ip_map.remove(&peer_ip);
+                }
             }
         });
     }

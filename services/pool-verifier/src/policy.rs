@@ -436,6 +436,23 @@ impl PolicyConfig {
             ));
         }
 
+        // Fee tier ordering: lo <= mid <= hi. Inverted tiers silently
+        // produce confusing rejection patterns.
+        if self.min_avg_fee_lo > self.min_avg_fee_mid {
+            return Err(anyhow!(
+                "min_avg_fee_lo ({}) must be <= min_avg_fee_mid ({})",
+                self.min_avg_fee_lo,
+                self.min_avg_fee_mid
+            ));
+        }
+        if self.min_avg_fee_mid > self.min_avg_fee_hi {
+            return Err(anyhow!(
+                "min_avg_fee_mid ({}) must be <= min_avg_fee_hi ({})",
+                self.min_avg_fee_mid,
+                self.min_avg_fee_hi
+            ));
+        }
+
         if !(self.safety.max_weight_ratio.is_finite()
             && self.safety.max_weight_ratio > 0.0
             && self.safety.max_weight_ratio <= 1.0)
