@@ -101,10 +101,13 @@ pub async fn install_update(app: AppHandle) -> Result<String, String> {
 
     let version = update.version.clone();
 
-    update.download_and_install(|_, _| {}, || {}).await.map_err(|e| {
-        warn!(error = %e, "update install failed");
-        format!("install failed: {e}")
-    })?;
+    update
+        .download_and_install(|_, _| {}, || {})
+        .await
+        .map_err(|e| {
+            warn!(error = %e, "update install failed");
+            format!("install failed: {e}")
+        })?;
 
     info!(version = %version, "update installed, relaunch required");
     Ok(format!("v{version} installed. Relaunch to apply."))
