@@ -55,7 +55,11 @@ struct Cli {
 
     /// Maximum concurrent connections from a single IP address. Default 8.
     /// Set to 0 to disable per-IP limiting.
-    #[arg(long, env = "VELDRA_DEMO_FEED_MAX_CONNECTIONS_PER_IP", default_value = "8")]
+    #[arg(
+        long,
+        env = "VELDRA_DEMO_FEED_MAX_CONNECTIONS_PER_IP",
+        default_value = "8"
+    )]
     max_connections_per_ip: usize,
 }
 
