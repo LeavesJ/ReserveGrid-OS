@@ -279,6 +279,7 @@ async fn bind_listener(addr: SocketAddr) -> TcpListener {
     })
 }
 
+#[allow(clippy::too_many_lines)] // Single logical unit: handshake → auth → relay loop.
 async fn handle_connection(
     stream: tokio::net::TcpStream,
     mut rx: broadcast::Receiver<Arc<String>>,

@@ -1679,7 +1679,7 @@ fn default_share_target() -> [u8; 32] {
 /// the loop reads the current value so that key rotations (SIGHUP / file poll)
 /// take effect without restarting the process. Existing connections that already
 /// completed the Noise handshake are unaffected by a credential swap.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn accept_loop(
     listener: tokio::net::TcpListener,
     limiter: ConnectionLimiter,
@@ -1899,6 +1899,7 @@ fn build_verifier_tls(cfg: &GatewayConfig) -> Result<VerifierTlsConfig, String> 
 /// A failed reload (bad file, key mismatch) is logged as an error and the
 /// previous credentials remain active. This is a fail-safe design: operators
 /// can fix the key file and re-signal without a process restart.
+#[allow(clippy::too_many_lines)] // Signal handling loop; splitting breaks reload flow.
 async fn run_key_reload_task(
     keypair_path: String,
     authority_pubkey: String,
