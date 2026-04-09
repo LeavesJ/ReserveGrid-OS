@@ -187,7 +187,9 @@ pub async fn run_verifier_stream(
             use std::hash::{Hash, Hasher};
             let mut h = std::hash::DefaultHasher::new();
             std::time::Instant::now().hash(&mut h);
-            (h.finish() % (config.reconnect_delay.as_millis() as u64 / 2).max(1)) as u64
+            let half = u64::try_from(config.reconnect_delay.as_millis() / 2)
+                .unwrap_or(u64::MAX);
+            h.finish() % half.max(1)
         };
         let delay = config.reconnect_delay + Duration::from_millis(jitter_ms);
 
