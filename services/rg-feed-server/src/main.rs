@@ -160,28 +160,7 @@ async fn main() {
         run_heartbeat(heartbeat_tx, heartbeat_interval).await;
     });
 
-    // Accept WebSocket connections.
-    let listener = TcpListener::bind(addr).await.unwrap_or_else(|e| {
-        error!(%addr, error = %e, "failed to bind");
-        std::process::exit(1);
-    });
-
-    // SEC-006: block non-loopback bind unless explicitly opted in.
-    if !addr.ip().is_loopback() {
-        let allow_non_loopback =
-            std::env::var("VELDRA_ALLOW_NON_LOOPBACK").ok().as_deref() == Some("1");
-        if !allow_non_loopback {
-            error!(
-                %addr,
-                "refusing to bind to non-loopback address; set VELDRA_ALLOW_NON_LOOPBACK=1 to override"
-            );
-            std::process::exit(1);
-        }
-        warn!(
-            %addr,
-            "feed server binding to non-loopback address (VELDRA_ALLOW_NON_LOOPBACK=1)"
-        );
-    }
+    let listener = bind_listener(addr).await;
 
     let max_conns = cfg.feed.max_connections;
     let max_conns_per_ip: usize = cfg.feed.max_connections_per_ip;
@@ -189,7 +168,12 @@ async fn main() {
     let per_ip_conns: Arc<tokio::sync::Mutex<HashMap<IpAddr, usize>>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
-    info!(%addr, max_connections = max_conns, max_connections_per_ip = max_conns_per_ip, "rg-feed-server listening");
+    info!(
+        %addr,
+        max_connections = max_conns,
+        max_connections_per_ip = max_conns_per_ip,
+        "rg-feed-server listening"
+    );
 
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -254,6 +238,35 @@ async fn main() {
             }
         });
     }
+}
+
+/// Bind the TCP listener with SEC-006 non-loopback guard.
+async fn bind_listener(addr: SocketAddr) -> TcpListener {
+    // SEC-006: block non-loopback bind unless explicitly opted in.
+    if !addr.ip().is_loopback() {
+        let allow_non_loopback =
+            std::env::var("VELDRA_ALLOW_NON_LOOPBACK")
+                .ok()
+                .as_deref()
+                == Some("1");
+        if !allow_non_loopback {
+            error!(
+                %addr,
+                "refusing to bind to non-loopback address; \
+                 set VELDRA_ALLOW_NON_LOOPBACK=1 to override"
+            );
+            std::process::exit(1);
+        }
+        warn!(
+            %addr,
+            "binding to non-loopback address (VELDRA_ALLOW_NON_LOOPBACK=1)"
+        );
+    }
+
+    TcpListener::bind(addr).await.unwrap_or_else(|e| {
+        error!(%addr, error = %e, "failed to bind");
+        std::process::exit(1);
+    })
 }
 
 async fn handle_connection(

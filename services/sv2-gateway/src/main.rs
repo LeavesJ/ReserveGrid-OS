@@ -1215,7 +1215,9 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                                     // than no template (miners would hold on an even older
                                     // unverified job otherwise). The sweep ticker handles
                                     // true abandonment when no verdict arrives at all.
-                                    let age_ms = pending.received_at.elapsed().as_millis() as u64;
+                                    let age_ms =
+                                        u64::try_from(pending.received_at.elapsed().as_millis())
+                                            .unwrap_or(u64::MAX);
                                     if age_ms > cfg.gateway.max_template_age_ms {
                                         warn!(
                                             template_id = v.id,
@@ -1384,7 +1386,7 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                     if age > max_age {
                         warn!(
                             template_id = tid,
-                            age_ms = age.as_millis() as u64,
+                            age_ms = u64::try_from(age.as_millis()).unwrap_or(u64::MAX),
                             "evicting stale pending template (exceeded max_template_age_ms)"
                         );
                         false
