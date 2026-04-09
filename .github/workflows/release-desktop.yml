@@ -34,7 +34,7 @@ jobs:
           - platform: macos-latest
             rust_target: aarch64-apple-darwin
             label: macos-arm64
-          - platform: macos-13
+          - platform: macos-14
             rust_target: x86_64-apple-darwin
             label: macos-x86_64
           - platform: ubuntu-22.04
