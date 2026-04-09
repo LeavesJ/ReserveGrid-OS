@@ -24,6 +24,7 @@ services:
       VELDRA_LOG_FILTER: info
       VELDRA_DEMO_FEED_LISTEN: "0.0.0.0:9100"
       VELDRA_DEMO_FEED_INTERVAL_MS: "5000"
+      VELDRA_ALLOW_NON_LOOPBACK: "1"
     ports:
       - "9100:9100"
     healthcheck:
@@ -44,6 +45,7 @@ services:
       VELDRA_LOG_FORMAT: json
       VELDRA_LOG_FILTER: info
       VELDRA_ADAPTER_LISTEN: "0.0.0.0:18444"
+      VELDRA_ALLOW_NON_LOOPBACK: "1"
       VELDRA_FEED_URL: "ws://rg-demo-feed:9100/ws"
     ports:
       - "18444:18444"
