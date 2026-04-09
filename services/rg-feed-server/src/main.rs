@@ -162,6 +162,22 @@ async fn main() {
 
     let listener = bind_listener(addr).await;
 
+    run_accept_loop(
+        listener, addr, &cfg, tx, validator, feed_state,
+    )
+    .await;
+}
+
+/// Accept connections with global and per-IP limits.
+#[allow(clippy::too_many_arguments)]
+async fn run_accept_loop(
+    listener: TcpListener,
+    addr: SocketAddr,
+    cfg: &config::Config,
+    tx: broadcast::Sender<Arc<String>>,
+    validator: KeyValidator,
+    feed_state: Arc<FeedState>,
+) {
     let max_conns = cfg.feed.max_connections;
     let max_conns_per_ip: usize = cfg.feed.max_connections_per_ip;
     let active_conns = Arc::new(AtomicUsize::new(0));
@@ -184,7 +200,6 @@ async fn main() {
             }
         };
 
-        // Enforce global connection limit (0 = unlimited).
         if max_conns > 0 {
             let current = active_conns.load(Ordering::Relaxed);
             if current >= max_conns {
@@ -199,7 +214,6 @@ async fn main() {
             }
         }
 
-        // Enforce per-IP connection limit (0 = unlimited).
         let peer_ip = peer.ip();
         if max_conns_per_ip > 0 {
             let mut ip_map = per_ip_conns.lock().await;
@@ -228,7 +242,6 @@ async fn main() {
         tokio::spawn(async move {
             handle_connection(stream, rx, peer, val, state).await;
             conns.fetch_sub(1, Ordering::Relaxed);
-            // Decrement per-IP counter; remove entry when zero to prevent map growth.
             let mut ip_map = ip_conns.lock().await;
             if let Some(count) = ip_map.get_mut(&peer_ip) {
                 *count = count.saturating_sub(1);

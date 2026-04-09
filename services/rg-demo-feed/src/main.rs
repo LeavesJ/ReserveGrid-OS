@@ -95,29 +95,47 @@ async fn main() {
         scenarios::run_scenario_loop(gen_tx, interval).await;
     });
 
-    // Accept WebSocket connections.
-    let listener = TcpListener::bind(addr).await.unwrap_or_else(|e| {
-        error!(%addr, error = %e, "failed to bind");
-        std::process::exit(1);
-    });
+    let listener = bind_demo_listener(addr).await;
 
-    // SEC-006: block non-loopback bind unless explicitly opted in.
+    run_demo_accept_loop(
+        listener, addr, &cli, tx,
+    )
+    .await;
+}
+
+/// Bind with SEC-006 non-loopback guard.
+async fn bind_demo_listener(addr: SocketAddr) -> TcpListener {
     if !addr.ip().is_loopback() {
-        let allow_non_loopback =
+        let allow =
             std::env::var("VELDRA_ALLOW_NON_LOOPBACK").ok().as_deref() == Some("1");
-        if !allow_non_loopback {
+        if !allow {
             error!(
                 %addr,
-                "refusing to bind to non-loopback address; set VELDRA_ALLOW_NON_LOOPBACK=1 to override"
+                "refusing to bind to non-loopback address; \
+                 set VELDRA_ALLOW_NON_LOOPBACK=1 to override"
             );
             std::process::exit(1);
         }
         warn!(
             %addr,
-            "demo feed binding to non-loopback address (VELDRA_ALLOW_NON_LOOPBACK=1)"
+            "demo feed binding to non-loopback address \
+             (VELDRA_ALLOW_NON_LOOPBACK=1)"
         );
     }
 
+    TcpListener::bind(addr).await.unwrap_or_else(|e| {
+        error!(%addr, error = %e, "failed to bind");
+        std::process::exit(1);
+    })
+}
+
+/// Accept connections with global and per-IP limits.
+async fn run_demo_accept_loop(
+    listener: TcpListener,
+    addr: SocketAddr,
+    cli: &Cli,
+    tx: broadcast::Sender<Arc<String>>,
+) {
     let max_conns = cli.max_connections;
     let max_conns_per_ip = cli.max_connections_per_ip;
     let active_conns = Arc::new(AtomicUsize::new(0));
@@ -141,7 +159,6 @@ async fn main() {
             }
         };
 
-        // Enforce global connection limit (0 = unlimited).
         if max_conns > 0 {
             let current = active_conns.load(Ordering::Relaxed);
             if current >= max_conns {
@@ -156,7 +173,6 @@ async fn main() {
             }
         }
 
-        // Enforce per-IP connection limit (0 = unlimited).
         let peer_ip = peer.ip();
         if max_conns_per_ip > 0 {
             let mut ip_map = per_ip_conns.lock().await;
