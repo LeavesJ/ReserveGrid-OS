@@ -162,10 +162,7 @@ async fn main() {
 
     let listener = bind_listener(addr).await;
 
-    run_accept_loop(
-        listener, addr, &cfg, tx, validator, feed_state,
-    )
-    .await;
+    run_accept_loop(listener, addr, &cfg, tx, validator, feed_state).await;
 }
 
 /// Accept connections with global and per-IP limits.

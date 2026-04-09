@@ -97,17 +97,13 @@ async fn main() {
 
     let listener = bind_demo_listener(addr).await;
 
-    run_demo_accept_loop(
-        listener, addr, &cli, tx,
-    )
-    .await;
+    run_demo_accept_loop(listener, addr, &cli, tx).await;
 }
 
 /// Bind with SEC-006 non-loopback guard.
 async fn bind_demo_listener(addr: SocketAddr) -> TcpListener {
     if !addr.ip().is_loopback() {
-        let allow =
-            std::env::var("VELDRA_ALLOW_NON_LOOPBACK").ok().as_deref() == Some("1");
+        let allow = std::env::var("VELDRA_ALLOW_NON_LOOPBACK").ok().as_deref() == Some("1");
         if !allow {
             error!(
                 %addr,
