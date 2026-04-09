@@ -173,7 +173,7 @@ async fn main() {
 async fn run_accept_loop(
     listener: TcpListener,
     addr: SocketAddr,
-    cfg: &config::Config,
+    cfg: &config::FeedServerConfig,
     tx: broadcast::Sender<Arc<String>>,
     validator: KeyValidator,
     feed_state: Arc<FeedState>,
