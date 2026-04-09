@@ -245,10 +245,7 @@ async fn bind_listener(addr: SocketAddr) -> TcpListener {
     // SEC-006: block non-loopback bind unless explicitly opted in.
     if !addr.ip().is_loopback() {
         let allow_non_loopback =
-            std::env::var("VELDRA_ALLOW_NON_LOOPBACK")
-                .ok()
-                .as_deref()
-                == Some("1");
+            std::env::var("VELDRA_ALLOW_NON_LOOPBACK").ok().as_deref() == Some("1");
         if !allow_non_loopback {
             error!(
                 %addr,
