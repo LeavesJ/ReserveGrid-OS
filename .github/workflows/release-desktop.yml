@@ -43,6 +43,21 @@ jobs:
 
     runs-on: ${{ matrix.platform }}
     steps:
+      - name: Validate required secrets
+        run: |
+          missing=0
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY secret is not set"
+            missing=1
+          fi
+          if [ -z "$VELDRA_LICENSE_PUBKEY" ]; then
+            echo "::error::VELDRA_LICENSE_PUBKEY secret is not set"
+            missing=1
+          fi
+          if [ "$missing" -eq 1 ]; then
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -186,7 +201,36 @@ jobs:
           }
           MANIFEST
 
-      - name: Create GitHub Release
+      # Prefer the version-specific release notes file (e.g. RELEASE_NOTES_V1.1.md
+      # for tag v1.1.0). Fall back to the generic download table when no file exists.
+      - name: Resolve release body
+        id: body
+        run: |
+          VERSION="${{ steps.tag.outputs.version }}"
+          # v1.1.0 → V1.1, v1.0.2 → V1.0.2
+          NOTES_SUFFIX=$(echo "$VERSION" | sed 's/^v/V/' | sed 's/\.0$//')
+          NOTES_FILE="RELEASE_NOTES_${NOTES_SUFFIX}.md"
+          if [ -f "$NOTES_FILE" ]; then
+            echo "source=${NOTES_FILE}" >> "$GITHUB_OUTPUT"
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release (with notes)
+        if: steps.body.outputs.found == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.version }}
+          name: "ReserveGrid OS ${{ steps.tag.outputs.version }}"
+          body_path: ${{ steps.body.outputs.source }}
+          draft: false
+          prerelease: false
+          files: artifacts/*
+          fail_on_unmatched_files: false
+
+      - name: Create GitHub Release (fallback)
+        if: steps.body.outputs.found == 'false'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.version }}

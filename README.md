@@ -4,7 +4,7 @@
 
 Built in Rust. Ships as a native macOS/Linux desktop app (`rg-desktop`) with embedded dashboard, or as a `docker compose up` server stack for headless deployment.
 
-**Current version:** v1.0.2
+**Current version:** v1.1.0
 
 ---
 
@@ -19,8 +19,10 @@ Built in Rust. Ships as a native macOS/Linux desktop app (`rg-desktop`) with emb
 
 - Evaluates candidate block templates against a configurable `policy.toml`
 - Returns accept/reject verdicts with stable machine readable reason codes and policy context
-- Runs a full Stratum V2 gateway (Noise NX encrypted) that distributes work to miners
+- Runs a full Stratum V2 gateway (Noise NX encrypted) with standard and extended mining channels
+- Adjusts per channel difficulty dynamically via variable difficulty (vardiff)
 - Tracks per channel hashrate with a sliding window estimator
+- Degrades automatically from inline to observe mode when the verifier is unreachable, then recovers on heartbeat
 - Enforces consensus safety checks: weight ratio, template age, sigops budget, coinbase sigops
 - Supports dynamic fee tiers driven by mempool conditions
 - Provides an operator dashboard with live service health, verdicts, miners, policy editor, and settings
@@ -47,7 +49,7 @@ ReserveGrid OS supports three deployment modes for progressive rollout:
 
 **Observe** connects to a live bitcoind but does not enforce policy. The gateway distributes jobs to miners regardless of the verdict. Operators see what the verifier would reject without blocking any work.
 
-**Inline** enforces policy. The gateway only distributes jobs that the verifier accepts. Rejected templates are held until a passing template arrives or a configurable stale hold timer expires. A dual prevhash buffer holds two pending templates simultaneously during block transitions, with a 50ms verdict window so miners never stall on a prevhash switch.
+**Inline** enforces policy. The gateway only distributes jobs that the verifier accepts. Rejected templates are held until a passing template arrives or a configurable stale hold timer expires. A dual prevhash buffer holds two pending templates simultaneously during block transitions, with a 50ms verdict window so miners never stall on a prevhash switch. If the verifier becomes unreachable, the gateway automatically degrades to observe behavior (templates flow without enforcement) and recovers when a heartbeat acknowledgment confirms the verifier is back.
 
 ```
   Inline / Observe mode:
@@ -91,7 +93,7 @@ TCP server that receives `TemplatePropose` messages and returns `TemplateVerdict
 Fetches block templates from bitcoind (`getblocktemplate`) or a Stratum bridge and forwards them to the verifier. Exposes mempool stats for the verifier fee tier logic. Supports runtime settings updates.
 
 ### sv2-gateway
-Stratum V2 mining gateway with Noise NX encryption. Accepts miner connections, opens channels, distributes `NewMiningJob` messages, and validates submitted shares. Tracks per channel state including a sliding window hashrate estimator. Exposes channel snapshots via HTTP for the miners page.
+Stratum V2 mining gateway with Noise NX encryption. Accepts miner connections on standard and extended mining channels, distributes `NewMiningJob` and `NewExtendedMiningJob` messages, and validates submitted shares (including variable length extranonce for extended channels). Variable difficulty adjusts each channel's target based on observed share rate. Tracks per channel state including a sliding window hashrate estimator. Automatic inline to observe degradation when the verifier heartbeat is lost. Exposes channel snapshots via HTTP for the miners page.
 
 ### rg-desktop
 Native desktop application (macOS/Linux) built with Tauri. Wraps rg-dashboard in a native window with IPC commands for license management, system tray integration, and in-app auto-updates (signed, with Tauri updater). The desktop app is the primary distribution format for operators. For headless or Docker deployments, rg-dashboard runs standalone.
@@ -106,7 +108,7 @@ Authentication service. Argon2id password hashing, session tokens, email verific
 Shared protocol structs and versioning. `TemplatePropose` and `TemplateVerdict` message types. Canonical `VerdictReason` enum and reason code string mappings.
 
 ### reservegrid-common
-Shared utilities: reason code enums, redacted secret types, common configuration helpers.
+Shared utilities: reason code enums, redacted secret types, per-IP rate limiter, common configuration helpers.
 
 ### rg-demo-feed
 Synthetic GBT (getblocktemplate) source for shadow mode testing. Generates realistic block template streams over WebSocket without requiring a real bitcoind. Ships multiple scenarios (normal, empty, fee sweep, reorg, stale).

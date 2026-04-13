@@ -1,7 +1,7 @@
 # Three Mode Architecture Spec
 
 **Status:** Implemented
-**Version:** v1.0.2
+**Version:** v1.1.0
 **Date:** 2026-03-10
 
 ## Overview

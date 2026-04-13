@@ -5,6 +5,56 @@ All notable changes to ReserveGrid OS are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] — 2026-04-13 — Yield
+
+### Added
+
+- Extended mining channels (0x13 `OpenExtendedMiningChannel`, 0x1b `SubmitSharesExtended`) with variable length extranonce negotiation
+- Variable difficulty (vardiff) with configurable target share rate, retarget interval, and per-retarget adjustment cap
+- Automatic inline to observe degradation when verifier heartbeat is lost, with recovery on `HeartbeatAck`
+- Mode transition NDJSON events (timestamp, direction, unenforced job count during degraded window)
+- Multi-gateway active/standby deployment documentation
+- Graceful shutdown drain for the management/health HTTP server via `shutdown_rx` watch channel
+- SIGHUP triggered HMAC secret rotation without restart (`Arc<RwLock<Vec<u8>>>`)
+- Per-IP rate limiter extracted from rg-auth into `reservegrid-common` and wired into sv2-gateway and rg-feed-server
+- Fly.io deployment scaffolding for rg-feed-server (`fly.toml`)
+- Production Ed25519 keypair generated for license signing (S-6)
+- Tauri devtools gated behind `cfg(feature = "devtools")`, debug builds only
+
+### Changed
+
+- `observe_free` tier renamed to `shadow` across the entire stack (SQLite migration v4, Rust constants, TypeScript types)
+- rg-feed-server WebSocket auth moved to tungstenite handshake callback (reject before first frame)
+- `gateway_signature_hex` HMAC now covers `event_id || SHA256(canonical_body)` instead of `event_id` alone (**breaking**)
+- Legacy DB-only `validate_key` fallback in rg-auth removed (all keys now require Ed25519 signature verification)
+- Static key list in rg-feed-server removed
+
+### Fixed
+
+- `build.rs` devtools gating uses Cargo `PROFILE` env var instead of `cfg!(debug_assertions)` (build scripts always compile in debug)
+
+## [1.0.2] — 2026-04-07 — Stress
+
+### Added
+
+- File descriptor limit check at sv2-gateway startup on Linux (safe `/proc/self/limits` read)
+- Fee tier ordering validation at startup (`lo <= mid <= hi`, fails with explicit error)
+- `VELDRA_GATEWAY_MODE` env var overlay on TOML mode config (was silently ignored)
+- Website i18n completion: 32 new keys in `es.json` and `zh.json`, 30+ elements across 14 pages
+
+### Changed
+
+- Template age timestamp uses bitcoind `curtime` field instead of `SystemTime::now()` (accurate under RPC latency)
+- Feed adapter `MAX_BACKOFF_SECS` reduced from 30 to 10 seconds
+- Verifier reconnect uses hash-based jitter (0 to 50 percent of base delay) to prevent thundering herd
+- Degraded policy mode logging upgraded from WARN to ERROR
+- Dashboard policy poll interval reduced from 30s to 5s to match verdict polling
+
+### Fixed
+
+- Stale-diff bug in all four dashboard save handlers (policy, verifier, gateway, template settings) via `baselineRef` pattern
+- `libc::getrlimit` replaced with safe `/proc/self/limits` read to satisfy workspace `unsafe_code = "deny"`
+
 ## [1.0.1] — 2026-04-04 — Temper
 
 ### Added
