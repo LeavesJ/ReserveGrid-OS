@@ -1,3 +1,9 @@
+# syntax=docker/dockerfile:1.7
+# BuildKit check directive: suppress SecretsUsedInArgOrEnv.
+# VELDRA_AUTH_ADDR is a listen host:port and VELDRA_AUTH_DB is a
+# filesystem path. The name-based heuristic false positives on
+# "AUTH"; no credentials are baked into image layers.
+# check=skip=SecretsUsedInArgOrEnv
 # ── Stage 1: Build ────────────────────────────
 FROM rust:1.92-bookworm AS builder
 
@@ -10,9 +16,14 @@ COPY Cargo.toml Cargo.lock ./
 COPY services/rg-auth/ services/rg-auth/
 COPY services/pool-verifier/Cargo.toml services/pool-verifier/Cargo.toml
 COPY services/template-manager/Cargo.toml services/template-manager/Cargo.toml
-COPY services/rg-protocol/Cargo.toml services/rg-protocol/Cargo.toml
 COPY services/sv2-bridge/Cargo.toml services/sv2-bridge/Cargo.toml
-COPY services/reservegrid-common/Cargo.toml services/reservegrid-common/Cargo.toml
+
+# reservegrid-common is a real source dependency of rg-auth (rate limiter
+# extracted in v1.1.0 S-3). reservegrid-common itself imports
+# rg_protocol::VerdictReason, so rg-protocol needs real source too.
+# Stub pattern for the rest of the workspace still applies (see R-148).
+COPY services/rg-protocol/ services/rg-protocol/
+COPY services/reservegrid-common/ services/reservegrid-common/
 COPY services/reservegrid-gateway/Cargo.toml services/reservegrid-gateway/Cargo.toml
 COPY services/sv2-gateway/Cargo.toml services/sv2-gateway/Cargo.toml
 COPY services/test-miner/Cargo.toml services/test-miner/Cargo.toml
@@ -22,13 +33,15 @@ COPY services/rg-demo-feed/Cargo.toml services/rg-demo-feed/Cargo.toml
 COPY services/rg-feed-server/Cargo.toml services/rg-feed-server/Cargo.toml
 COPY services/rg-load-test/Cargo.toml services/rg-load-test/Cargo.toml
 COPY services/rg-desktop/Cargo.toml services/rg-desktop/Cargo.toml
+# rg-consensus is a library crate with no external deps at Phase 1. rg-auth
+# does not import from it, so the stub pattern is safe here. Revisit when any
+# source-level import of rg_consensus:: lands in rg-auth. (R-148)
+COPY services/rg-consensus/Cargo.toml services/rg-consensus/Cargo.toml
 
 # Create dummy src files for other workspace members so cargo resolves
 RUN mkdir -p services/pool-verifier/src && echo "fn main(){}" > services/pool-verifier/src/main.rs \
     && mkdir -p services/template-manager/src && echo "fn main(){}" > services/template-manager/src/main.rs \
-    && mkdir -p services/rg-protocol/src && echo "" > services/rg-protocol/src/lib.rs \
     && mkdir -p services/sv2-bridge/src && echo "fn main(){}" > services/sv2-bridge/src/main.rs \
-    && mkdir -p services/reservegrid-common/src && echo "" > services/reservegrid-common/src/lib.rs \
     && mkdir -p services/reservegrid-gateway/src && echo "fn main(){}" > services/reservegrid-gateway/src/main.rs \
     && mkdir -p services/sv2-gateway/src && echo "fn main(){}" > services/sv2-gateway/src/main.rs \
     && mkdir -p services/test-miner/src && echo "fn main(){}" > services/test-miner/src/main.rs \
@@ -38,7 +51,8 @@ RUN mkdir -p services/pool-verifier/src && echo "fn main(){}" > services/pool-ve
     && mkdir -p services/rg-feed-server/src && echo "fn main(){}" > services/rg-feed-server/src/main.rs \
     && mkdir -p services/rg-load-test/src && echo "fn main(){}" > services/rg-load-test/src/main.rs \
     && mkdir -p services/rg-desktop/src && echo "fn main(){}" > services/rg-desktop/src/main.rs \
-    && echo "fn main(){}" > services/rg-desktop/build.rs
+    && echo "fn main(){}" > services/rg-desktop/build.rs \
+    && mkdir -p services/rg-consensus/src && echo "" > services/rg-consensus/src/lib.rs
 
 RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=cargo-target,target=/build/target,sharing=locked \
