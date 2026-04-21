@@ -205,32 +205,41 @@ impl ShareWal {
     ///
     /// Must be called before `try_send` to the forward channel so that a
     /// crash between this write and the forward result is recoverable.
-    pub fn mark_pending(&mut self, share_id_hex: &str, event_id_hex: &str) {
+    ///
+    /// Returns `Err` if the append or fsync fails; the in-memory pending
+    /// index is **not** updated in that case. Callers must treat a failure
+    /// as fatal to share durability: silently proceeding would leave the
+    /// share orphaned with no recovery record on disk, permanently breaking
+    /// the 1:1 accepted-to-forward-result join invariant.
+    pub fn mark_pending(&mut self, share_id_hex: &str, event_id_hex: &str) -> std::io::Result<()> {
         let record = WalRecord {
             status: WalStatus::Pending,
             share_id_hex: share_id_hex.to_string(),
             event_id_hex: event_id_hex.to_string(),
             timestamp_ms: unix_ms_now(),
         };
-        if let Err(e) = self.append_record(&record) {
-            error!(
-                share_id = %share_id_hex,
-                error = %e,
-                "wal: failed to write pending record"
-            );
-            return;
-        }
+        self.append_record(&record)?;
         self.pending.insert(
             (share_id_hex.to_string(), event_id_hex.to_string()),
             record.timestamp_ms,
         );
+        Ok(())
     }
 
     /// Record a share forward as completed.
     ///
     /// Removes the entry from the pending index and triggers compaction if
     /// the threshold is reached.
-    pub fn mark_completed(&mut self, share_id_hex: &str, event_id_hex: &str) {
+    ///
+    /// Returns `Err` if the append, fsync, or (when threshold reached)
+    /// compaction fails. The in-memory pending entry is removed up front so
+    /// that repeated retries remain idempotent; callers treat a failure as
+    /// fatal, same as `mark_pending`.
+    pub fn mark_completed(
+        &mut self,
+        share_id_hex: &str,
+        event_id_hex: &str,
+    ) -> std::io::Result<()> {
         let key = (share_id_hex.to_string(), event_id_hex.to_string());
         // Always write the completed record even if the pending entry is
         // missing. This guards against a select! ordering race where
@@ -244,20 +253,14 @@ impl ShareWal {
             event_id_hex: event_id_hex.to_string(),
             timestamp_ms: unix_ms_now(),
         };
-        if let Err(e) = self.append_record(&record) {
-            error!(
-                share_id = %share_id_hex,
-                error = %e,
-                "wal: failed to write completed record"
-            );
-        }
+        self.append_record(&record)?;
         self.completed_since_compaction += 1;
         if self.compaction_threshold > 0
             && self.completed_since_compaction >= self.compaction_threshold
-            && let Err(e) = self.compact_inner()
         {
-            error!(error = %e, "wal: auto-compaction failed");
+            self.compact_inner()?;
         }
+        Ok(())
     }
 
     /// Number of entries currently pending (not yet completed).
@@ -352,9 +355,9 @@ mod tests {
         let path = temp_wal_path("pending_completed");
         cleanup(&path);
         let mut wal = ShareWal::open(&path, 100).unwrap();
-        wal.mark_pending("aaa", "bbb");
+        wal.mark_pending("aaa", "bbb").unwrap();
         assert_eq!(wal.pending_count(), 1);
-        wal.mark_completed("aaa", "bbb");
+        wal.mark_completed("aaa", "bbb").unwrap();
         assert_eq!(wal.pending_count(), 0);
         cleanup(&path);
     }
@@ -367,9 +370,9 @@ mod tests {
         // Phase 1: write pending entries and drop (simulate crash).
         {
             let mut wal = ShareWal::open(&path, 100).unwrap();
-            wal.mark_pending("share1", "event1");
-            wal.mark_pending("share2", "event2");
-            wal.mark_completed("share1", "event1");
+            wal.mark_pending("share1", "event1").unwrap();
+            wal.mark_pending("share2", "event2").unwrap();
+            wal.mark_completed("share1", "event1").unwrap();
             // share2 is still pending when we "crash".
         }
 
@@ -398,13 +401,13 @@ mod tests {
         cleanup(&path);
 
         let mut wal = ShareWal::open(&path, 2).unwrap(); // threshold = 2
-        wal.mark_pending("s1", "e1");
-        wal.mark_pending("s2", "e2");
-        wal.mark_pending("s3", "e3");
+        wal.mark_pending("s1", "e1").unwrap();
+        wal.mark_pending("s2", "e2").unwrap();
+        wal.mark_pending("s3", "e3").unwrap();
 
         // Complete two entries to trigger compaction.
-        wal.mark_completed("s1", "e1");
-        wal.mark_completed("s2", "e2");
+        wal.mark_completed("s1", "e1").unwrap();
+        wal.mark_completed("s2", "e2").unwrap();
         // Compaction should have fired.
 
         // Verify: reopen and check only s3 remains.
@@ -419,10 +422,10 @@ mod tests {
         let path = temp_wal_path("dup_complete");
         cleanup(&path);
         let mut wal = ShareWal::open(&path, 100).unwrap();
-        wal.mark_pending("s1", "e1");
-        wal.mark_completed("s1", "e1");
+        wal.mark_pending("s1", "e1").unwrap();
+        wal.mark_completed("s1", "e1").unwrap();
         // Second completion should be a no-op.
-        wal.mark_completed("s1", "e1");
+        wal.mark_completed("s1", "e1").unwrap();
         assert_eq!(wal.pending_count(), 0);
         cleanup(&path);
     }
@@ -459,8 +462,8 @@ mod tests {
 
         {
             let mut wal = ShareWal::open(&path, 100).unwrap();
-            wal.mark_pending("s1", "e1");
-            wal.mark_completed("s1", "e1");
+            wal.mark_pending("s1", "e1").unwrap();
+            wal.mark_completed("s1", "e1").unwrap();
         }
 
         let mut wal = ShareWal::open(&path, 100).unwrap();
@@ -478,7 +481,7 @@ mod tests {
         // Crash 1: leave s1 pending.
         {
             let mut wal = ShareWal::open(&path, 100).unwrap();
-            wal.mark_pending("s1", "e1");
+            wal.mark_pending("s1", "e1").unwrap();
         }
 
         // Recovery 1: s1 recovered.
@@ -492,7 +495,7 @@ mod tests {
         // Crash 2: leave s2 pending.
         {
             let mut wal = ShareWal::open(&path, 100).unwrap();
-            wal.mark_pending("s2", "e2");
+            wal.mark_pending("s2", "e2").unwrap();
         }
 
         // Recovery 2: only s2 recovered (s1 was cleaned up).
@@ -504,5 +507,67 @@ mod tests {
         }
 
         cleanup(&path);
+    }
+
+    /// When the underlying writer returns an I/O error, `mark_pending` and
+    /// `mark_completed` must propagate the error (not swallow it) so the
+    /// gateway can halt before silently losing share durability.
+    ///
+    /// Linux-only: relies on `/dev/full`, which always returns `ENOSPC` on
+    /// write. Skipped on other platforms.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mark_pending_propagates_write_failure() {
+        use std::fs::OpenOptions;
+
+        let dev_full_path = std::path::Path::new("/dev/full");
+        if !dev_full_path.exists() {
+            // Sandbox without /dev/full; skip rather than fail.
+            return;
+        }
+        let file = match OpenOptions::new().write(true).open(dev_full_path) {
+            Ok(f) => f,
+            Err(_) => return, // not permitted in this sandbox; skip
+        };
+        let writer = std::io::BufWriter::new(file);
+
+        // Hand-construct a WAL pointed at a throwaway tmp path but with the
+        // writer replaced by /dev/full. open() itself can't fail here because
+        // the path is writable; we only substitute the append handle.
+        let path = temp_wal_path("dev_full");
+        cleanup(&path);
+        let mut wal = ShareWal {
+            path: path.clone(),
+            pending: HashMap::new(),
+            writer,
+            completed_since_compaction: 0,
+            compaction_threshold: 0,
+        };
+
+        let err = wal
+            .mark_pending("share-x", "event-x")
+            .expect_err("write to /dev/full must fail");
+        // ENOSPC maps to ErrorKind::StorageFull on recent toolchains and to
+        // WriteZero/Other on older ones. Assert propagation rather than the
+        // specific kind so this test survives stdlib churn.
+        let kind = err.kind();
+        assert!(
+            matches!(
+                kind,
+                std::io::ErrorKind::WriteZero
+                    | std::io::ErrorKind::Other
+                    | std::io::ErrorKind::StorageFull
+            ) || err.raw_os_error() == Some(libc_enospc()),
+            "unexpected error kind from /dev/full write: {kind:?} ({err})",
+        );
+        // In-memory pending must NOT have been updated on failure.
+        assert_eq!(wal.pending_count(), 0);
+        cleanup(&path);
+    }
+
+    /// ENOSPC on Linux. Hardcoded rather than pulling in libc for one constant.
+    #[cfg(target_os = "linux")]
+    fn libc_enospc() -> i32 {
+        28
     }
 }

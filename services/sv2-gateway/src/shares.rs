@@ -79,20 +79,57 @@ pub fn compute_event_id(share_id: &[u8; 32], worker_id: &str, validation_level: 
     out
 }
 
-/// Compute the HMAC-SHA256 gateway signature.
+/// Compute the HMAC-SHA256 gateway signature over `event_id || body_hash`.
+///
+/// `body_hash` is the SHA-256 of the canonical JSON body (serialized with
+/// `gateway_signature_hex` set to the empty string). Including the body hash
+/// prevents replay attacks with modified bodies.
 ///
 /// Returns `None` if the HMAC key is rejected (should not happen for SHA256
 /// which accepts any key length, but we propagate rather than panic).
-pub fn compute_gateway_signature(secret: &[u8], event_id: &[u8; 32]) -> Option<[u8; 32]> {
+pub fn compute_gateway_signature(
+    secret: &[u8],
+    event_id: &[u8; 32],
+    body_hash: &[u8; 32],
+) -> Option<[u8; 32]> {
     use hmac::{Hmac, Mac};
     type HmacSha256 = Hmac<Sha256>;
 
     let mut mac = HmacSha256::new_from_slice(secret).ok()?;
     mac.update(event_id);
+    mac.update(body_hash);
     let result = mac.finalize();
     let mut out = [0u8; 32];
     out.copy_from_slice(&result.into_bytes());
     Some(out)
+}
+
+/// Sign a [`ShareSubmission`] by computing the body hash and HMAC signature.
+///
+/// Serializes the submission with an empty `gateway_signature_hex`, hashes the
+/// canonical JSON, then computes `HMAC(secret, event_id || body_hash)`. Returns
+/// the hex-encoded signature, or an empty string if signing is disabled or fails.
+pub fn sign_submission(secret: &[u8], submission: &mut ShareSubmission) {
+    if secret.is_empty() {
+        return;
+    }
+    // Ensure signature is empty for canonical serialization.
+    submission.gateway_signature_hex = String::new();
+    let Ok(canonical_json) = serde_json::to_vec(submission) else {
+        return;
+    };
+    let body_hash: [u8; 32] = Sha256::digest(&canonical_json).into();
+
+    let mut event_id = [0u8; 32];
+    if let Ok(decoded) = hex::decode(&submission.event_id_hex)
+        && decoded.len() == 32
+    {
+        event_id.copy_from_slice(&decoded);
+    }
+
+    submission.gateway_signature_hex = compute_gateway_signature(secret, &event_id, &body_hash)
+        .map(hex::encode)
+        .unwrap_or_default();
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -456,6 +493,29 @@ impl ShareForwardResultEvent {
     }
 }
 
+/// Event 3: Emitted when the gateway enters or exits degraded mode.
+///
+/// Degradation occurs when the verifier heartbeat is lost for longer
+/// than the configured threshold. Recovery occurs when a `HeartbeatAck`
+/// arrives while degraded. The `unenforced_jobs` field counts how many
+/// jobs were broadcast without verdict enforcement during the degraded
+/// window (populated only on recovery).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ModeTransitionEvent {
+    /// Event type discriminator for NDJSON stream consumers.
+    pub event_type: &'static str,
+    /// Transition direction: `"degraded"` or `"recovered"`.
+    pub direction: &'static str,
+    /// Unix timestamp (ms) of the transition.
+    pub timestamp_ms: u64,
+    /// Duration of the degraded window in milliseconds.
+    /// Zero on degradation entry; populated on recovery.
+    pub degraded_duration_ms: u64,
+    /// Number of jobs broadcast without verdict enforcement during the
+    /// degraded window. Zero on degradation entry; populated on recovery.
+    pub unenforced_jobs: u64,
+}
+
 /// Current UNIX timestamp in milliseconds.
 pub fn unix_ms_now() -> u64 {
     #[allow(clippy::cast_possible_truncation)]
@@ -502,62 +562,164 @@ pub fn display_hex_to_wire_bytes(hex_str: &str) -> Result<[u8; 32], String> {
 ///
 /// `difficulty = DIFF1_TARGET / channel_target`
 ///
-/// Uses a 256-bit big-number representation for full precision across
-/// the entire 32-byte target, avoiding truncation of low bytes.
+/// Uses 256-bit binary long division for full precision. The result
+/// is capped at `u64::MAX`.
 pub fn target_to_difficulty_u64(maximum_target: &[u8; 32]) -> u64 {
-    // Check for zero target.
     if maximum_target.iter().all(|&b| b == 0) {
         return u64::MAX;
     }
 
-    // DIFF1_TARGET in LE byte order (reverse of BE constant).
     let mut diff1_le = rg_protocol::gateway::DIFF1_TARGET_BE;
     diff1_le.reverse();
 
-    // Perform 256-bit division by finding the most significant non-zero
-    // 16-byte window that captures both numerator and denominator content.
-    // We scan from the MSB end (index 31 down) to find the first non-zero
-    // region that gives us a valid ratio.
+    let n = u256_from_le(&diff1_le);
+    let d = u256_from_le(maximum_target);
 
-    // Find the most significant non-zero byte index for the target.
-    let Some(target_msb) = maximum_target.iter().rposition(|&b| b != 0) else {
-        return u64::MAX; // all-zero, handled above but be safe
-    };
-
-    // Align both numbers so the target's MSB region fits in a u128.
-    // We want a 16-byte window ending at target_msb (inclusive).
-    let window_end = target_msb + 1;
-    let window_start = window_end.saturating_sub(16);
-
-    let target_val = u128_from_le_window(maximum_target, window_start, window_end);
-    if target_val == 0 {
-        return u64::MAX;
+    // If target > DIFF1, difficulty is 0.
+    if u256_gt(&d, &n) {
+        return 0;
+    }
+    if u256_eq(&d, &n) {
+        return 1;
     }
 
-    let diff1_val = u128_from_le_window(&diff1_le, window_start, window_end);
-    if diff1_val == 0 {
-        // DIFF1 has no content in this window; difficulty is astronomically
-        // high (target is far above DIFF1). Return 0 since the target is
-        // easier than diff-1.
+    let n_bits = u256_bits(&n);
+    let d_bits = u256_bits(&d);
+    if d_bits > n_bits {
         return 0;
     }
 
-    let ratio = diff1_val / target_val;
-    if ratio > u128::from(u64::MAX) {
-        u64::MAX
+    let max_shift = n_bits - d_bits;
+    if max_shift > 63 {
+        return u64::MAX;
+    }
+
+    let mut remainder = n;
+    let mut quotient: u64 = 0;
+
+    for shift in (0..=max_shift).rev() {
+        let shifted_d = u256_shl(&d, shift);
+        if u256_gte(&remainder, &shifted_d) {
+            remainder = u256_sub(&remainder, &shifted_d);
+            quotient |= 1u64 << shift;
+        }
+    }
+
+    quotient
+}
+
+// ── 256-bit arithmetic helpers (lo, hi) representation ──
+
+type U256 = (u128, u128); // (lo, hi)
+
+fn u256_from_le(bytes: &[u8; 32]) -> U256 {
+    let mut lo_buf = [0u8; 16];
+    let mut hi_buf = [0u8; 16];
+    lo_buf.copy_from_slice(&bytes[0..16]);
+    hi_buf.copy_from_slice(&bytes[16..32]);
+    (u128::from_le_bytes(lo_buf), u128::from_le_bytes(hi_buf))
+}
+
+fn u256_bits(v: &U256) -> u32 {
+    if v.1 != 0 {
+        128 + (128 - v.1.leading_zeros())
+    } else if v.0 != 0 {
+        128 - v.0.leading_zeros()
     } else {
-        #[allow(clippy::cast_possible_truncation)]
-        let result = ratio as u64;
-        result
+        0
     }
 }
 
-/// Extract up to 16 bytes from a LE byte array at the given window as u128.
-fn u128_from_le_window(bytes: &[u8; 32], start: usize, end: usize) -> u128 {
-    let mut buf = [0u8; 16];
-    let len = (end - start).min(16);
-    buf[..len].copy_from_slice(&bytes[start..start + len]);
-    u128::from_le_bytes(buf)
+fn u256_shl(v: &U256, shift: u32) -> U256 {
+    if shift == 0 {
+        return *v;
+    }
+    if shift >= 256 {
+        return (0, 0);
+    }
+    if shift >= 128 {
+        (0, v.0 << (shift - 128))
+    } else {
+        let lo = v.0 << shift;
+        let hi = (v.1 << shift) | (v.0 >> (128 - shift));
+        (lo, hi)
+    }
+}
+
+fn u256_gte(a: &U256, b: &U256) -> bool {
+    match a.1.cmp(&b.1) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => a.0 >= b.0,
+    }
+}
+
+fn u256_gt(a: &U256, b: &U256) -> bool {
+    match a.1.cmp(&b.1) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => a.0 > b.0,
+    }
+}
+
+fn u256_eq(a: &U256, b: &U256) -> bool {
+    a.0 == b.0 && a.1 == b.1
+}
+
+fn u256_sub(a: &U256, b: &U256) -> U256 {
+    let (lo, borrow) = a.0.overflowing_sub(b.0);
+    let hi = a.1.wrapping_sub(b.1).wrapping_sub(u128::from(borrow));
+    (lo, hi)
+}
+
+fn u256_or(a: &U256, b: &U256) -> U256 {
+    (a.0 | b.0, a.1 | b.1)
+}
+
+/// Convert a difficulty value back to a 32-byte LE target.
+///
+/// `target = DIFF1_TARGET / difficulty`. Returns `[0xFF; 32]` for
+/// difficulty 0 (no difficulty, accept everything).
+///
+/// Uses 256-bit binary long division for exact results. The divisor
+/// (difficulty) is at most u64, so the quotient is a full 256-bit value.
+pub fn difficulty_to_target(difficulty: u64) -> [u8; 32] {
+    if difficulty == 0 {
+        return [0xFF; 32];
+    }
+
+    let mut diff1_le = rg_protocol::gateway::DIFF1_TARGET_BE;
+    diff1_le.reverse();
+
+    let n = u256_from_le(&diff1_le);
+    let d = (u128::from(difficulty), 0u128); // U256 with only lo set
+
+    let n_bits = u256_bits(&n);
+    let d_bits = u256_bits(&d);
+    if d_bits > n_bits {
+        return [0u8; 32];
+    }
+
+    let max_shift = n_bits - d_bits;
+
+    // The quotient can be up to 256 bits. We accumulate it in a U256.
+    let mut remainder = n;
+    let mut quotient: U256 = (0, 0);
+
+    for shift in (0..=max_shift).rev() {
+        let shifted_d = u256_shl(&d, shift);
+        if u256_gte(&remainder, &shifted_d) {
+            remainder = u256_sub(&remainder, &shifted_d);
+            // Set bit `shift` in quotient.
+            let bit = u256_shl(&(1, 0), shift);
+            quotient = u256_or(&quotient, &bit);
+        }
+    }
+
+    let mut target = [0u8; 32];
+    target[0..16].copy_from_slice(&quotient.0.to_le_bytes());
+    target[16..32].copy_from_slice(&quotient.1.to_le_bytes());
+    target
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -624,17 +786,138 @@ mod tests {
     fn gateway_signature_deterministic() {
         let secret = b"test-secret";
         let event_id = [0xBB; 32];
-        let sig1 = compute_gateway_signature(secret, &event_id).unwrap();
-        let sig2 = compute_gateway_signature(secret, &event_id).unwrap();
+        let body_hash = [0xCC; 32];
+        let sig1 = compute_gateway_signature(secret, &event_id, &body_hash).unwrap();
+        let sig2 = compute_gateway_signature(secret, &event_id, &body_hash).unwrap();
         assert_eq!(sig1, sig2);
     }
 
     #[test]
     fn gateway_signature_changes_with_secret() {
         let event_id = [0xBB; 32];
-        let sig1 = compute_gateway_signature(b"secret1", &event_id).unwrap();
-        let sig2 = compute_gateway_signature(b"secret2", &event_id).unwrap();
+        let body_hash = [0xCC; 32];
+        let sig1 = compute_gateway_signature(b"secret1", &event_id, &body_hash).unwrap();
+        let sig2 = compute_gateway_signature(b"secret2", &event_id, &body_hash).unwrap();
         assert_ne!(sig1, sig2);
+    }
+
+    #[test]
+    fn gateway_signature_changes_with_body_hash() {
+        let secret = b"test-secret";
+        let event_id = [0xBB; 32];
+        let hash1 = [0xCC; 32];
+        let hash2 = [0xDD; 32];
+        let sig1 = compute_gateway_signature(secret, &event_id, &hash1).unwrap();
+        let sig2 = compute_gateway_signature(secret, &event_id, &hash2).unwrap();
+        assert_ne!(sig1, sig2);
+    }
+
+    #[test]
+    fn sign_submission_populates_signature() {
+        let mut sub = ShareSubmission {
+            share_id_hex: hex::encode([0xAA; 32]),
+            version: 0x2000_0000,
+            prev_hash_wire_hex: hex::encode([0u8; 32]),
+            prev_hash_display_hex: hex::encode([0u8; 32]),
+            merkle_root_wire_hex: hex::encode([0u8; 32]),
+            merkle_root_display_hex: hex::encode([0u8; 32]),
+            ntime: 1_700_000_000,
+            nbits: 0x1d00_ffff,
+            nonce: 42,
+            event_id_hex: hex::encode([0xBB; 32]),
+            worker_id: "worker1".to_string(),
+            validation_level: "full".to_string(),
+            gateway_instance_id: "gw-1".to_string(),
+            channel_id: 1,
+            sequence_number: 0,
+            job_id: 1,
+            template_id: 100,
+            block_height: 800_000,
+            pool_account_id: None,
+            timestamp_ms: 1_700_000_000_000,
+            difficulty_u64: 1,
+            difficulty_display: 1.0,
+            source_instance_id: "src-1".to_string(),
+            gateway_signature_hex: String::new(),
+        };
+        sign_submission(b"my-secret", &mut sub);
+        assert!(!sub.gateway_signature_hex.is_empty());
+        assert_eq!(sub.gateway_signature_hex.len(), 64); // 32 bytes hex
+    }
+
+    #[test]
+    fn sign_submission_empty_secret_leaves_empty_sig() {
+        let mut sub = ShareSubmission {
+            share_id_hex: hex::encode([0xAA; 32]),
+            version: 0x2000_0000,
+            prev_hash_wire_hex: hex::encode([0u8; 32]),
+            prev_hash_display_hex: hex::encode([0u8; 32]),
+            merkle_root_wire_hex: hex::encode([0u8; 32]),
+            merkle_root_display_hex: hex::encode([0u8; 32]),
+            ntime: 1_700_000_000,
+            nbits: 0x1d00_ffff,
+            nonce: 42,
+            event_id_hex: hex::encode([0xBB; 32]),
+            worker_id: "worker1".to_string(),
+            validation_level: "full".to_string(),
+            gateway_instance_id: "gw-1".to_string(),
+            channel_id: 1,
+            sequence_number: 0,
+            job_id: 1,
+            template_id: 100,
+            block_height: 800_000,
+            pool_account_id: None,
+            timestamp_ms: 1_700_000_000_000,
+            difficulty_u64: 1,
+            difficulty_display: 1.0,
+            source_instance_id: "src-1".to_string(),
+            gateway_signature_hex: String::new(),
+        };
+        sign_submission(b"", &mut sub);
+        assert!(sub.gateway_signature_hex.is_empty());
+    }
+
+    #[test]
+    fn sign_submission_is_deterministic_and_body_sensitive() {
+        let make_sub = || ShareSubmission {
+            share_id_hex: hex::encode([0xAA; 32]),
+            version: 0x2000_0000,
+            prev_hash_wire_hex: hex::encode([0u8; 32]),
+            prev_hash_display_hex: hex::encode([0u8; 32]),
+            merkle_root_wire_hex: hex::encode([0u8; 32]),
+            merkle_root_display_hex: hex::encode([0u8; 32]),
+            ntime: 1_700_000_000,
+            nbits: 0x1d00_ffff,
+            nonce: 42,
+            event_id_hex: hex::encode([0xBB; 32]),
+            worker_id: "worker1".to_string(),
+            validation_level: "full".to_string(),
+            gateway_instance_id: "gw-1".to_string(),
+            channel_id: 1,
+            sequence_number: 0,
+            job_id: 1,
+            template_id: 100,
+            block_height: 800_000,
+            pool_account_id: None,
+            timestamp_ms: 1_700_000_000_000,
+            difficulty_u64: 1,
+            difficulty_display: 1.0,
+            source_instance_id: "src-1".to_string(),
+            gateway_signature_hex: String::new(),
+        };
+
+        // Same input produces same signature.
+        let mut s1 = make_sub();
+        let mut s2 = make_sub();
+        sign_submission(b"secret", &mut s1);
+        sign_submission(b"secret", &mut s2);
+        assert_eq!(s1.gateway_signature_hex, s2.gateway_signature_hex);
+
+        // Different body field produces different signature.
+        let mut s3 = make_sub();
+        s3.nonce = 99;
+        sign_submission(b"secret", &mut s3);
+        assert_ne!(s1.gateway_signature_hex, s3.gateway_signature_hex);
     }
 
     #[test]
@@ -968,5 +1251,97 @@ mod tests {
             full.reason_code.as_deref(),
             Some(GatewayReason::ShareDroppedQueueFull.as_str())
         );
+    }
+
+    // ── difficulty_to_target tests ──
+
+    #[test]
+    fn difficulty_to_target_zero_returns_all_ff() {
+        let target = difficulty_to_target(0);
+        assert_eq!(target, [0xFF; 32]);
+    }
+
+    #[test]
+    fn difficulty_to_target_one_returns_diff1() {
+        let target = difficulty_to_target(1);
+        let mut diff1_le = rg_protocol::gateway::DIFF1_TARGET_BE;
+        diff1_le.reverse();
+        assert_eq!(target, diff1_le);
+    }
+
+    #[test]
+    fn difficulty_to_target_round_trip() {
+        // Verify that target_to_difficulty(difficulty_to_target(d)) ≈ d
+        // for several values. Integer division may lose precision, so we
+        // accept a tolerance of 1.
+        for &d in &[1u64, 2, 100, 1000, 65536, 1_000_000, u64::MAX / 2] {
+            let target = difficulty_to_target(d);
+            let round_tripped = target_to_difficulty_u64(&target);
+            let diff = round_tripped.abs_diff(d);
+            assert!(
+                diff <= 1,
+                "round-trip failed for d={d}: got {round_tripped}, diff={diff}",
+            );
+        }
+    }
+
+    #[test]
+    fn difficulty_to_target_higher_difficulty_gives_lower_target() {
+        let t1 = difficulty_to_target(100);
+        let t2 = difficulty_to_target(1000);
+        // As a 256-bit LE integer, t2 should be smaller than t1.
+        // Compare MSB first.
+        let cmp = t1.iter().rev().cmp(t2.iter().rev());
+        assert_eq!(cmp, std::cmp::Ordering::Greater);
+    }
+
+    // ── ModeTransitionEvent tests ──
+
+    #[test]
+    fn mode_transition_event_degraded_key_set() {
+        let evt = ModeTransitionEvent {
+            event_type: "mode_transition",
+            direction: "degraded",
+            timestamp_ms: 1_700_000_000_000,
+            degraded_duration_ms: 0,
+            unenforced_jobs: 2,
+        };
+        let json = serde_json::to_string(&evt).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = v.as_object().unwrap();
+        let expected_keys = [
+            "event_type",
+            "direction",
+            "timestamp_ms",
+            "degraded_duration_ms",
+            "unenforced_jobs",
+        ];
+        for key in &expected_keys {
+            assert!(
+                obj.contains_key(*key),
+                "ModeTransitionEvent missing expected key '{key}'",
+            );
+        }
+        assert_eq!(obj["event_type"], "mode_transition");
+        assert_eq!(obj["direction"], "degraded");
+        assert_eq!(obj["degraded_duration_ms"], 0);
+        assert_eq!(obj["unenforced_jobs"], 2);
+    }
+
+    #[test]
+    fn mode_transition_event_recovered_key_set() {
+        let evt = ModeTransitionEvent {
+            event_type: "mode_transition",
+            direction: "recovered",
+            timestamp_ms: 1_700_000_010_000,
+            degraded_duration_ms: 10_000,
+            unenforced_jobs: 5,
+        };
+        let json = serde_json::to_string(&evt).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = v.as_object().unwrap();
+        assert_eq!(obj["direction"], "recovered");
+        assert_eq!(obj["degraded_duration_ms"], 10_000);
+        assert_eq!(obj["unenforced_jobs"], 5);
     }
 }

@@ -27,6 +27,7 @@ pub struct GatewayConfig {
 /// SV2 gateway operational parameters.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct GatewaySection {
     /// SV2 listener bind address (e.g., "0.0.0.0:3333").
     pub listen_addr: String,
@@ -140,6 +141,52 @@ pub struct GatewaySection {
     #[serde(default)]
     pub max_shares_per_second_per_channel: u32,
 
+    /// Extranonce prefix length in bytes for standard channels. Default 4.
+    /// Extended channels use the same prefix length but add a miner-controlled
+    /// suffix. Valid range: 2..=8.
+    #[serde(default = "default_extranonce_prefix_len")]
+    pub extranonce_prefix_len: usize,
+
+    /// Whether to accept extended mining channel requests (SV2 0x13).
+    /// When false, extended channel opens are rejected with `CloseChannel`.
+    /// Default true (most production ASIC firmware requires extended channels).
+    #[serde(default = "default_extended_channels_enabled")]
+    pub extended_channels_enabled: bool,
+
+    /// Enable variable difficulty adjustment per channel. When enabled, the
+    /// gateway adjusts each channel's target to maintain the configured
+    /// shares-per-minute rate. Default false (static difficulty).
+    #[serde(default)]
+    pub vardiff_enabled: bool,
+
+    /// Target share submission rate in shares per minute per channel.
+    /// The vardiff algorithm adjusts difficulty to converge on this rate.
+    /// Default 20.0.
+    #[serde(default = "default_vardiff_target_shares_per_min")]
+    pub vardiff_target_shares_per_min: f64,
+
+    /// Retarget evaluation interval in seconds. The gateway evaluates
+    /// whether to adjust difficulty after this many seconds of observation.
+    /// Default 90.
+    #[serde(default = "default_vardiff_retarget_interval_secs")]
+    pub vardiff_retarget_interval_secs: u64,
+
+    /// Minimum difficulty floor for vardiff. Prevents the target from
+    /// becoming trivially easy. Default 1.
+    #[serde(default = "default_vardiff_min_difficulty")]
+    pub vardiff_min_difficulty: u64,
+
+    /// Maximum difficulty ceiling for vardiff. Default `u64::MAX` (no cap).
+    #[serde(default = "default_vardiff_max_difficulty")]
+    pub vardiff_max_difficulty: u64,
+
+    /// Maximum multiplicative adjustment factor per retarget. Limits how
+    /// aggressively difficulty can change in a single step. For example,
+    /// 4.0 means difficulty can at most quadruple or quarter per retarget.
+    /// Default 4.0.
+    #[serde(default = "default_vardiff_max_adjustment_factor")]
+    pub vardiff_max_adjustment_factor: f64,
+
     /// Enable SIGHUP triggered reload of the Noise authority keypair.
     /// When `true` (the default), sending SIGHUP to the gateway process causes
     /// it to re-read `noise_keypair_path`, validate against `authority_pubkey`,
@@ -179,6 +226,21 @@ pub struct GatewaySection {
     /// When empty, falls back to the `VELDRA_TEMPLATE_URL` environment variable.
     #[serde(default)]
     pub template_url: String,
+
+    /// Enable automatic inline-to-observe degradation when the verifier
+    /// becomes unreachable. When enabled and the verifier health probe
+    /// exceeds `auto_degrade_after_ms`, the gateway temporarily suspends
+    /// verdict enforcement and broadcasts templates immediately (observe
+    /// equivalent). Enforcement resumes when the verifier reconnects and
+    /// sends a heartbeat ack. Default true.
+    #[serde(default = "default_auto_degrade")]
+    pub auto_degrade: bool,
+
+    /// Milliseconds without a verifier heartbeat ack before the gateway
+    /// transitions to degraded mode. Only effective when `auto_degrade`
+    /// is true and the configured mode is inline. Default 10000.
+    #[serde(default = "default_auto_degrade_after_ms")]
+    pub auto_degrade_after_ms: u64,
 }
 
 /// Verifier connection parameters.
@@ -337,7 +399,12 @@ fn default_max_template_age_ms() -> u64 {
     30_000
 }
 fn default_prevhash_verdict_timeout_ms() -> u64 {
-    50
+    // Mainnet-safe default. 50ms was regtest-only and would cause mass
+    // miner disconnection under real network latency. Regtest/dev configs
+    // explicitly override this to 50ms in dev/gateway.toml. The
+    // sub-1000ms regtest warning in validate_timing_chain still fires
+    // for any override below 1s. See lessons.md R-107.
+    2000
 }
 fn default_prevhash_stale_hold_ms() -> u64 {
     5000
@@ -386,6 +453,36 @@ fn default_noise_keypair_reload_sighup() -> bool {
 }
 fn default_wal_compaction_threshold() -> usize {
     1000
+}
+
+fn default_extranonce_prefix_len() -> usize {
+    4
+}
+fn default_extended_channels_enabled() -> bool {
+    true
+}
+
+fn default_vardiff_target_shares_per_min() -> f64 {
+    20.0
+}
+fn default_vardiff_retarget_interval_secs() -> u64 {
+    90
+}
+fn default_vardiff_min_difficulty() -> u64 {
+    1
+}
+fn default_vardiff_max_difficulty() -> u64 {
+    u64::MAX
+}
+fn default_vardiff_max_adjustment_factor() -> f64 {
+    4.0
+}
+
+fn default_auto_degrade() -> bool {
+    true
+}
+fn default_auto_degrade_after_ms() -> u64 {
+    10_000
 }
 
 fn default_gateway_instance_id() -> String {
@@ -584,6 +681,22 @@ pub fn validate(config: &GatewayConfig) -> Result<Vec<String>, String> {
     validate_timing_chain(config, &mut warnings)?;
     validate_verifier_security(config, &mut warnings)?;
 
+    // Degradation threshold must exceed heartbeat interval, otherwise
+    // the gateway will enter degraded mode between heartbeats and never
+    // recover because no ack can arrive in time.
+    if config.gateway.auto_degrade
+        && config.mode.enforces_verdicts()
+        && config.gateway.auto_degrade_after_ms < config.verifier.heartbeat_interval_ms
+    {
+        warnings.push(format!(
+            "auto_degrade_after_ms ({}) is below \
+             heartbeat_interval_ms ({}); the gateway will enter \
+             permanent degradation because no heartbeat ack can \
+             arrive within the threshold",
+            config.gateway.auto_degrade_after_ms, config.verifier.heartbeat_interval_ms,
+        ));
+    }
+
     Ok(warnings)
 }
 
@@ -621,12 +734,22 @@ mod tests {
                 job_retention_ms: default_job_retention_ms(),
                 channel_target_hex: None,
                 max_shares_per_second_per_channel: 0,
+                extranonce_prefix_len: default_extranonce_prefix_len(),
+                extended_channels_enabled: default_extended_channels_enabled(),
+                vardiff_enabled: false,
+                vardiff_target_shares_per_min: default_vardiff_target_shares_per_min(),
+                vardiff_retarget_interval_secs: default_vardiff_retarget_interval_secs(),
+                vardiff_min_difficulty: default_vardiff_min_difficulty(),
+                vardiff_max_difficulty: default_vardiff_max_difficulty(),
+                vardiff_max_adjustment_factor: default_vardiff_max_adjustment_factor(),
                 noise_keypair_reload_sighup: default_noise_keypair_reload_sighup(),
                 noise_keypair_poll_interval_secs: 0,
                 wal_path: String::new(),
                 wal_compaction_threshold: default_wal_compaction_threshold(),
                 gateway_instance_id: "test-gateway".to_string(),
                 template_url: String::new(),
+                auto_degrade: default_auto_degrade(),
+                auto_degrade_after_ms: default_auto_degrade_after_ms(),
             },
             verifier: VerifierSection {
                 addr: "127.0.0.1:9100".to_string(),
@@ -896,8 +1019,10 @@ mod tests {
 
     #[test]
     fn validate_warns_on_low_prevhash_verdict_timeout() {
-        let config = minimal_config(GatewayMode::Observe);
-        // Default is 50ms which is < 1000, so warning expected.
+        let mut config = minimal_config(GatewayMode::Observe);
+        // Explicitly set a regtest-grade value (<1000ms) to exercise the warning.
+        // Default is mainnet-safe (2000ms) and must NOT trigger this warning.
+        config.gateway.prevhash_verdict_timeout_ms = 50;
         let result = validate(&config);
         assert!(result.is_ok());
         let warnings = result.unwrap();
@@ -906,6 +1031,24 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("prevhash_verdict_timeout_ms=50")),
             "expected regtest warning, got: {warnings:?}",
+        );
+    }
+
+    #[test]
+    fn default_prevhash_verdict_timeout_is_mainnet_safe() {
+        // Guard against accidental regression to the regtest-only 50ms default.
+        // The sub-1000ms regtest warning must NOT fire for shipped defaults.
+        let config = minimal_config(GatewayMode::Observe);
+        assert!(
+            config.gateway.prevhash_verdict_timeout_ms >= 1000,
+            "default prevhash_verdict_timeout_ms must be >= 1000ms for mainnet \
+             safety; got {}",
+            config.gateway.prevhash_verdict_timeout_ms,
+        );
+        let warnings = validate(&config).expect("defaults must validate");
+        assert!(
+            !warnings.iter().any(|w| w.contains("regtest-appropriate")),
+            "default config must not trigger the regtest warning: {warnings:?}",
         );
     }
 
@@ -919,6 +1062,53 @@ mod tests {
         assert!(
             !warnings.iter().any(|w| w.contains("regtest")),
             "unexpected regtest warning: {warnings:?}",
+        );
+    }
+
+    #[test]
+    fn auto_degrade_defaults() {
+        let config = minimal_config(GatewayMode::Inline);
+        assert!(config.gateway.auto_degrade);
+        assert_eq!(config.gateway.auto_degrade_after_ms, 10_000);
+    }
+
+    #[test]
+    fn auto_degrade_only_effective_for_inline() {
+        let inline = minimal_config(GatewayMode::Inline);
+        let observe = minimal_config(GatewayMode::Observe);
+        let shadow = minimal_config(GatewayMode::Shadow);
+        assert!(inline.gateway.auto_degrade && inline.mode.enforces_verdicts());
+        assert!(!observe.mode.enforces_verdicts());
+        assert!(!shadow.mode.enforces_verdicts());
+    }
+
+    #[test]
+    fn validate_warns_degrade_below_heartbeat() {
+        let mut config = minimal_config(GatewayMode::Inline);
+        config.gateway.prevhash_verdict_timeout_ms = 2000;
+        config.gateway.auto_degrade_after_ms = 2000;
+        config.verifier.heartbeat_interval_ms = 5000;
+        let result = validate(&config);
+        assert!(result.is_ok());
+        let warnings = result.unwrap();
+        assert!(
+            warnings.iter().any(|w| w.contains("auto_degrade_after_ms")),
+            "expected degradation threshold warning, got: {warnings:?}",
+        );
+    }
+
+    #[test]
+    fn validate_no_degrade_warning_when_threshold_sufficient() {
+        let mut config = minimal_config(GatewayMode::Inline);
+        config.gateway.prevhash_verdict_timeout_ms = 2000;
+        config.gateway.auto_degrade_after_ms = 10_000;
+        config.verifier.heartbeat_interval_ms = 5000;
+        let result = validate(&config);
+        assert!(result.is_ok());
+        let warnings = result.unwrap();
+        assert!(
+            !warnings.iter().any(|w| w.contains("auto_degrade_after_ms")),
+            "unexpected degradation warning: {warnings:?}",
         );
     }
 }

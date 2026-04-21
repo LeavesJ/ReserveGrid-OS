@@ -24,26 +24,29 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, info, warn};
 
 use crate::channels::{
-    ChannelIdAllocator, ConnectionChannels, ExtranonceAllocator, SharedChannelRegistry,
-    snapshot_from_open,
+    ChannelIdAllocator, ChannelKind, ConnectionChannels, ExtranonceAllocator,
+    SharedChannelRegistry, snapshot_from_open,
 };
 use crate::connection::{DisconnectEvent, PeerState};
 use crate::jobs::JobTable;
 use crate::shares::{
     self, ShareAcceptedEvent, ShareDedupSet, ShareSubmission, check_ntime_bounds,
-    check_version_bits, compute_event_id, compute_gateway_signature, compute_share_id,
-    current_unix_timestamp, header_identity_bytes, unix_ms_now, validate_share_pow,
+    check_version_bits, compute_event_id, compute_share_id, current_unix_timestamp,
+    header_identity_bytes, sign_submission, unix_ms_now, validate_share_pow,
 };
 use crate::sv2_codec::{
     self, MESSAGE_TYPE_CLOSE_CHANNEL, MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH,
-    MESSAGE_TYPE_NEW_MINING_JOB, MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
+    MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB, MESSAGE_TYPE_NEW_MINING_JOB,
+    MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL, MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
     MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR, MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL,
     MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS, MESSAGE_TYPE_SET_TARGET,
     MESSAGE_TYPE_SETUP_CONNECTION, MESSAGE_TYPE_SETUP_CONNECTION_ERROR,
     MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS, MESSAGE_TYPE_SUBMIT_SHARES_ERROR,
-    MESSAGE_TYPE_SUBMIT_SHARES_STANDARD, MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS,
+    MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED, MESSAGE_TYPE_SUBMIT_SHARES_STANDARD,
+    MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS,
 };
 use crate::transport::{Sv2FrameHeader, Sv2Transport};
+use prometheus_client::metrics::counter::Counter;
 
 // ─────────────────────────────────────────────────────────────────────
 // Job broadcast payload
@@ -146,7 +149,26 @@ pub struct HandlerConfig {
     /// Gateway instance identifier embedded in share submissions.
     pub gateway_instance_id: String,
     /// HMAC secret bytes for signing share event IDs. Empty disables signing.
-    pub share_hmac_secret: Vec<u8>,
+    /// Behind `RwLock` to support SIGHUP-triggered rotation without restart.
+    pub share_hmac_secret: Arc<std::sync::RwLock<Vec<u8>>>,
+    /// Whether extended mining channels are accepted. When false, extended
+    /// channel open requests are rejected with `CloseChannel`.
+    pub extended_channels_enabled: bool,
+    /// Extranonce prefix length in bytes (from config). Used for computing
+    /// total `extranonce_size` in extended channel negotiation.
+    pub extranonce_prefix_len: usize,
+    /// Enable variable difficulty adjustment per channel.
+    pub vardiff_enabled: bool,
+    /// Target shares per minute per channel (vardiff).
+    pub vardiff_target_shares_per_min: f64,
+    /// Retarget evaluation interval (vardiff).
+    pub vardiff_retarget_interval: Duration,
+    /// Minimum difficulty floor (vardiff).
+    pub vardiff_min_difficulty: u64,
+    /// Maximum difficulty ceiling (vardiff).
+    pub vardiff_max_difficulty: u64,
+    /// Maximum multiplicative adjustment factor per retarget (vardiff).
+    pub vardiff_max_adjustment_factor: f64,
 }
 
 /// All resources needed to run a single connection handler.
@@ -164,6 +186,8 @@ pub struct ConnectionContext {
     pub shutdown: watch::Receiver<bool>,
     pub permit: tokio::sync::OwnedSemaphorePermit,
     pub channel_registry: SharedChannelRegistry,
+    pub vardiff_retarget_up: Counter,
+    pub vardiff_retarget_down: Counter,
 }
 
 /// Run the full SV2 session lifecycle for one connection.
@@ -186,6 +210,8 @@ pub async fn run_connection(ctx: ConnectionContext) -> HandlerExit {
         mut shutdown,
         permit: _permit,
         channel_registry,
+        vardiff_retarget_up,
+        vardiff_retarget_down,
     } = ctx;
     let peer_state = PeerState::new(peer);
     let mut share_dedup = ShareDedupSet::new(config.share_dedup_window_size);
@@ -205,6 +231,8 @@ pub async fn run_connection(ctx: ConnectionContext) -> HandlerExit {
         &mut shutdown,
         &mut share_dedup,
         &channel_registry,
+        &vardiff_retarget_up,
+        &vardiff_retarget_down,
     )
     .await;
 
@@ -242,6 +270,8 @@ async fn run_connection_inner(
     shutdown: &mut watch::Receiver<bool>,
     share_dedup: &mut ShareDedupSet,
     channel_registry: &SharedChannelRegistry,
+    vardiff_retarget_up: &Counter,
+    vardiff_retarget_down: &Counter,
 ) -> (HandlerExit, Vec<u32>) {
     let mut opened_ids: Vec<u32> = Vec::new();
 
@@ -322,6 +352,8 @@ async fn run_connection_inner(
                             channel_registry,
                             peer,
                             &mut opened_ids,
+                            vardiff_retarget_up,
+                            vardiff_retarget_down,
                         ).await;
                         match action {
                             FrameAction::Continue => {}
@@ -495,23 +527,24 @@ async fn wait_for_channel_open(
                 return Ok(());
             }
             MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL => {
-                // Extended channels not supported in V1.0.0. Close connection.
-                let close = sv2_codec::CloseChannel {
-                    channel_id: 0,
-                    reason_code: GatewayReason::ExtendedChannelUnsupported
-                        .as_str()
-                        .to_string(),
-                };
-                if let Ok(close_payload) = close.encode()
-                    && let Err(e) = transport
-                        .write_frame(0x8000, MESSAGE_TYPE_CLOSE_CHANNEL, &close_payload)
-                        .await
-                {
-                    debug!(error = %e, "best-effort CloseChannel write failed");
+                if !config.extended_channels_enabled {
+                    return Err(reject_extended_channel_err(transport).await);
                 }
-                return Err(HandlerExit::SetupRejected(
-                    "extended channels not supported".to_string(),
-                ));
+                handle_open_extended_channel(
+                    transport,
+                    peer_state,
+                    channels,
+                    channel_id_alloc,
+                    extranonce_alloc,
+                    config,
+                    latest_job,
+                    &payload,
+                    channel_registry,
+                    peer,
+                    opened_ids,
+                )
+                .await?;
+                return Ok(());
             }
             other => {
                 debug!(
@@ -601,6 +634,9 @@ async fn handle_open_standard_channel(
         ));
     };
 
+    // Clone extranonce before moving into channel state (Vec is not Copy).
+    let extranonce_for_reply = extranonce.clone();
+
     // Register in connection channels.
     if let Err(reason) = channels.open_channel(
         channel_id,
@@ -631,6 +667,21 @@ async fn handle_open_standard_channel(
         )));
     }
 
+    // Initialize vardiff state if enabled.
+    if config.vardiff_enabled
+        && let Some(ch) = channels.get_mut(channel_id)
+    {
+        let initial_diff = shares::target_to_difficulty_u64(&config.channel_target);
+        ch.vardiff = Some(crate::channels::VardiffState::new(
+            initial_diff,
+            config.vardiff_target_shares_per_min,
+            config.vardiff_retarget_interval,
+            config.vardiff_min_difficulty,
+            config.vardiff_max_difficulty,
+            config.vardiff_max_adjustment_factor,
+        ));
+    }
+
     // Register in global channel registry for HTTP /channels API.
     channel_registry
         .register(snapshot_from_open(
@@ -653,7 +704,7 @@ async fn handle_open_standard_channel(
         request_id: open_req.request_id,
         channel_id,
         target: config.channel_target,
-        extranonce_prefix: extranonce.to_vec(),
+        extranonce_prefix: extranonce_for_reply.clone(),
         group_channel_id: 0,
     };
     let success_payload = success.encode().map_err(HandlerExit::CodecError)?;
@@ -682,7 +733,7 @@ async fn handle_open_standard_channel(
         // Compute per-channel merkle root using this channel's extranonce.
         let merkle_root = crate::jobs::compute_merkle_root(
             &job.coinbase_tx_prefix,
-            &extranonce,
+            &extranonce_for_reply,
             &job.coinbase_tx_suffix,
             &job.merkle_path,
         );
@@ -734,6 +785,267 @@ async fn handle_open_standard_channel(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+async fn handle_open_extended_channel(
+    transport: &mut Sv2Transport,
+    peer_state: &PeerState,
+    channels: &mut ConnectionChannels,
+    channel_id_alloc: &ChannelIdAllocator,
+    extranonce_alloc: &ExtranonceAllocator,
+    config: &HandlerConfig,
+    latest_job: &Arc<tokio::sync::RwLock<Option<Arc<JobBroadcast>>>>,
+    payload: &[u8],
+    channel_registry: &SharedChannelRegistry,
+    peer: SocketAddr,
+    opened_ids: &mut Vec<u32>,
+) -> Result<(), HandlerExit> {
+    let open_req = match sv2_codec::OpenExtendedMiningChannel::decode(payload) {
+        Ok(r) => r,
+        Err(e) => {
+            let err = sv2_codec::OpenMiningChannelError {
+                request_id: 0,
+                error_code: "unsupported-protocol".to_string(),
+            };
+            if let Ok(err_payload) = err.encode()
+                && let Err(we) = transport
+                    .write_frame(0x0000, MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR, &err_payload)
+                    .await
+            {
+                debug!(
+                    error = %we,
+                    "best-effort OpenMiningChannel.Error write failed",
+                );
+            }
+            return Err(HandlerExit::CodecError(e));
+        }
+    };
+
+    // Validate min_extranonce_size: must be 2..=8.
+    if open_req.min_extranonce_size < 2 || open_req.min_extranonce_size > 8 {
+        warn!(
+            peer = %peer_state.peer_addr,
+            min_extranonce_size = open_req.min_extranonce_size,
+            "invalid min_extranonce_size; rejecting extended channel",
+        );
+        let err = sv2_codec::OpenMiningChannelError {
+            request_id: open_req.request_id,
+            error_code: "max-target-out-of-range".to_string(),
+        };
+        if let Ok(err_payload) = err.encode()
+            && let Err(e) = transport
+                .write_frame(0x0000, MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR, &err_payload)
+                .await
+        {
+            debug!(error = %e, "best-effort error write failed");
+        }
+        return Err(HandlerExit::SetupRejected(
+            "min_extranonce_size out of range".to_string(),
+        ));
+    }
+
+    // Allocate channel ID.
+    let Some(channel_id) = channel_id_alloc.allocate() else {
+        warn!(
+            peer = %peer_state.peer_addr,
+            "channel_id allocation exhausted; rejecting extended channel",
+        );
+        let err = sv2_codec::OpenMiningChannelError {
+            request_id: open_req.request_id,
+            error_code: "max-target-out-of-range".to_string(),
+        };
+        if let Ok(err_payload) = err.encode()
+            && let Err(e) = transport
+                .write_frame(0x0000, MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR, &err_payload)
+                .await
+        {
+            debug!(error = %e, "best-effort error write failed");
+        }
+        return Err(HandlerExit::SetupRejected(
+            "channel_id allocator exhausted".to_string(),
+        ));
+    };
+
+    // Allocate extranonce prefix.
+    let Some(extranonce_prefix) = extranonce_alloc.allocate() else {
+        warn!(
+            peer = %peer_state.peer_addr,
+            "extranonce allocation exhausted; rejecting extended channel",
+        );
+        let err = sv2_codec::OpenMiningChannelError {
+            request_id: open_req.request_id,
+            error_code: "max-target-out-of-range".to_string(),
+        };
+        if let Ok(err_payload) = err.encode()
+            && let Err(e) = transport
+                .write_frame(0x0000, MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR, &err_payload)
+                .await
+        {
+            debug!(error = %e, "best-effort error write failed");
+        }
+        return Err(HandlerExit::SetupRejected(
+            "extranonce allocator exhausted".to_string(),
+        ));
+    };
+
+    // Compute extranonce_size: pool prefix + miner portion.
+    // Miner portion is at least min_extranonce_size, floored at 4.
+    let prefix_len = config.extranonce_prefix_len;
+    let miner_portion = usize::from(open_req.min_extranonce_size).max(4);
+    let extranonce_size_usize = prefix_len + miner_portion;
+    // SV2 extranonce_size is u16.
+    #[allow(clippy::cast_possible_truncation)]
+    let extranonce_size = extranonce_size_usize as u16;
+
+    // Clone prefix for the success reply before moving into channel state.
+    let prefix_for_reply = extranonce_prefix.clone();
+
+    // Register in connection channels.
+    if let Err(reason) = channels.open_extended_channel(
+        channel_id,
+        extranonce_prefix,
+        open_req.user_identity.clone(),
+        None,
+        config.channel_target,
+        config.max_shares_per_second_per_channel,
+        open_req.min_extranonce_size,
+        extranonce_size,
+    ) {
+        warn!(
+            peer = %peer_state.peer_addr,
+            reason = %reason,
+            "channel registration failed; rejecting extended channel",
+        );
+        let err = sv2_codec::OpenMiningChannelError {
+            request_id: open_req.request_id,
+            error_code: "max-target-out-of-range".to_string(),
+        };
+        if let Ok(err_payload) = err.encode()
+            && let Err(e) = transport
+                .write_frame(0x0000, MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR, &err_payload)
+                .await
+        {
+            debug!(error = %e, "best-effort error write failed");
+        }
+        return Err(HandlerExit::SetupRejected(format!(
+            "channel registration failed: {reason}"
+        )));
+    }
+
+    // Initialize vardiff state if enabled.
+    if config.vardiff_enabled
+        && let Some(ch) = channels.get_mut(channel_id)
+    {
+        let initial_diff = shares::target_to_difficulty_u64(&config.channel_target);
+        ch.vardiff = Some(crate::channels::VardiffState::new(
+            initial_diff,
+            config.vardiff_target_shares_per_min,
+            config.vardiff_retarget_interval,
+            config.vardiff_min_difficulty,
+            config.vardiff_max_difficulty,
+            config.vardiff_max_adjustment_factor,
+        ));
+    }
+
+    // Register in global channel registry for HTTP /channels API.
+    channel_registry
+        .register(snapshot_from_open(
+            channel_id,
+            &open_req.user_identity,
+            peer,
+        ))
+        .await;
+    opened_ids.push(channel_id);
+
+    debug!(
+        peer = %peer_state.peer_addr,
+        channel_id,
+        worker = %open_req.user_identity,
+        extranonce_size,
+        "extended mining channel opened",
+    );
+
+    // Send OpenExtendedMiningChannel.Success.
+    let success = sv2_codec::OpenExtendedMiningChannelSuccess {
+        request_id: open_req.request_id,
+        channel_id,
+        target: config.channel_target,
+        extranonce_size,
+        extranonce_prefix: prefix_for_reply,
+    };
+    let success_payload = success.encode().map_err(HandlerExit::CodecError)?;
+    transport
+        .write_frame(
+            0x0000,
+            MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
+            &success_payload,
+        )
+        .await
+        .map_err(HandlerExit::TransportError)?;
+
+    // Send SetTarget for this channel.
+    let set_target = sv2_codec::SetTarget {
+        channel_id,
+        maximum_target: config.channel_target,
+    };
+    let target_payload = set_target.encode().map_err(HandlerExit::CodecError)?;
+    transport
+        .write_frame(0x8000, MESSAGE_TYPE_SET_TARGET, &target_payload)
+        .await
+        .map_err(HandlerExit::TransportError)?;
+
+    // Send initial NewExtendedMiningJob if one is available.
+    if let Some(ref job) = *latest_job.read().await {
+        let ext_job = sv2_codec::NewExtendedMiningJob {
+            channel_id,
+            job_id: job.job_id,
+            min_ntime: job.min_ntime,
+            version: job.version,
+            version_rolling_allowed: true,
+            merkle_path: job.merkle_path.clone(),
+            coinbase_tx_prefix: job.coinbase_tx_prefix.clone(),
+            coinbase_tx_suffix: job.coinbase_tx_suffix.clone(),
+        };
+        let job_payload = ext_job.encode().map_err(HandlerExit::CodecError)?;
+        transport
+            .write_frame(0x8000, MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB, &job_payload)
+            .await
+            .map_err(HandlerExit::TransportError)?;
+
+        // Send SetNewPrevHash if this job carries one.
+        if let Some(ref ph) = job.prevhash_update {
+            let set_prev = sv2_codec::SetNewPrevHash {
+                channel_id,
+                job_id: job.job_id,
+                prev_hash: ph.prev_hash,
+                min_ntime: ph.min_ntime,
+                nbits: ph.nbits,
+            };
+            let ph_payload = set_prev.encode().map_err(HandlerExit::CodecError)?;
+            transport
+                .write_frame(0x8000, MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH, &ph_payload)
+                .await
+                .map_err(HandlerExit::TransportError)?;
+
+            if let Some(ch) = channels.get_mut(channel_id) {
+                ch.record_prevhash_sent(job.job_id, ph.min_ntime);
+            }
+        }
+
+        if let Some(ch) = channels.get_mut(channel_id) {
+            ch.record_active_job_sent(job.job_id);
+        }
+
+        info!(
+            peer = %peer_state.peer_addr,
+            channel_id,
+            job_id = job.job_id,
+            "sent initial NewExtendedMiningJob on channel open",
+        );
+    }
+
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Stage 3: Steady-state miner frame dispatch
 // ─────────────────────────────────────────────────────────────────────
@@ -743,9 +1055,15 @@ enum FrameAction {
     Disconnect(HandlerExit),
 }
 
-/// Reject an extended mining channel open request. Extended channels are not
-/// supported; send a best-effort `CloseChannel` and disconnect.
-async fn reject_extended_channel(transport: &mut Sv2Transport) -> FrameAction {
+/// Send a best-effort `CloseChannel` rejection for an extended channel
+/// request. Returns `FrameAction::Disconnect` for steady-state dispatch.
+async fn reject_extended_channel_action(transport: &mut Sv2Transport) -> FrameAction {
+    FrameAction::Disconnect(reject_extended_channel_err(transport).await)
+}
+
+/// Send a best-effort `CloseChannel` rejection for an extended channel
+/// request. Returns a `HandlerExit` for the setup phase.
+async fn reject_extended_channel_err(transport: &mut Sv2Transport) -> HandlerExit {
     let close = sv2_codec::CloseChannel {
         channel_id: 0,
         reason_code: GatewayReason::ExtendedChannelUnsupported
@@ -759,9 +1077,7 @@ async fn reject_extended_channel(transport: &mut Sv2Transport) -> FrameAction {
     {
         debug!(error = %e, "best-effort CloseChannel write failed");
     }
-    FrameAction::Disconnect(HandlerExit::SetupRejected(
-        "extended channels not supported".to_string(),
-    ))
+    HandlerExit::SetupRejected("extended channels not supported".to_string())
 }
 
 /// Handle a miner-initiated `CloseChannel`. Unregisters the channel and
@@ -802,7 +1118,7 @@ async fn handle_close_channel(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn handle_miner_frame(
     transport: &mut Sv2Transport,
     peer_state: &PeerState,
@@ -820,6 +1136,8 @@ async fn handle_miner_frame(
     channel_registry: &SharedChannelRegistry,
     peer: SocketAddr,
     opened_ids: &mut Vec<u32>,
+    vardiff_retarget_up: &Counter,
+    vardiff_retarget_down: &Counter,
 ) -> FrameAction {
     // Reject non-base-protocol extension types.
     if header.extension_type & 0x7FFF != 0 {
@@ -846,6 +1164,28 @@ async fn handle_miner_frame(
                 share_event_tx,
                 share_forward_tx,
                 payload,
+                vardiff_retarget_up,
+                vardiff_retarget_down,
+            )
+            .await
+            {
+                Ok(()) => FrameAction::Continue,
+                Err(exit) => FrameAction::Disconnect(exit),
+            }
+        }
+        MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED => {
+            match handle_submit_shares_extended(
+                transport,
+                peer_state,
+                channels,
+                config,
+                job_table,
+                share_dedup,
+                share_event_tx,
+                share_forward_tx,
+                payload,
+                vardiff_retarget_up,
+                vardiff_retarget_down,
             )
             .await
             {
@@ -874,7 +1214,29 @@ async fn handle_miner_frame(
                 Err(exit) => FrameAction::Disconnect(exit),
             }
         }
-        MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL => reject_extended_channel(transport).await,
+        MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL => {
+            if !config.extended_channels_enabled {
+                return reject_extended_channel_action(transport).await;
+            }
+            match handle_open_extended_channel(
+                transport,
+                peer_state,
+                channels,
+                channel_id_alloc,
+                extranonce_alloc,
+                config,
+                latest_job,
+                payload,
+                channel_registry,
+                peer,
+                opened_ids,
+            )
+            .await
+            {
+                Ok(()) => FrameAction::Continue,
+                Err(exit) => FrameAction::Disconnect(exit),
+            }
+        }
         MESSAGE_TYPE_CLOSE_CHANNEL => {
             handle_close_channel(peer_state, channels, channel_registry, payload).await
         }
@@ -908,6 +1270,8 @@ async fn handle_submit_shares(
     share_event_tx: &mpsc::Sender<ShareAcceptedEvent>,
     share_forward_tx: &mpsc::Sender<ShareSubmission>,
     payload: &[u8],
+    vardiff_retarget_up: &Counter,
+    vardiff_retarget_down: &Counter,
 ) -> Result<(), HandlerExit> {
     let share = match sv2_codec::SubmitSharesStandard::decode(payload) {
         Ok(s) => s,
@@ -998,7 +1362,7 @@ async fn handle_submit_shares(
 
     // Snapshot channel state before releasing the borrow.
     let channel_target = channel.maximum_target;
-    let channel_extranonce = channel.extranonce_prefix;
+    let channel_extranonce = channel.extranonce_prefix.clone();
     let activation_min_ntime = channel.activation_min_ntime;
     let elapsed_secs = channel.elapsed_since_prevhash_secs();
     let worker_id = channel.worker_id.clone();
@@ -1244,7 +1608,7 @@ async fn handle_submit_shares(
     let mut merkle_root_display = merkle_root;
     merkle_root_display.reverse();
 
-    let submission = ShareSubmission {
+    let mut submission = ShareSubmission {
         share_id_hex: share_id_hex.clone(),
         version: share.version,
         prev_hash_wire_hex: hex::encode(prev_hash_wire),
@@ -1268,14 +1632,15 @@ async fn handle_submit_shares(
         difficulty_u64: difficulty,
         difficulty_display: difficulty as f64,
         source_instance_id: job_source_instance_id,
-        gateway_signature_hex: if config.share_hmac_secret.is_empty() {
-            String::new()
-        } else {
-            compute_gateway_signature(&config.share_hmac_secret, &event_id)
-                .map(hex::encode)
-                .unwrap_or_default()
-        },
+        gateway_signature_hex: String::new(),
     };
+    {
+        let secret = config.share_hmac_secret.read().unwrap_or_else(|e| {
+            warn!("share_hmac_secret lock poisoned, signing disabled: {e}");
+            e.into_inner()
+        });
+        sign_submission(&secret, &mut submission);
+    }
     if let Err(e) = share_forward_tx.try_send(submission) {
         warn!(error = %e, "share_forward_tx full; share submission dropped");
     }
@@ -1291,6 +1656,16 @@ async fn handle_submit_shares(
         .write_frame(0x8000, MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS, &success_payload)
         .await
         .map_err(HandlerExit::TransportError)?;
+
+    // Vardiff retarget check.
+    maybe_retarget(
+        transport,
+        channels,
+        share.channel_id,
+        vardiff_retarget_up,
+        vardiff_retarget_down,
+    )
+    .await?;
 
     Ok(())
 }
@@ -1315,6 +1690,514 @@ async fn send_share_error(
     Ok(())
 }
 
+/// Handle `SubmitSharesExtended` (0x1b). Extended shares include a
+/// miner-provided extranonce that is concatenated with the channel's
+/// pool-assigned prefix to form the full extranonce for coinbase assembly.
+/// The rest of the validation pipeline is identical to standard shares.
+#[allow(
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    clippy::cast_precision_loss
+)]
+async fn handle_submit_shares_extended(
+    transport: &mut Sv2Transport,
+    peer_state: &PeerState,
+    channels: &mut ConnectionChannels,
+    config: &HandlerConfig,
+    job_table: &Arc<tokio::sync::RwLock<JobTable>>,
+    share_dedup: &mut ShareDedupSet,
+    share_event_tx: &mpsc::Sender<ShareAcceptedEvent>,
+    share_forward_tx: &mpsc::Sender<ShareSubmission>,
+    payload: &[u8],
+    vardiff_retarget_up: &Counter,
+    vardiff_retarget_down: &Counter,
+) -> Result<(), HandlerExit> {
+    let share = match sv2_codec::SubmitSharesExtended::decode(payload) {
+        Ok(s) => s,
+        Err(e) => {
+            let err = sv2_codec::SubmitSharesError {
+                channel_id: 0,
+                sequence_number: 0,
+                error_code: GatewayReason::FrameDecodeError
+                    .to_sv2_error_code()
+                    .to_string(),
+            };
+            if let Ok(err_payload) = err.encode()
+                && let Err(we) = transport
+                    .write_frame(0x8000, MESSAGE_TYPE_SUBMIT_SHARES_ERROR, &err_payload)
+                    .await
+            {
+                debug!(
+                    error = %we,
+                    "best-effort SubmitShares.Error write failed",
+                );
+            }
+            return Err(HandlerExit::CodecError(e));
+        }
+    };
+
+    // ── Step 0: Validate channel exists ──
+    let Some(_channel) = channels.get(share.channel_id) else {
+        let evt = ShareAcceptedEvent::sentinel(
+            &GatewayReason::InvalidChannelId,
+            share.channel_id,
+            share.sequence_number,
+            share.job_id,
+        );
+        if let Err(e) = share_event_tx.try_send(evt) {
+            warn!(error = %e, "share_event_tx full; share event dropped");
+        }
+        return send_share_error(
+            transport,
+            share.channel_id,
+            share.sequence_number,
+            GatewayReason::InvalidChannelId,
+        )
+        .await;
+    };
+
+    // ── Step 0.5: Per-channel share rate limit ──
+    if let Some(ch) = channels.get_mut(share.channel_id)
+        && !ch.rate_limiter.try_acquire()
+    {
+        warn!(
+            peer = %peer_state.peer_addr,
+            channel_id = share.channel_id,
+            "share rejected: per-channel rate limit exceeded",
+        );
+        let evt = ShareAcceptedEvent::sentinel(
+            &GatewayReason::ShareRateLimited,
+            share.channel_id,
+            share.sequence_number,
+            share.job_id,
+        );
+        if let Err(e) = share_event_tx.try_send(evt) {
+            warn!(error = %e, "share_event_tx full; share event dropped");
+        }
+        return send_share_error(
+            transport,
+            share.channel_id,
+            share.sequence_number,
+            GatewayReason::ShareRateLimited,
+        )
+        .await;
+    }
+
+    // Re-acquire immutable borrow.
+    let Some(channel) = channels.get(share.channel_id) else {
+        return send_share_error(
+            transport,
+            share.channel_id,
+            share.sequence_number,
+            GatewayReason::InvalidChannelId,
+        )
+        .await;
+    };
+
+    // ── Step 0.75: Validate channel is extended and extranonce length ──
+    let expected_miner_en_len = match channel.kind {
+        ChannelKind::Extended {
+            extranonce_size, ..
+        } => usize::from(extranonce_size) - channel.extranonce_prefix.len(),
+        ChannelKind::Standard => {
+            warn!(
+                peer = %peer_state.peer_addr,
+                channel_id = share.channel_id,
+                "SubmitSharesExtended on standard channel; rejecting",
+            );
+            return send_share_error(
+                transport,
+                share.channel_id,
+                share.sequence_number,
+                GatewayReason::InvalidChannelId,
+            )
+            .await;
+        }
+    };
+
+    if share.extranonce.len() != expected_miner_en_len {
+        warn!(
+            peer = %peer_state.peer_addr,
+            channel_id = share.channel_id,
+            got = share.extranonce.len(),
+            expected = expected_miner_en_len,
+            "extranonce length mismatch; rejecting share",
+        );
+        return send_share_error(
+            transport,
+            share.channel_id,
+            share.sequence_number,
+            GatewayReason::ShareInvalidNonce,
+        )
+        .await;
+    }
+
+    // Construct full extranonce: pool_prefix || miner_extranonce.
+    let mut full_extranonce = channel.extranonce_prefix.clone();
+    full_extranonce.extend_from_slice(&share.extranonce);
+
+    // Snapshot channel state.
+    let channel_target = channel.maximum_target;
+    let activation_min_ntime = channel.activation_min_ntime;
+    let elapsed_secs = channel.elapsed_since_prevhash_secs();
+    let worker_id = channel.worker_id.clone();
+
+    // ── Step 1: Validate job_id ──
+    let table = job_table.read().await;
+    let Some(job) = table.get(share.job_id) else {
+        drop(table);
+        let evt = ShareAcceptedEvent::sentinel(
+            &GatewayReason::ShareInvalidJobId,
+            share.channel_id,
+            share.sequence_number,
+            share.job_id,
+        );
+        if let Err(e) = share_event_tx.try_send(evt) {
+            warn!(error = %e, "share_event_tx full; share event dropped");
+        }
+        return send_share_error(
+            transport,
+            share.channel_id,
+            share.sequence_number,
+            GatewayReason::ShareInvalidJobId,
+        )
+        .await;
+    };
+
+    let job_version = job.version;
+    let job_prev_hash = job.prev_hash;
+    let job_nbits = job.nbits;
+    let job_activation_min_ntime = job.activation_min_ntime;
+    let job_block_height = job.block_height;
+    let job_coinbase_prefix = job.coinbase_tx_prefix.clone();
+    let job_coinbase_suffix = job.coinbase_tx_suffix.clone();
+    let job_merkle_path = job.merkle_path.clone();
+    let job_template_id = job.template_id;
+    let job_source_instance_id = job.source_instance_id.clone();
+    drop(table);
+
+    // ── Step 2: Validate version bits (BIP 320) ──
+    if !check_version_bits(share.version, job_version) {
+        warn!(
+            peer = %peer_state.peer_addr,
+            channel_id = share.channel_id,
+            share_version = share.version,
+            job_version,
+            "share rejected: version bit violation",
+        );
+        let evt = ShareAcceptedEvent::sentinel(
+            &GatewayReason::VersionBitViolation,
+            share.channel_id,
+            share.sequence_number,
+            share.job_id,
+        );
+        if let Err(e) = share_event_tx.try_send(evt) {
+            warn!(error = %e, "share_event_tx full; share event dropped");
+        }
+        return send_share_error(
+            transport,
+            share.channel_id,
+            share.sequence_number,
+            GatewayReason::VersionBitViolation,
+        )
+        .await;
+    }
+
+    // ── Step 3: Validate ntime bounds ──
+    let effective_min_ntime = activation_min_ntime.unwrap_or(job_activation_min_ntime);
+    let effective_elapsed = elapsed_secs.unwrap_or(0);
+    let now_unix = current_unix_timestamp();
+
+    if !check_ntime_bounds(
+        share.ntime,
+        effective_min_ntime,
+        effective_elapsed,
+        config.ntime_elapsed_slack_seconds,
+        config.max_future_block_time_seconds,
+        now_unix,
+    ) {
+        warn!(
+            peer = %peer_state.peer_addr,
+            channel_id = share.channel_id,
+            ntime = share.ntime,
+            "share rejected: ntime out of range",
+        );
+        let evt = ShareAcceptedEvent::sentinel(
+            &GatewayReason::NtimeOutOfRange,
+            share.channel_id,
+            share.sequence_number,
+            share.job_id,
+        );
+        if let Err(e) = share_event_tx.try_send(evt) {
+            warn!(error = %e, "share_event_tx full; share event dropped");
+        }
+        return send_share_error(
+            transport,
+            share.channel_id,
+            share.sequence_number,
+            GatewayReason::NtimeOutOfRange,
+        )
+        .await;
+    }
+
+    // ── Step 4: Build 80-byte header and validate PoW ──
+    // Extended shares use pool_prefix || miner_extranonce as the
+    // full extranonce in coinbase assembly.
+    let merkle_root = crate::jobs::compute_merkle_root(
+        &job_coinbase_prefix,
+        &full_extranonce,
+        &job_coinbase_suffix,
+        &job_merkle_path,
+    );
+
+    let header_bytes = header_identity_bytes(
+        share.version,
+        &job_prev_hash,
+        &merkle_root,
+        share.ntime,
+        job_nbits,
+        share.nonce,
+    );
+
+    if !validate_share_pow(&header_bytes, &channel_target) {
+        debug!(
+            peer = %peer_state.peer_addr,
+            channel_id = share.channel_id,
+            "share rejected: difficulty below target",
+        );
+        let sid = compute_share_id(&header_bytes);
+        let eid = compute_event_id(&sid, &worker_id, "full");
+        let evt = ShareAcceptedEvent {
+            event_type: "share_accepted",
+            share_id_hex: hex::encode(sid),
+            event_id_hex: hex::encode(eid),
+            sv2_response: "error",
+            reason_code: Some(
+                GatewayReason::ShareDifficultyBelowTarget
+                    .as_str()
+                    .to_string(),
+            ),
+            reason_detail: Some(GatewayReason::ShareDifficultyBelowTarget.to_string()),
+            worker_id: worker_id.clone(),
+            channel_id: share.channel_id,
+            sequence_number: share.sequence_number,
+            job_id: share.job_id,
+            block_height: job_block_height,
+            timestamp_ms: unix_ms_now(),
+            difficulty_u64: 0,
+        };
+        if let Err(e) = share_event_tx.try_send(evt) {
+            warn!(error = %e, "share_event_tx full; share event dropped");
+        }
+        return send_share_error(
+            transport,
+            share.channel_id,
+            share.sequence_number,
+            GatewayReason::ShareDifficultyBelowTarget,
+        )
+        .await;
+    }
+
+    // ── Step 5: Replay detection ──
+    let share_id = compute_share_id(&header_bytes);
+    if share_dedup.check_and_insert(&share_id) {
+        warn!(
+            peer = %peer_state.peer_addr,
+            channel_id = share.channel_id,
+            share_id_hex = hex::encode(share_id),
+            "share rejected: replay detected",
+        );
+        let eid = compute_event_id(&share_id, &worker_id, "full");
+        let evt = ShareAcceptedEvent {
+            event_type: "share_accepted",
+            share_id_hex: hex::encode(share_id),
+            event_id_hex: hex::encode(eid),
+            sv2_response: "error",
+            reason_code: Some(GatewayReason::ShareReplayDetected.as_str().to_string()),
+            reason_detail: Some(GatewayReason::ShareReplayDetected.to_string()),
+            worker_id: worker_id.clone(),
+            channel_id: share.channel_id,
+            sequence_number: share.sequence_number,
+            job_id: share.job_id,
+            block_height: job_block_height,
+            timestamp_ms: unix_ms_now(),
+            difficulty_u64: 0,
+        };
+        if let Err(e) = share_event_tx.try_send(evt) {
+            warn!(error = %e, "share_event_tx full; share event dropped");
+        }
+        return send_share_error(
+            transport,
+            share.channel_id,
+            share.sequence_number,
+            GatewayReason::ShareReplayDetected,
+        )
+        .await;
+    }
+
+    // ── Share accepted ──
+    peer_state.record_frame_decoded();
+
+    let difficulty = shares::target_to_difficulty_u64(&channel_target);
+    let share_id_hex = hex::encode(share_id);
+    let event_id = compute_event_id(&share_id, &worker_id, "full");
+    let event_id_hex = hex::encode(event_id);
+
+    debug!(
+        peer = %peer_state.peer_addr,
+        channel_id = share.channel_id,
+        job_id = share.job_id,
+        seq = share.sequence_number,
+        difficulty,
+        share_id_hex = %share_id_hex,
+        extranonce_hex = %hex::encode(&full_extranonce),
+        "extended share accepted",
+    );
+
+    let evt = ShareAcceptedEvent {
+        event_type: "share_accepted",
+        share_id_hex: share_id_hex.clone(),
+        event_id_hex: event_id_hex.clone(),
+        sv2_response: "success",
+        reason_code: None,
+        reason_detail: None,
+        worker_id: worker_id.clone(),
+        channel_id: share.channel_id,
+        sequence_number: share.sequence_number,
+        job_id: share.job_id,
+        block_height: job_block_height,
+        timestamp_ms: unix_ms_now(),
+        difficulty_u64: difficulty,
+    };
+    if let Err(e) = share_event_tx.try_send(evt) {
+        warn!(error = %e, "share_event_tx full; share event dropped");
+    }
+
+    // Enqueue for upstream relay.
+    let prev_hash_wire = job_prev_hash;
+    let mut prev_hash_display = job_prev_hash;
+    prev_hash_display.reverse();
+
+    let mut merkle_root_display = merkle_root;
+    merkle_root_display.reverse();
+
+    let mut submission = ShareSubmission {
+        share_id_hex: share_id_hex.clone(),
+        version: share.version,
+        prev_hash_wire_hex: hex::encode(prev_hash_wire),
+        prev_hash_display_hex: hex::encode(prev_hash_display),
+        merkle_root_wire_hex: hex::encode(merkle_root),
+        merkle_root_display_hex: hex::encode(merkle_root_display),
+        ntime: share.ntime,
+        nbits: job_nbits,
+        nonce: share.nonce,
+        event_id_hex,
+        worker_id,
+        validation_level: "full".to_string(),
+        gateway_instance_id: config.gateway_instance_id.clone(),
+        channel_id: share.channel_id,
+        sequence_number: share.sequence_number,
+        job_id: share.job_id,
+        template_id: job_template_id,
+        block_height: job_block_height,
+        pool_account_id: None,
+        timestamp_ms: unix_ms_now(),
+        difficulty_u64: difficulty,
+        difficulty_display: difficulty as f64,
+        source_instance_id: job_source_instance_id,
+        gateway_signature_hex: String::new(),
+    };
+    {
+        let secret = config.share_hmac_secret.read().unwrap_or_else(|e| {
+            warn!("share_hmac_secret lock poisoned, signing disabled: {e}");
+            e.into_inner()
+        });
+        sign_submission(&secret, &mut submission);
+    }
+    if let Err(e) = share_forward_tx.try_send(submission) {
+        warn!(
+            error = %e,
+            "share_forward_tx full; share submission dropped",
+        );
+    }
+
+    let success = sv2_codec::SubmitSharesSuccess {
+        channel_id: share.channel_id,
+        last_sequence_number: share.sequence_number,
+        new_submits_accepted_count: 1,
+        new_shares_sum: difficulty,
+    };
+    let success_payload = success.encode().map_err(HandlerExit::CodecError)?;
+    transport
+        .write_frame(0x8000, MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS, &success_payload)
+        .await
+        .map_err(HandlerExit::TransportError)?;
+
+    // Vardiff retarget check.
+    maybe_retarget(
+        transport,
+        channels,
+        share.channel_id,
+        vardiff_retarget_up,
+        vardiff_retarget_down,
+    )
+    .await?;
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Vardiff retarget
+// ─────────────────────────────────────────────────────────────────────
+
+/// Check whether the channel's vardiff state warrants a retarget. If the
+/// retarget interval has elapsed and the new difficulty differs, send a
+/// `SetTarget` message updating the channel's `maximum_target`.
+async fn maybe_retarget(
+    transport: &mut Sv2Transport,
+    channels: &mut ConnectionChannels,
+    channel_id: u32,
+    retarget_up: &Counter,
+    retarget_down: &Counter,
+) -> Result<(), HandlerExit> {
+    let Some(ch) = channels.get_mut(channel_id) else {
+        return Ok(());
+    };
+    let Some(ref mut vd) = ch.vardiff else {
+        return Ok(());
+    };
+    let old_diff = vd.current_difficulty;
+    if !vd.record_share() {
+        return Ok(());
+    }
+    let Some(new_diff) = vd.evaluate_retarget() else {
+        return Ok(());
+    };
+
+    let new_target = shares::difficulty_to_target(new_diff);
+    ch.maximum_target = new_target;
+
+    if new_diff > old_diff {
+        retarget_up.inc();
+    } else {
+        retarget_down.inc();
+    }
+
+    info!(channel_id, new_difficulty = new_diff, "vardiff retarget",);
+
+    let set_target = sv2_codec::SetTarget {
+        channel_id,
+        maximum_target: new_target,
+    };
+    let target_payload = set_target.encode().map_err(HandlerExit::CodecError)?;
+    transport
+        .write_frame(0x8000, MESSAGE_TYPE_SET_TARGET, &target_payload)
+        .await
+        .map_err(HandlerExit::TransportError)?;
+
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Job distribution
 // ─────────────────────────────────────────────────────────────────────
@@ -1325,27 +2208,50 @@ async fn distribute_job(
     job: &JobBroadcast,
 ) -> Result<(), HandlerExit> {
     for ch in channels.iter_open_mut() {
-        // Compute per-channel merkle root using the channel's unique extranonce.
-        let merkle_root = crate::jobs::compute_merkle_root(
-            &job.coinbase_tx_prefix,
-            &ch.extranonce_prefix,
-            &job.coinbase_tx_suffix,
-            &job.merkle_path,
-        );
-        let new_job = sv2_codec::NewMiningJob {
-            channel_id: ch.channel_id,
-            job_id: job.job_id,
-            min_ntime: job.min_ntime,
-            version: job.version,
-            merkle_root,
-        };
-        let job_payload = new_job.encode().map_err(HandlerExit::CodecError)?;
-        transport
-            .write_frame(0x8000, MESSAGE_TYPE_NEW_MINING_JOB, &job_payload)
-            .await
-            .map_err(HandlerExit::TransportError)?;
+        match ch.kind {
+            ChannelKind::Standard => {
+                // Standard: compute merkle root, send NewMiningJob.
+                let merkle_root = crate::jobs::compute_merkle_root(
+                    &job.coinbase_tx_prefix,
+                    &ch.extranonce_prefix,
+                    &job.coinbase_tx_suffix,
+                    &job.merkle_path,
+                );
+                let new_job = sv2_codec::NewMiningJob {
+                    channel_id: ch.channel_id,
+                    job_id: job.job_id,
+                    min_ntime: job.min_ntime,
+                    version: job.version,
+                    merkle_root,
+                };
+                let job_payload = new_job.encode().map_err(HandlerExit::CodecError)?;
+                transport
+                    .write_frame(0x8000, MESSAGE_TYPE_NEW_MINING_JOB, &job_payload)
+                    .await
+                    .map_err(HandlerExit::TransportError)?;
+            }
+            ChannelKind::Extended { .. } => {
+                // Extended: send raw merkle path and coinbase splits.
+                // Miner computes its own merkle root.
+                let ext_job = sv2_codec::NewExtendedMiningJob {
+                    channel_id: ch.channel_id,
+                    job_id: job.job_id,
+                    min_ntime: job.min_ntime,
+                    version: job.version,
+                    version_rolling_allowed: true,
+                    merkle_path: job.merkle_path.clone(),
+                    coinbase_tx_prefix: job.coinbase_tx_prefix.clone(),
+                    coinbase_tx_suffix: job.coinbase_tx_suffix.clone(),
+                };
+                let job_payload = ext_job.encode().map_err(HandlerExit::CodecError)?;
+                transport
+                    .write_frame(0x8000, MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB, &job_payload)
+                    .await
+                    .map_err(HandlerExit::TransportError)?;
+            }
+        }
 
-        // If there's a prevhash update, send SetNewPrevHash.
+        // If there is a prevhash update, send SetNewPrevHash.
         if let Some(ref ph) = job.prevhash_update {
             let set_prev = sv2_codec::SetNewPrevHash {
                 channel_id: ch.channel_id,
@@ -1416,10 +2322,20 @@ mod tests {
             share_dedup_window_size: 10_000,
             max_shares_per_second_per_channel: 0,
             gateway_instance_id: "test-gw".to_string(),
-            share_hmac_secret: Vec::new(),
+            share_hmac_secret: Arc::new(std::sync::RwLock::new(Vec::new())),
+            extended_channels_enabled: true,
+            extranonce_prefix_len: 4,
+            vardiff_enabled: false,
+            vardiff_target_shares_per_min: 20.0,
+            vardiff_retarget_interval: Duration::from_secs(90),
+            vardiff_min_difficulty: 1,
+            vardiff_max_difficulty: u64::MAX,
+            vardiff_max_adjustment_factor: 4.0,
         };
         assert_eq!(config.max_channels_per_conn, 256);
         assert_eq!(config.ntime_elapsed_slack_seconds, 2);
         assert_eq!(config.gateway_instance_id, "test-gw");
+        assert!(config.extended_channels_enabled);
+        assert!(!config.vardiff_enabled);
     }
 }
