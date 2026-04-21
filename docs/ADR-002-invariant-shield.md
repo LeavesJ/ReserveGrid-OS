@@ -369,9 +369,39 @@ verifier checks, not gateway checks). A new
    `cargo test -p rg-consensus`,
    `cargo clippy -p rg-consensus --all-targets -- -D warnings` all
    green on the landing machine.
-4. [ ] Wire `rg-consensus` into pool-verifier as a new policy layer that
+4. [x] Wire `rg-consensus` into pool-verifier as a new policy layer that
    runs after the existing `check_basic_validity` pass. Emit the new
-   reason codes on mismatch. Blocked on action item 3.
+   reason codes on mismatch. Landed 2026-04-21. Wire schema decision:
+   inline `raw_block_hex: Option<String>` on `TemplatePropose` over a
+   sidecar channel, chosen for atomicity with the verdict, backward
+   compatibility via `#[serde(default)]` matching the existing optional
+   field pattern, and simpler failure semantics (no cross channel join).
+   Senders that omit the field silently skip the shield and are counted
+   in the new `verifier_shield_skipped_total` metric so dashboards can
+   track Phase 1 rollout coverage. Phase 1 scope: coinbase value always,
+   template weight when the sender supplied it. The remaining 16
+   invariants (merkle root, witness commitment, per tx weight, sigops,
+   target meet, header bind, coinbase script prefix, duplicate txid,
+   BIP-34 height, witness reserved value, witness present without
+   commitment, txid derivation, segwit marker) need follow up wire
+   additions (`declared_merkle_root`, `declared_witness_commitment`,
+   `declared_sigop_cost`) tracked under action item 4b. `ShieldOutcome`
+   is decoupled from `VerdictReason` through
+   `consensus_violation_to_verdict_reason`, exhaustive over every
+   `ConsensusViolation` variant including the `NotImplemented` sentinel
+   which maps to the internal error code so a facade gap never
+   surfaces as an accept. Shield runs strictly after
+   `check_basic_validity`, `check_template_constraints`, and
+   `check_safety_constraints`, so earlier policy verdicts short
+   circuit first and the shield never overrides an existing rejection.
+   Thirteen unit tests cover round trip sanity, skipped path, bad hex,
+   garbage bytes, coinbase mismatch, weight mismatch, happy path,
+   template_weight=None path, ordering with safety warnings, the
+   `shield_skipped` field wiring in `evaluate_dynamic`, reject emitted
+   as `VerdictReason`, and mapping distinctness across all 18 variants.
+   Tests use a hardcoded `GENESIS_RAW_HEX` constant rather than a
+   `bitcoin` dev dependency so pool-verifier's dep graph stays narrow
+   and exercises the facade during tests (R-154 precedent).
 5. [x] Add the 18 `VerdictReason` variants to `rg-protocol` and mirror
    them into `reservegrid-common::ReasonCode`. Bump the `ALL` length
    assertions. Landed 2026-04-21. `VerdictReason::ALL.len()` is 33,
