@@ -18,15 +18,20 @@
 //!    matched to the same `snake_case` string by the downstream
 //!    round-trip tests.
 //!
-//! During scaffolding the five public functions return
-//! [`ConsensusViolation::NotImplemented`]. Callers may link against
-//! the real symbols today; once rust-bitcoin lands behind this
-//! facade the function bodies swap in without any caller-visible
-//! surface change.
+//! ADR-002 Phase 1 action item #3 landed 2026-04-21: the five
+//! public functions below now re-derive against rust-bitcoin
+//! 0.32.8. The `NotImplemented` variant remains in the enum as a
+//! shield-disabled sentinel for callers that opt to link against
+//! the facade without wiring a parser; no facade function emits it.
 
 #![forbid(unsafe_code)]
 
 use std::fmt;
+
+use bitcoin::Block;
+use bitcoin::consensus::deserialize;
+use bitcoin::hashes::Hash;
+use bitcoin::hashes::sha256d;
 
 // ─────────────────────────────────────────────────────────────────────
 // ConsensusViolation: the single error type crossing the facade
@@ -263,11 +268,18 @@ impl std::error::Error for ConsensusViolation {}
 /// # Errors
 ///
 /// Returns [`ConsensusViolation::DecodeFailed`] if the bytes cannot
-/// be parsed, or [`ConsensusViolation::NotImplemented`] during
-/// scaffolding.
+/// be parsed.
 pub fn re_derive_coinbase_value(raw_block: &[u8]) -> Result<u64, ConsensusViolation> {
-    let _ = raw_block;
-    Err(ConsensusViolation::NotImplemented)
+    let block: Block = deserialize(raw_block).map_err(|_| ConsensusViolation::DecodeFailed {
+        detail: "block_deserialize",
+    })?;
+    let coinbase = block
+        .txdata
+        .first()
+        .ok_or(ConsensusViolation::DecodeFailed {
+            detail: "block_has_no_coinbase",
+        })?;
+    Ok(coinbase.output.iter().map(|o| o.value.to_sat()).sum())
 }
 
 /// Re-derive block weight from the raw block bytes per BIP-141
@@ -275,11 +287,12 @@ pub fn re_derive_coinbase_value(raw_block: &[u8]) -> Result<u64, ConsensusViolat
 ///
 /// # Errors
 ///
-/// Returns [`ConsensusViolation::DecodeFailed`] on parse failure or
-/// [`ConsensusViolation::NotImplemented`] during scaffolding.
+/// Returns [`ConsensusViolation::DecodeFailed`] on parse failure.
 pub fn re_derive_template_weight(raw_block: &[u8]) -> Result<u64, ConsensusViolation> {
-    let _ = raw_block;
-    Err(ConsensusViolation::NotImplemented)
+    let block: Block = deserialize(raw_block).map_err(|_| ConsensusViolation::DecodeFailed {
+        detail: "block_deserialize",
+    })?;
+    Ok(block.weight().to_wu())
 }
 
 /// Re-derive the transaction merkle root from the block body.
@@ -287,10 +300,17 @@ pub fn re_derive_template_weight(raw_block: &[u8]) -> Result<u64, ConsensusViola
 /// # Errors
 ///
 /// Returns [`ConsensusViolation::DecodeFailed`] on parse failure or
-/// [`ConsensusViolation::NotImplemented`] during scaffolding.
+/// on an empty block body with no merkle root.
 pub fn re_derive_merkle_root(raw_block: &[u8]) -> Result<[u8; 32], ConsensusViolation> {
-    let _ = raw_block;
-    Err(ConsensusViolation::NotImplemented)
+    let block: Block = deserialize(raw_block).map_err(|_| ConsensusViolation::DecodeFailed {
+        detail: "block_deserialize",
+    })?;
+    let root = block
+        .compute_merkle_root()
+        .ok_or(ConsensusViolation::DecodeFailed {
+            detail: "merkle_root_empty_block",
+        })?;
+    Ok(root.to_byte_array())
 }
 
 /// Re-derive the witness commitment. Returns `None` when the block
@@ -299,13 +319,55 @@ pub fn re_derive_merkle_root(raw_block: &[u8]) -> Result<[u8; 32], ConsensusViol
 ///
 /// # Errors
 ///
-/// Returns [`ConsensusViolation::DecodeFailed`] on parse failure or
-/// [`ConsensusViolation::NotImplemented`] during scaffolding.
+/// Returns [`ConsensusViolation::DecodeFailed`] on parse failure.
 pub fn re_derive_witness_commitment(
     raw_block: &[u8],
 ) -> Result<Option<[u8; 32]>, ConsensusViolation> {
-    let _ = raw_block;
-    Err(ConsensusViolation::NotImplemented)
+    let block: Block = deserialize(raw_block).map_err(|_| ConsensusViolation::DecodeFailed {
+        detail: "block_deserialize",
+    })?;
+
+    // BIP-141: a block carries a witness commitment iff any non
+    // coinbase transaction contains witness data. The coinbase
+    // witness holds only the reserved value, not true segwit data.
+    let has_segwit = block
+        .txdata
+        .iter()
+        .skip(1)
+        .any(|tx| tx.input.iter().any(|i| !i.witness.is_empty()));
+
+    if !has_segwit {
+        return Ok(None);
+    }
+
+    let witness_root = block
+        .witness_root()
+        .ok_or(ConsensusViolation::DecodeFailed {
+            detail: "witness_root_empty_block",
+        })?;
+
+    // BIP-141: witness reserved value is the first (and only)
+    // stack element of the coinbase input witness. Missing or
+    // malformed witness stacks fall back to 32 zero bytes; the
+    // caller flags the resulting commitment mismatch via its own
+    // invariant code. The shield only derives; it does not judge.
+    let coinbase = block
+        .txdata
+        .first()
+        .ok_or(ConsensusViolation::DecodeFailed {
+            detail: "block_has_no_coinbase",
+        })?;
+    let reserved: [u8; 32] = coinbase
+        .input
+        .first()
+        .and_then(|i| i.witness.iter().next())
+        .and_then(|w| <[u8; 32]>::try_from(w).ok())
+        .unwrap_or([0u8; 32]);
+
+    let mut buf = [0u8; 64];
+    buf[..32].copy_from_slice(&witness_root.to_byte_array());
+    buf[32..].copy_from_slice(&reserved);
+    Ok(Some(sha256d::Hash::hash(&buf).to_byte_array()))
 }
 
 /// Count total sigops in the block using legacy plus witness
@@ -313,11 +375,32 @@ pub fn re_derive_witness_commitment(
 ///
 /// # Errors
 ///
-/// Returns [`ConsensusViolation::DecodeFailed`] on parse failure or
-/// [`ConsensusViolation::NotImplemented`] during scaffolding.
+/// Returns [`ConsensusViolation::DecodeFailed`] on parse failure.
+///
+/// # TODO
+///
+/// Phase 1 counts legacy sigops only (`Script::count_sigops_legacy`
+/// across every `script_sig` and `script_pubkey`). Accurate
+/// BIP-141 sigop cost (P2SH scale plus witness scale factor) is a
+/// follow up; see `Script::count_sigops` and the sigop cost docs
+/// in rust-bitcoin. A legacy count is not a strict upper bound for
+/// BIP-141 cost on the same block, so a caller emitting
+/// `v2_invariant_sigops_mismatch` against an accurate declared
+/// count may surface a false positive until this is tightened.
 pub fn count_sigops(raw_block: &[u8]) -> Result<u32, ConsensusViolation> {
-    let _ = raw_block;
-    Err(ConsensusViolation::NotImplemented)
+    let block: Block = deserialize(raw_block).map_err(|_| ConsensusViolation::DecodeFailed {
+        detail: "block_deserialize",
+    })?;
+    let mut total: u64 = 0;
+    for tx in &block.txdata {
+        for input in &tx.input {
+            total = total.saturating_add(input.script_sig.count_sigops_legacy() as u64);
+        }
+        for output in &tx.output {
+            total = total.saturating_add(output.script_pubkey.count_sigops_legacy() as u64);
+        }
+    }
+    Ok(u32::try_from(total).unwrap_or(u32::MAX))
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -395,28 +478,86 @@ mod tests {
         );
     }
 
+    /// Helper: serialize the mainnet genesis block to the on wire
+    /// form the facade expects.
+    fn genesis_bytes() -> Vec<u8> {
+        use bitcoin::Network;
+        use bitcoin::blockdata::constants::genesis_block;
+        use bitcoin::consensus::serialize;
+        serialize(&genesis_block(Network::Bitcoin))
+    }
+
     #[test]
-    fn facade_returns_not_implemented_during_scaffold() {
-        let empty: &[u8] = &[];
+    fn garbage_bytes_surface_decode_failed_on_every_function() {
+        let junk: &[u8] = &[0xff; 16];
         assert!(matches!(
-            re_derive_coinbase_value(empty),
-            Err(ConsensusViolation::NotImplemented)
+            re_derive_coinbase_value(junk),
+            Err(ConsensusViolation::DecodeFailed { .. })
         ));
         assert!(matches!(
-            re_derive_template_weight(empty),
-            Err(ConsensusViolation::NotImplemented)
+            re_derive_template_weight(junk),
+            Err(ConsensusViolation::DecodeFailed { .. })
         ));
         assert!(matches!(
-            re_derive_merkle_root(empty),
-            Err(ConsensusViolation::NotImplemented)
+            re_derive_merkle_root(junk),
+            Err(ConsensusViolation::DecodeFailed { .. })
         ));
         assert!(matches!(
-            re_derive_witness_commitment(empty),
-            Err(ConsensusViolation::NotImplemented)
+            re_derive_witness_commitment(junk),
+            Err(ConsensusViolation::DecodeFailed { .. })
         ));
         assert!(matches!(
-            count_sigops(empty),
-            Err(ConsensusViolation::NotImplemented)
+            count_sigops(junk),
+            Err(ConsensusViolation::DecodeFailed { .. })
         ));
+    }
+
+    #[test]
+    fn genesis_coinbase_value_is_fifty_btc() {
+        let bytes = genesis_bytes();
+        let v = re_derive_coinbase_value(&bytes).expect("genesis parses");
+        assert_eq!(v, 50 * 100_000_000, "genesis coinbase value in sats");
+    }
+
+    #[test]
+    fn genesis_weight_matches_rust_bitcoin() {
+        use bitcoin::Network;
+        use bitcoin::blockdata::constants::genesis_block;
+        let bytes = genesis_bytes();
+        let declared = genesis_block(Network::Bitcoin).weight().to_wu();
+        let re_derived = re_derive_template_weight(&bytes).expect("genesis parses");
+        assert_eq!(declared, re_derived);
+    }
+
+    #[test]
+    fn genesis_merkle_root_matches_rust_bitcoin() {
+        use bitcoin::Network;
+        use bitcoin::blockdata::constants::genesis_block;
+        let bytes = genesis_bytes();
+        let declared = genesis_block(Network::Bitcoin)
+            .compute_merkle_root()
+            .expect("genesis has a merkle root")
+            .to_byte_array();
+        let re_derived = re_derive_merkle_root(&bytes).expect("genesis parses");
+        assert_eq!(declared, re_derived);
+    }
+
+    #[test]
+    fn genesis_has_no_witness_commitment() {
+        let bytes = genesis_bytes();
+        let c = re_derive_witness_commitment(&bytes).expect("genesis parses");
+        assert!(
+            c.is_none(),
+            "pre segwit genesis must not carry a commitment"
+        );
+    }
+
+    #[test]
+    fn genesis_legacy_sigops_is_small() {
+        let bytes = genesis_bytes();
+        let n = count_sigops(&bytes).expect("genesis parses");
+        // Genesis coinbase carries one scriptSig push and a single
+        // P2PK output: legacy sigops are strictly bounded.
+        assert!(n < 10, "genesis legacy sigops unexpectedly large: {n}");
     }
 }

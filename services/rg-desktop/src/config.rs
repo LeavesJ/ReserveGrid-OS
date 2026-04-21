@@ -25,6 +25,12 @@ pub struct DesktopConfig {
     #[serde(default = "default_gateway_url_opt")]
     pub gateway_url: Option<String>,
 
+    /// Base URL of the `rg-feed-adapter` HTTP API (e.g. `http://127.0.0.1:18444`).
+    /// When set, the health check probes feed-adapter health so the
+    /// `LicenseGate` can detect whether shadow feed services are running.
+    #[serde(default)]
+    pub feed_adapter_url: Option<String>,
+
     /// License key string. Can also be set via `VELDRA_LICENSE_KEY` env var.
     #[serde(default)]
     pub license_key: Option<String>,
@@ -63,6 +69,7 @@ impl Default for DesktopConfig {
             verifier_url: default_verifier_url(),
             template_url: default_template_url(),
             gateway_url: Some(default_gateway_url()),
+            feed_adapter_url: None,
             license_key: None,
             health_probes: Vec::new(),
         }
@@ -104,6 +111,9 @@ impl DesktopConfig {
         if let Ok(v) = std::env::var("VELDRA_GATEWAY_URL") {
             cfg.gateway_url = Some(v);
         }
+        if let Ok(v) = std::env::var("VELDRA_FEED_ADAPTER_URL") {
+            cfg.feed_adapter_url = Some(v);
+        }
         if let Ok(v) = std::env::var("VELDRA_LICENSE_KEY") {
             cfg.license_key = Some(v);
         }
@@ -120,9 +130,22 @@ impl DesktopConfig {
             }
         }
 
-        // XDG config directory.
+        // Platform config directory (macOS: ~/Library/Application Support).
         if let Some(config_dir) = dirs::config_dir() {
             let path = config_dir.join("reservegrid").join("desktop.toml");
+            if path.exists() {
+                return Some(path);
+            }
+        }
+
+        // XDG fallback so ~/.config/reservegrid/desktop.toml works on
+        // macOS (where dirs::config_dir() returns ~/Library/Application
+        // Support) and on any Linux system that sets $HOME but not $XDG_CONFIG_HOME.
+        if let Some(home) = dirs::home_dir() {
+            let path = home
+                .join(".config")
+                .join("reservegrid")
+                .join("desktop.toml");
             if path.exists() {
                 return Some(path);
             }
@@ -280,6 +303,51 @@ impl std::error::Error for ConfigError {}
 #[allow(clippy::unwrap_used, clippy::expect_used, unsafe_code)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, PoisonError};
+
+    // Serializes tests that race on the shared VELDRA_DESKTOP_CONFIG env var.
+    // Without this guard the tests relied on an implicit `--test-threads=1`
+    // contract that silently breaks under default cargo test parallelism.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Per test scratch directory. The path is suffixed with pid plus
+    /// nanoseconds so parallel runs, repeated runs on the same pid,
+    /// and prior crashed runs never collide on a stale tree. Drop
+    /// tears the tree down via `remove_dir_all`, which fires even on
+    /// panic, so a mid test failure never leaks state into the next
+    /// run. Replaces the earlier `rg-test-<pid>/` pattern flagged in
+    /// the PB-10 residual list.
+    struct ScratchDir {
+        path: std::path::PathBuf,
+    }
+
+    impl ScratchDir {
+        fn new(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let pid = std::process::id();
+            let path = std::env::temp_dir()
+                .join(format!("rg-test-{tag}-{pid}-{nanos}"));
+            // Belt and suspenders: if the improbable pid+nanos
+            // collision ever happens, kill any stale tree before
+            // recreating so the test sees a clean directory.
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("create scratch dir");
+            Self { path }
+        }
+
+        fn join(&self, leaf: &str) -> std::path::PathBuf {
+            self.path.join(leaf)
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
 
     #[test]
     fn default_config_has_localhost_urls() {
@@ -309,13 +377,12 @@ license_key = "veldra_lic_test123"
 
     #[test]
     fn save_license_key_creates_new_file() {
-        let dir = std::env::temp_dir().join(format!("rg-test-{}", std::process::id()));
-        let path = dir.join("desktop.toml");
-        // SAFETY: tests run with --test-threads=1 to avoid env var races.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let scratch = ScratchDir::new("save");
+        let path = scratch.join("desktop.toml");
+        // SAFETY: ENV_LOCK serializes this test against its sibling that
+        // also mutates VELDRA_DESKTOP_CONFIG.
         unsafe { std::env::set_var("VELDRA_DESKTOP_CONFIG", &path) };
-
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::create_dir_all(&dir);
 
         DesktopConfig::save_license_key("veldra_lic_abc").expect("save");
 
@@ -323,22 +390,22 @@ license_key = "veldra_lic_test123"
         let cfg: DesktopConfig = toml::from_str(&contents).expect("parse");
         assert_eq!(cfg.license_key.as_deref(), Some("veldra_lic_abc"));
 
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir(&dir);
         unsafe { std::env::remove_var("VELDRA_DESKTOP_CONFIG") };
+        // ScratchDir::drop removes the tree.
     }
 
     #[test]
     fn save_license_key_preserves_existing_fields() {
-        let dir = std::env::temp_dir().join(format!("rg-test-preserve-{}", std::process::id()));
-        let path = dir.join("desktop.toml");
-        let _ = std::fs::create_dir_all(&dir);
+        let _guard = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let scratch = ScratchDir::new("preserve");
+        let path = scratch.join("desktop.toml");
 
         let existing = r#"verifier_url = "http://custom:9999"
 template_url = "http://custom:8888"
 "#;
         std::fs::write(&path, existing).expect("write seed");
-        // SAFETY: tests run with --test-threads=1 to avoid env var races.
+        // SAFETY: ENV_LOCK serializes this test against its sibling that
+        // also mutates VELDRA_DESKTOP_CONFIG.
         unsafe { std::env::set_var("VELDRA_DESKTOP_CONFIG", &path) };
 
         DesktopConfig::save_license_key("veldra_lic_xyz").expect("save");
@@ -349,22 +416,22 @@ template_url = "http://custom:8888"
         assert_eq!(cfg.template_url, "http://custom:8888");
         assert_eq!(cfg.license_key.as_deref(), Some("veldra_lic_xyz"));
 
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir(&dir);
         unsafe { std::env::remove_var("VELDRA_DESKTOP_CONFIG") };
+        // ScratchDir::drop removes the tree.
     }
 
     #[test]
     fn clear_license_key_removes_field() {
-        let dir = std::env::temp_dir().join(format!("rg-test-clear-{}", std::process::id()));
-        let path = dir.join("desktop.toml");
-        let _ = std::fs::create_dir_all(&dir);
+        let _guard = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let scratch = ScratchDir::new("clear");
+        let path = scratch.join("desktop.toml");
 
         let existing = r#"verifier_url = "http://custom:9999"
 license_key = "veldra_lic_old"
 "#;
         std::fs::write(&path, existing).expect("write seed");
-        // SAFETY: tests run with --test-threads=1 to avoid env var races.
+        // SAFETY: ENV_LOCK serializes this test against siblings that
+        // also mutate VELDRA_DESKTOP_CONFIG.
         unsafe { std::env::set_var("VELDRA_DESKTOP_CONFIG", &path) };
 
         DesktopConfig::clear_license_key().expect("clear");
@@ -374,14 +441,15 @@ license_key = "veldra_lic_old"
         assert!(cfg.license_key.is_none());
         assert_eq!(cfg.verifier_url, "http://custom:9999");
 
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir(&dir);
         unsafe { std::env::remove_var("VELDRA_DESKTOP_CONFIG") };
+        // ScratchDir::drop removes the tree.
     }
 
     #[test]
     fn clear_license_key_noop_when_no_file() {
-        // SAFETY: tests run with --test-threads=1 to avoid env var races.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        // SAFETY: ENV_LOCK serializes this test against siblings that
+        // also mutate VELDRA_DESKTOP_CONFIG.
         unsafe {
             std::env::set_var(
                 "VELDRA_DESKTOP_CONFIG",
