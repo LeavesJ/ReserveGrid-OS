@@ -1,5 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rg_consensus::ConsensusViolation;
 use rg_protocol::{PROTOCOL_VERSION, TemplatePropose, VerdictReason};
 use serde::{Deserialize, Serialize};
 
@@ -47,6 +48,12 @@ pub struct EvalResult {
     pub min_avg_fee_used: u64,
     /// Observe only safety warnings (never cause rejection on their own).
     pub warnings: Vec<SafetyWarning>,
+    /// `true` when the v2.0 Invariant Shield pass was reached but the
+    /// template omitted `raw_block_hex`. The caller increments
+    /// `verifier_shield_skipped_total` to make the Phase 1 rollout
+    /// visibility explicit. `false` for rejected-before-shield and for
+    /// shield-ran paths (agreed or rejected).
+    pub shield_skipped: bool,
 }
 
 fn default_max_weight_ratio() -> f64 {
@@ -188,6 +195,7 @@ fn check_basic_validity(
             fee_tier,
             min_avg_fee_used,
             warnings: vec![],
+            shield_skipped: false,
         });
     }
 
@@ -202,6 +210,7 @@ fn check_basic_validity(
             fee_tier,
             min_avg_fee_used,
             warnings: vec![],
+            shield_skipped: false,
         });
     }
 
@@ -212,6 +221,7 @@ fn check_basic_validity(
             fee_tier,
             min_avg_fee_used,
             warnings: vec![],
+            shield_skipped: false,
         });
     }
 
@@ -232,6 +242,7 @@ fn check_template_constraints(
             fee_tier,
             min_avg_fee_used,
             warnings: vec![],
+            shield_skipped: false,
         });
     }
 
@@ -242,6 +253,7 @@ fn check_template_constraints(
             fee_tier,
             min_avg_fee_used,
             warnings: vec![],
+            shield_skipped: false,
         });
     }
 
@@ -255,6 +267,7 @@ fn check_template_constraints(
             fee_tier,
             min_avg_fee_used,
             warnings: vec![],
+            shield_skipped: false,
         });
     }
 
@@ -268,6 +281,7 @@ fn check_template_constraints(
             fee_tier,
             min_avg_fee_used,
             warnings: vec![],
+            shield_skipped: false,
         });
     }
 
@@ -287,6 +301,7 @@ fn check_template_constraints(
                 fee_tier,
                 min_avg_fee_used,
                 warnings: vec![],
+                shield_skipped: false,
             });
         }
     }
@@ -320,6 +335,7 @@ fn check_safety_constraints(
                     fee_tier,
                     min_avg_fee_used,
                     warnings: warnings.clone(),
+                    shield_skipped: false,
                 });
             }
             warnings.push(SafetyWarning {
@@ -343,6 +359,7 @@ fn check_safety_constraints(
                     fee_tier,
                     min_avg_fee_used,
                     warnings: warnings.clone(),
+                    shield_skipped: false,
                 });
             }
             warnings.push(SafetyWarning {
@@ -498,6 +515,155 @@ impl PolicyConfig {
     }
 }
 
+/// Outcome of the v2.0 Invariant Shield pass (ADR-002 Phase 1).
+///
+/// The shield is the last stage of `evaluate_dynamic`. It re-derives
+/// consensus critical values from the raw block bytes supplied on the
+/// wire as `raw_block_hex` and compares them against the declared
+/// template fields. The outcome feeds back into `EvalResult` plus the
+/// `verifier_shield_skipped_total` metric.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShieldOutcome {
+    /// Template omitted `raw_block_hex`. Shield pass did not run. The
+    /// caller counts the skip so Phase 1 rollout coverage is observable.
+    Skipped,
+    /// Shield ran and every re-derivation agreed with the declared
+    /// value. Template continues toward acceptance.
+    Agreed,
+    /// Shield ran and detected a disagreement. The carried reason is a
+    /// canonical `v2_invariant_*` `VerdictReason` and the detail string
+    /// is human readable only.
+    Rejected {
+        reason: VerdictReason,
+        detail: String,
+    },
+}
+
+/// Map a `ConsensusViolation` returned by the rg-consensus facade to
+/// the canonical `VerdictReason` variant that mirrors the same
+/// `snake_case` reason code string. The mapping is exhaustive by
+/// construction; reason code drift across crates is caught by the
+/// `snake_case` round trip tests in `rg-protocol` and `rg-consensus`.
+///
+/// `ConsensusViolation::NotImplemented` is a shield-disabled sentinel
+/// and MUST NOT reach this function once Phase 1 has landed. If it
+/// does, the facade has been misconfigured; we surface it as
+/// `InternalError` so the observability pipeline flags the drift
+/// rather than silently routing a sentinel onto the wire.
+fn consensus_violation_to_verdict_reason(v: &ConsensusViolation) -> VerdictReason {
+    match v {
+        ConsensusViolation::DecodeFailed { .. } => VerdictReason::V2InvariantDecodeFailed,
+        ConsensusViolation::CoinbaseValueMismatch { .. } => {
+            VerdictReason::V2InvariantCoinbaseValueMismatch
+        }
+        ConsensusViolation::TemplateWeightMismatch { .. } => {
+            VerdictReason::V2InvariantTemplateWeightMismatch
+        }
+        ConsensusViolation::MerkleRootMismatch { .. } => {
+            VerdictReason::V2InvariantMerkleRootMismatch
+        }
+        ConsensusViolation::WitnessCommitmentMissing => {
+            VerdictReason::V2InvariantWitnessCommitmentMissing
+        }
+        ConsensusViolation::WitnessCommitmentMismatch { .. } => {
+            VerdictReason::V2InvariantWitnessCommitmentMismatch
+        }
+        ConsensusViolation::SigopsMismatch { .. } => VerdictReason::V2InvariantSigopsMismatch,
+        ConsensusViolation::CoinbaseSigopsMismatch { .. } => {
+            VerdictReason::V2InvariantCoinbaseSigopsMismatch
+        }
+        ConsensusViolation::TxCountMismatch { .. } => VerdictReason::V2InvariantTxCountMismatch,
+        ConsensusViolation::CoinbaseScriptLength => VerdictReason::V2InvariantCoinbaseScriptLength,
+        ConsensusViolation::CoinbaseOutputCount => VerdictReason::V2InvariantCoinbaseOutputCount,
+        ConsensusViolation::CoinbaseBip34Missing => VerdictReason::V2InvariantCoinbaseBip34Missing,
+        ConsensusViolation::CoinbaseHeightMismatch { .. } => {
+            VerdictReason::V2InvariantCoinbaseHeightMismatch
+        }
+        ConsensusViolation::WeightExceedsMax => VerdictReason::V2InvariantWeightExceedsMax,
+        ConsensusViolation::SigopsExceedMax => VerdictReason::V2InvariantSigopsExceedMax,
+        ConsensusViolation::NonCoinbaseNullPrevout => VerdictReason::V2InvariantNontcbNullPrevout,
+        ConsensusViolation::HeaderVersionLow => VerdictReason::V2InvariantHeaderVersionLow,
+        ConsensusViolation::DuplicateTx => VerdictReason::V2InvariantDuplicateTx,
+        ConsensusViolation::NotImplemented => VerdictReason::InternalError,
+    }
+}
+
+/// Run the v2.0 Invariant Shield pass against a template.
+///
+/// Phase 1 scope: only the fields the wire already carries declared
+/// values for are checked against re-derived values. That is:
+/// `coinbase_value` (always) and `template_weight` (when present).
+/// The remaining invariants need declared wire fields to compare
+/// against and land in Phase 1b.
+///
+/// When `raw_block_hex` is `None` the shield is silently skipped and
+/// the caller increments `verifier_shield_skipped_total` via the
+/// `shield_skipped` field on `EvalResult`. When the hex decode fails
+/// the shield emits `v2_invariant_decode_failed` so bad gateway
+/// encodings surface loudly rather than silently bypassing the shield.
+pub fn check_invariant_shield(template: &TemplatePropose) -> ShieldOutcome {
+    let Some(hex_str) = template.raw_block_hex.as_deref() else {
+        return ShieldOutcome::Skipped;
+    };
+
+    let raw_block = match hex::decode(hex_str) {
+        Ok(b) => b,
+        Err(e) => {
+            return ShieldOutcome::Rejected {
+                reason: VerdictReason::V2InvariantDecodeFailed,
+                detail: format!("raw_block_hex decode failed: {e}"),
+            };
+        }
+    };
+
+    // Coinbase value re-derivation is always comparable.
+    match rg_consensus::re_derive_coinbase_value(&raw_block) {
+        Ok(re_derived) => {
+            if re_derived != template.coinbase_value {
+                return ShieldOutcome::Rejected {
+                    reason: VerdictReason::V2InvariantCoinbaseValueMismatch,
+                    detail: format!(
+                        "coinbase_value declared={} re_derived={}",
+                        template.coinbase_value, re_derived
+                    ),
+                };
+            }
+        }
+        Err(v) => {
+            return ShieldOutcome::Rejected {
+                reason: consensus_violation_to_verdict_reason(&v),
+                detail: v.to_string(),
+            };
+        }
+    }
+
+    // Template weight re-derivation only runs when the sender declared
+    // a value. Senders that omit template_weight still benefit from the
+    // coinbase value check above.
+    if let Some(declared) = template.template_weight {
+        match rg_consensus::re_derive_template_weight(&raw_block) {
+            Ok(re_derived) => {
+                if re_derived != declared {
+                    return ShieldOutcome::Rejected {
+                        reason: VerdictReason::V2InvariantTemplateWeightMismatch,
+                        detail: format!(
+                            "template_weight declared={declared} re_derived={re_derived}"
+                        ),
+                    };
+                }
+            }
+            Err(v) => {
+                return ShieldOutcome::Rejected {
+                    reason: consensus_violation_to_verdict_reason(&v),
+                    detail: v.to_string(),
+                };
+            }
+        }
+    }
+
+    ShieldOutcome::Agreed
+}
+
 /// Convenience wrapper: evaluate with no mempool context.
 pub fn evaluate(template: &TemplatePropose, cfg: &PolicyConfig) -> EvalResult {
     evaluate_dynamic(template, cfg, None, now_unix_ms())
@@ -540,12 +706,33 @@ pub fn evaluate_dynamic(
         return result;
     }
 
+    // ── v2.0 Invariant Shield (ADR-002 Phase 1) ──
+    // Runs after safety so earlier policy rejects short circuit first
+    // and the shield only sees templates that have already passed every
+    // prior check. Strictly additive: templates that omit raw_block_hex
+    // bypass the shield without altering the prior verdict path.
+    let shield_skipped = match check_invariant_shield(template) {
+        ShieldOutcome::Skipped => true,
+        ShieldOutcome::Agreed => false,
+        ShieldOutcome::Rejected { reason, detail } => {
+            return EvalResult {
+                reason: Some(reason),
+                detail: Some(detail),
+                fee_tier,
+                min_avg_fee_used,
+                warnings,
+                shield_skipped: false,
+            };
+        }
+    };
+
     EvalResult {
         reason: None,
         detail: None,
         fee_tier,
         min_avg_fee_used,
         warnings,
+        shield_skipped,
     }
 }
 
@@ -571,6 +758,7 @@ mod tests {
             coinbase_sigops: None,
             template_weight: None,
             gateway_instance_id: None,
+            raw_block_hex: None,
         }
     }
 
@@ -958,5 +1146,231 @@ mod tests {
         assert!(t.template_weight.is_none());
         assert!(t.observed_weight.is_none());
         assert!(t.created_at_unix_ms.is_none());
+        assert!(t.raw_block_hex.is_none());
+    }
+
+    // ── v2.0 Invariant Shield tests (ADR-002 Phase 1) ──
+
+    /// Mainnet genesis block raw hex. Hardcoded rather than serialized
+    /// via rust-bitcoin at test time so pool-verifier keeps depending
+    /// only on `rg-consensus` at its facade boundary (ADR-002). The
+    /// facade itself verifies that this constant round-trips through
+    /// `re_derive_*` to the expected coinbase value and weight.
+    const GENESIS_RAW_HEX: &str = concat!(
+        "0100000000000000000000000000000000000000000000000000000000000000",
+        "000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa",
+        "4b1e5e4a29ab5f49ffff001d1dac2b7c01010000000100000000000000000000",
+        "00000000000000000000000000000000000000000000ffffffff4d04ffff001d",
+        "0104455468652054696d65732030332f4a616e2f32303039204368616e63656c",
+        "6c6f72206f6e206272696e6b206f66207365636f6e64206261696c6f75742066",
+        "6f722062616e6b73ffffffff0100f2052a0100000043410467",
+        "8afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649",
+        "f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5fac",
+        "00000000",
+    );
+
+    /// Genesis coinbase value: the 50 BTC subsidy at height 0.
+    const GENESIS_COINBASE_SATS: u64 = 50 * 100_000_000;
+
+    /// Compute the genesis block weight through the facade itself.
+    /// Using `re_derive_template_weight` here keeps pool-verifier free
+    /// of a direct `bitcoin` dev-dependency and exercises the same
+    /// code path the shield runs in production.
+    fn genesis_weight_via_facade() -> u64 {
+        let bytes = hex::decode(GENESIS_RAW_HEX).expect("GENESIS_RAW_HEX decodes");
+        rg_consensus::re_derive_template_weight(&bytes).expect("genesis weight re-derives")
+    }
+
+    #[test]
+    fn genesis_raw_hex_constant_round_trips_through_facade() {
+        // Sanity check the hardcoded constant: if the hex ever drifts,
+        // every downstream shield test breaks with a cryptic decode
+        // failure. This test names the drift clearly.
+        let bytes = hex::decode(GENESIS_RAW_HEX).expect("GENESIS_RAW_HEX decodes");
+        let coinbase = rg_consensus::re_derive_coinbase_value(&bytes)
+            .expect("coinbase value re-derives from GENESIS_RAW_HEX");
+        assert_eq!(coinbase, GENESIS_COINBASE_SATS);
+    }
+
+    #[test]
+    fn shield_skipped_without_raw_block_hex() {
+        let outcome = check_invariant_shield(&base_template());
+        assert_eq!(outcome, ShieldOutcome::Skipped);
+    }
+
+    #[test]
+    fn shield_decode_failed_on_bad_hex() {
+        let t = TemplatePropose {
+            raw_block_hex: Some("not_hex_at_all".to_string()),
+            ..base_template()
+        };
+        match check_invariant_shield(&t) {
+            ShieldOutcome::Rejected { reason, .. } => {
+                assert_eq!(reason, VerdictReason::V2InvariantDecodeFailed);
+            }
+            other => panic!("expected Rejected(V2InvariantDecodeFailed) got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shield_decode_failed_on_garbage_bytes() {
+        // Valid hex that does not deserialize as a block.
+        let t = TemplatePropose {
+            raw_block_hex: Some("ffffffffffffff".to_string()),
+            ..base_template()
+        };
+        match check_invariant_shield(&t) {
+            ShieldOutcome::Rejected { reason, .. } => {
+                assert_eq!(reason, VerdictReason::V2InvariantDecodeFailed);
+            }
+            other => panic!("expected Rejected(V2InvariantDecodeFailed) got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shield_coinbase_value_mismatch_rejects() {
+        let t = TemplatePropose {
+            // Declared coinbase != genesis 50 BTC.
+            coinbase_value: 1,
+            raw_block_hex: Some(GENESIS_RAW_HEX.to_string()),
+            ..base_template()
+        };
+        match check_invariant_shield(&t) {
+            ShieldOutcome::Rejected { reason, detail } => {
+                assert_eq!(reason, VerdictReason::V2InvariantCoinbaseValueMismatch);
+                assert!(
+                    detail.contains("declared=1"),
+                    "detail missing declared value: {detail}"
+                );
+            }
+            other => panic!("expected Rejected(V2InvariantCoinbaseValueMismatch) got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shield_template_weight_mismatch_rejects() {
+        let weight = genesis_weight_via_facade();
+        let t = TemplatePropose {
+            coinbase_value: GENESIS_COINBASE_SATS,
+            template_weight: Some(weight + 1),
+            raw_block_hex: Some(GENESIS_RAW_HEX.to_string()),
+            ..base_template()
+        };
+        match check_invariant_shield(&t) {
+            ShieldOutcome::Rejected { reason, .. } => {
+                assert_eq!(reason, VerdictReason::V2InvariantTemplateWeightMismatch);
+            }
+            other => panic!("expected Rejected(V2InvariantTemplateWeightMismatch) got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shield_agrees_on_genesis_happy_path() {
+        let weight = genesis_weight_via_facade();
+        let t = TemplatePropose {
+            coinbase_value: GENESIS_COINBASE_SATS,
+            template_weight: Some(weight),
+            raw_block_hex: Some(GENESIS_RAW_HEX.to_string()),
+            ..base_template()
+        };
+        assert_eq!(check_invariant_shield(&t), ShieldOutcome::Agreed);
+    }
+
+    #[test]
+    fn shield_agrees_when_template_weight_absent() {
+        // No declared template_weight means the weight re-derivation
+        // is skipped; the coinbase value check must still pass alone.
+        let t = TemplatePropose {
+            coinbase_value: GENESIS_COINBASE_SATS,
+            template_weight: None,
+            raw_block_hex: Some(GENESIS_RAW_HEX.to_string()),
+            ..base_template()
+        };
+        assert_eq!(check_invariant_shield(&t), ShieldOutcome::Agreed);
+    }
+
+    #[test]
+    fn shield_does_not_override_earlier_safety_rejection() {
+        // Shield runs after safety. A stale template that also carries
+        // a valid raw_block_hex must still reject with TemplateStale,
+        // not propagate an Agreed outcome past safety.
+        let cfg = PolicyConfig {
+            safety: PolicySafety {
+                max_template_age_ms: Some(1_000),
+                enforce_template_age: true,
+                ..PolicySafety::default()
+            },
+            ..PolicyConfig::default_with_protocol(PROTOCOL_VERSION)
+        };
+        let now = now_unix_ms();
+        let t = TemplatePropose {
+            coinbase_value: GENESIS_COINBASE_SATS,
+            created_at_unix_ms: Some(now.saturating_sub(5_000)),
+            raw_block_hex: Some(GENESIS_RAW_HEX.to_string()),
+            ..base_template()
+        };
+        let result = evaluate_dynamic(&t, &cfg, None, now);
+        assert_eq!(result.reason, Some(VerdictReason::TemplateStale));
+        // Shield never ran because safety short-circuited first.
+        assert!(!result.shield_skipped);
+    }
+
+    #[test]
+    fn evaluate_dynamic_sets_shield_skipped_when_hex_absent() {
+        let cfg = PolicyConfig::default_with_protocol(PROTOCOL_VERSION);
+        let result = evaluate(&base_template(), &cfg);
+        assert!(result.reason.is_none());
+        assert!(result.shield_skipped);
+    }
+
+    #[test]
+    fn evaluate_dynamic_clears_shield_skipped_when_shield_runs() {
+        let weight = genesis_weight_via_facade();
+        let cfg = PolicyConfig::default_with_protocol(PROTOCOL_VERSION);
+        let t = TemplatePropose {
+            coinbase_value: GENESIS_COINBASE_SATS,
+            template_weight: Some(weight),
+            raw_block_hex: Some(GENESIS_RAW_HEX.to_string()),
+            ..base_template()
+        };
+        let result = evaluate(&t, &cfg);
+        assert!(result.reason.is_none());
+        assert!(!result.shield_skipped);
+    }
+
+    #[test]
+    fn evaluate_dynamic_emits_shield_reject_as_verdict_reason() {
+        let cfg = PolicyConfig::default_with_protocol(PROTOCOL_VERSION);
+        let t = TemplatePropose {
+            coinbase_value: 1,
+            raw_block_hex: Some(GENESIS_RAW_HEX.to_string()),
+            ..base_template()
+        };
+        let result = evaluate(&t, &cfg);
+        assert_eq!(
+            result.reason,
+            Some(VerdictReason::V2InvariantCoinbaseValueMismatch)
+        );
+        assert!(!result.shield_skipped);
+    }
+
+    #[test]
+    fn shield_violation_mapping_is_distinct_across_invariants() {
+        // Catch silent collapses to a single VerdictReason across the
+        // 18 shield variants. NotImplemented is the shield-disabled
+        // sentinel and intentionally routes to InternalError.
+        let mut seen: Vec<VerdictReason> = ConsensusViolation::ALL
+            .iter()
+            .filter(|v| !matches!(v, ConsensusViolation::NotImplemented))
+            .map(consensus_violation_to_verdict_reason)
+            .collect();
+        let before = seen.len();
+        seen.sort_by_key(VerdictReason::as_str);
+        seen.dedup();
+        assert_eq!(
+            before,
+            seen.len(),
+            "consensus_violation_to_verdict_reason collapsed two variants onto one reason"
+        );
     }
 }

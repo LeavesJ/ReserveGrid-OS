@@ -412,6 +412,7 @@ mod tests {
             coinbase_sigops: Some(4),
             template_weight: Some(3_950_000),
             gateway_instance_id: Some("test-gw-01".to_string()),
+            raw_block_hex: None,
         };
         let msg = VerifierOutbound::TemplatePropose(tp);
         let line = serialize_outbound(&msg).unwrap();

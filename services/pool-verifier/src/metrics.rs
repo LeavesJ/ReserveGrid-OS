@@ -24,6 +24,12 @@ pub(crate) struct VerifierMetrics {
     pub(crate) verdicts_total: Family<VerdictLabels, Counter>,
     pub(crate) templates_evaluated_total: Counter,
     pub(crate) policy_reloads_total: Family<PolicyReloadLabels, Counter>,
+    /// Count of templates where the v2.0 Invariant Shield pass was
+    /// reached but the sender omitted `raw_block_hex`. Separate from
+    /// `verdicts_total` because the shield skip is not a verdict
+    /// outcome; dashboards use this to measure Phase 1 rollout
+    /// coverage of gateways that ship raw block bytes.
+    pub(crate) shield_skipped_total: Counter,
 }
 
 impl VerifierMetrics {
@@ -32,6 +38,7 @@ impl VerifierMetrics {
             verdicts_total: Family::default(),
             templates_evaluated_total: Counter::default(),
             policy_reloads_total: Family::default(),
+            shield_skipped_total: Counter::default(),
         };
         registry.register(
             "verifier_verdicts_total",
@@ -47,6 +54,11 @@ impl VerifierMetrics {
             "verifier_policy_reloads_total",
             "Total policy reload attempts",
             m.policy_reloads_total.clone(),
+        );
+        registry.register(
+            "verifier_shield_skipped_total",
+            "Templates that reached the v2.0 Invariant Shield but omitted raw_block_hex",
+            m.shield_skipped_total.clone(),
         );
         m
     }

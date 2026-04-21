@@ -523,6 +523,13 @@ pub(crate) async fn handle_tcp_connection<R, W>(
                 })
                 .inc();
 
+            // ADR-002 Phase 1: count templates that reached the v2.0 Invariant
+            // Shield pass but omitted `raw_block_hex`. Dashboards use this to
+            // measure rollout coverage of gateways that ship raw block bytes.
+            if eval.shield_skipped {
+                metrics.shield_skipped_total.inc();
+            }
+
             {
                 let mut guard = log
                     .lock()

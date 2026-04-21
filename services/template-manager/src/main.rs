@@ -789,6 +789,10 @@ impl TemplateSource for BitcoindTemplateSource {
                 coinbase_sigops,
                 template_weight: Some(template_weight),
                 gateway_instance_id: None,
+                // ADR-002 Phase 1: template-manager does not yet emit
+                // raw block bytes. The shield pass is skipped for its
+                // proposals. Phase 1b wires raw_block_hex end to end.
+                raw_block_hex: None,
             },
             Some(extras),
         )))

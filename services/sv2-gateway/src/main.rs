@@ -327,7 +327,7 @@ fn build_settings_snapshot_from_toml(toml_val: &toml::Value) -> serde_json::Valu
         "max_worker_id_bytes": get_u64(gw, "max_worker_id_bytes", 128),
         "template_poll_interval_ms": get_u64(gw, "template_poll_interval_ms", 3000),
         "max_template_age_ms": get_u64(gw, "max_template_age_ms", 30000),
-        "prevhash_verdict_timeout_ms": get_u64(gw, "prevhash_verdict_timeout_ms", 50),
+        "prevhash_verdict_timeout_ms": get_u64(gw, "prevhash_verdict_timeout_ms", 2000),
         "prevhash_stale_hold_ms": get_u64(gw, "prevhash_stale_hold_ms", 5000),
         "upstream_stale_max_ms": get_u64(gw, "upstream_stale_max_ms", 30000),
         "upstream_failure_policy": get_str(gw, "upstream_failure_policy"),
@@ -569,6 +569,18 @@ struct VerdictLabels {
     accepted: String,
 }
 
+/// Label set for mode transition counters.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct ModeTransitionLabels {
+    direction: String,
+}
+
+/// Label set for vardiff retarget counters.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct VardiffLabels {
+    direction: String,
+}
+
 /// All Prometheus metric families for sv2-gateway.
 struct GatewayMetrics {
     shares_total: Family<ShareLabels, Counter>,
@@ -578,6 +590,8 @@ struct GatewayMetrics {
     templates_received_total: Counter,
     verdicts_total: Family<VerdictLabels, Counter>,
     share_forward_total: Family<ForwardLabels, Counter>,
+    mode_transitions_total: Family<ModeTransitionLabels, Counter>,
+    vardiff_retargets_total: Family<VardiffLabels, Counter>,
 }
 
 impl GatewayMetrics {
@@ -590,6 +604,8 @@ impl GatewayMetrics {
             templates_received_total: Counter::default(),
             verdicts_total: Family::default(),
             share_forward_total: Family::default(),
+            mode_transitions_total: Family::default(),
+            vardiff_retargets_total: Family::default(),
         };
         registry.register(
             "svtwo_shares_total",
@@ -625,6 +641,16 @@ impl GatewayMetrics {
             "svtwo_share_forward_total",
             "Total share forward results from upstream",
             m.share_forward_total.clone(),
+        );
+        registry.register(
+            "svtwo_mode_transitions_total",
+            "Mode transitions between enforcing and degraded",
+            m.mode_transitions_total.clone(),
+        );
+        registry.register(
+            "svtwo_vardiff_retargets_total",
+            "Variable difficulty retarget events",
+            m.vardiff_retargets_total.clone(),
         );
         m
     }
@@ -758,13 +784,26 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
         .layer(Extension(shared_registry))
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES));
 
+    let health_shutdown = shutdown_rx.clone();
     match tokio::net::TcpListener::bind(&health_addr).await {
         Ok(health_listener) => {
             info!(addr = %health_addr, "health server listening");
             tokio::spawn(async move {
-                if let Err(e) = axum::serve(health_listener, health_router).await {
+                let shutdown_signal = async move {
+                    let mut rx = health_shutdown;
+                    while !*rx.borrow_and_update() {
+                        if rx.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                };
+                if let Err(e) = axum::serve(health_listener, health_router)
+                    .with_graceful_shutdown(shutdown_signal)
+                    .await
+                {
                     error!(error = %e, "health server error");
                 }
+                info!("health server drained");
             });
         }
         Err(e) => {
@@ -939,7 +978,9 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
 
     // Shared allocators for all connection handlers.
     let channel_id_alloc = Arc::new(ChannelIdAllocator::new());
-    let extranonce_alloc = Arc::new(ExtranonceAllocator::new());
+    let extranonce_alloc = Arc::new(ExtranonceAllocator::with_prefix_len(
+        cfg.gateway.extranonce_prefix_len,
+    ));
 
     // Shared job table for validation lookups across all connection handlers.
     let job_table = Arc::new(tokio::sync::RwLock::new(sv2_gateway::jobs::JobTable::new(
@@ -975,6 +1016,13 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
             .noise_cert_loaded
             .store(true, std::sync::atomic::Ordering::SeqCst);
 
+        // HMAC secret for share signing, behind RwLock for SIGHUP rotation.
+        let share_hmac_secret: Arc<std::sync::RwLock<Vec<u8>>> = Arc::new(std::sync::RwLock::new(
+            std::env::var("VELDRA_SHARE_UPSTREAM_SECRET")
+                .unwrap_or_default()
+                .into_bytes(),
+        ));
+
         // Credential watch channel: accept_loop reads the latest value on each
         // new connection. The key reload task swaps in fresh credentials on
         // SIGHUP or file change without disrupting existing connections.
@@ -987,6 +1035,7 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
         let reload_sighup = cfg.gateway.noise_keypair_reload_sighup;
         let reload_poll_secs = cfg.gateway.noise_keypair_poll_interval_secs;
         let reload_shutdown = shutdown_rx.clone();
+        let reload_hmac_secret = Arc::clone(&share_hmac_secret);
         tokio::spawn(async move {
             run_key_reload_task(
                 reload_keypair_path,
@@ -995,6 +1044,7 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                 reload_sighup,
                 reload_poll_secs,
                 creds_tx,
+                reload_hmac_secret,
                 reload_shutdown,
             )
             .await;
@@ -1027,10 +1077,6 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
             default_share_target()
         };
 
-        let share_hmac_secret = std::env::var("VELDRA_SHARE_UPSTREAM_SECRET")
-            .unwrap_or_default()
-            .into_bytes();
-
         let handler_config = Arc::new(HandlerConfig {
             max_channels_per_conn: cfg.gateway.max_channels_per_conn,
             channel_target,
@@ -1041,6 +1087,16 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
             max_shares_per_second_per_channel: cfg.gateway.max_shares_per_second_per_channel,
             gateway_instance_id: cfg.gateway.gateway_instance_id.clone(),
             share_hmac_secret,
+            extended_channels_enabled: cfg.gateway.extended_channels_enabled,
+            extranonce_prefix_len: cfg.gateway.extranonce_prefix_len,
+            vardiff_enabled: cfg.gateway.vardiff_enabled,
+            vardiff_target_shares_per_min: cfg.gateway.vardiff_target_shares_per_min,
+            vardiff_retarget_interval: Duration::from_secs(
+                cfg.gateway.vardiff_retarget_interval_secs,
+            ),
+            vardiff_min_difficulty: cfg.gateway.vardiff_min_difficulty,
+            vardiff_max_difficulty: cfg.gateway.vardiff_max_difficulty,
+            vardiff_max_adjustment_factor: cfg.gateway.vardiff_max_adjustment_factor,
         });
 
         let accept_shutdown = shutdown_rx.clone();
@@ -1117,6 +1173,31 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
     let upstream_stale_check_interval =
         Duration::from_millis(cfg.gateway.upstream_stale_max_ms.max(1000) / 2);
 
+    // Automatic inline-to-observe degradation state.
+    // When the verifier becomes unreachable for longer than
+    // `auto_degrade_after_ms`, the gateway suspends verdict enforcement
+    // and broadcasts templates immediately. Enforcement resumes when
+    // the verifier reconnects and sends a heartbeat ack.
+    let auto_degrade_enabled = cfg.gateway.auto_degrade && cfg.mode.enforces_verdicts();
+    let auto_degrade_threshold = Duration::from_millis(cfg.gateway.auto_degrade_after_ms);
+    let mut degraded = false;
+    let mut degraded_since: Option<Instant> = None;
+    let mut unenforced_jobs: u64 = 0;
+    let mut last_verifier_ack = Instant::now();
+    // Check degradation on a sub-threshold cadence so the transition
+    // fires promptly after the threshold is crossed.
+    let degrade_check_interval =
+        Duration::from_millis(cfg.gateway.auto_degrade_after_ms.max(2000) / 2);
+    let mut degrade_check_ticker = tokio::time::interval(degrade_check_interval);
+    degrade_check_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    if auto_degrade_enabled {
+        info!(
+            threshold_ms = cfg.gateway.auto_degrade_after_ms,
+            "automatic inline-to-observe degradation enabled"
+        );
+    }
+
     loop {
         // Compute the stale hold sleep future. If no deadline, sleep forever.
         let stale_hold_sleep = async {
@@ -1159,8 +1240,9 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                     warn!(error = %e, "verifier_outbound_tx send failed; template propose dropped");
                 }
 
-                if cfg.mode.enforces_verdicts() {
-                    // Inline mode: store template as pending, wait for verdict.
+                if cfg.mode.enforces_verdicts() && !degraded {
+                    // Inline mode (enforcing): store template as pending,
+                    // wait for verdict before broadcasting.
                     // Evict oldest (FIFO) if at capacity (2).
                     while pending_templates.len() >= 2 {
                         if let Some(oldest_id) = pending_order.pop_front() {
@@ -1180,7 +1262,7 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                         received_at: Instant::now(),
                     });
                 } else {
-                    // Observe mode: create and broadcast job immediately.
+                    // Observe mode or degraded inline: broadcast immediately.
                     broadcast_job_from_template(
                         &template,
                         &job_alloc,
@@ -1189,6 +1271,9 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                         &job_broadcast_tx,
                         &latest_job,
                     ).await;
+                    if degraded {
+                        unenforced_jobs += 1;
+                    }
                 }
             }
 
@@ -1265,7 +1350,50 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                         }
                     }
                     Ok(sv2_gateway::verifier_stream::VerifierInbound::HeartbeatAck) => {
-                        // Handled in verifier_stream dispatch.
+                        last_verifier_ack = Instant::now();
+                        if degraded {
+                            let dur_ms = degraded_since.map_or(0, |s| {
+                                u64::try_from(s.elapsed().as_millis())
+                                    .unwrap_or(u64::MAX)
+                            });
+                            let recover_evt =
+                                sv2_gateway::shares::ModeTransitionEvent {
+                                    event_type: "mode_transition",
+                                    direction: "recovered",
+                                    timestamp_ms:
+                                        sv2_gateway::shares::unix_ms_now(),
+                                    degraded_duration_ms: dur_ms,
+                                    unenforced_jobs,
+                                };
+                            if let Ok(line) =
+                                serde_json::to_string(&recover_evt)
+                            {
+                                info!(
+                                    target: "share_events", "{}", line
+                                );
+                            }
+                            // Verifier is back. Resume enforcement.
+                            degraded = false;
+                            degraded_since = None;
+                            unenforced_jobs = 0;
+                            readiness.clear_degraded();
+                            stale_hold_deadline = None;
+                            // Drain any pending templates that accumulated
+                            // during recovery. They will be re-proposed on
+                            // the next template arrival.
+                            pending_templates.clear();
+                            pending_order.clear();
+                            gw_metrics.mode_transitions_total
+                                .get_or_create(&ModeTransitionLabels {
+                                    direction: "recovered".into(),
+                                })
+                                .inc();
+                            warn!(
+                                degraded_duration_ms = dur_ms,
+                                unenforced_jobs = recover_evt.unenforced_jobs,
+                                "verifier recovered; resuming inline enforcement"
+                            );
+                        }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         warn!(missed = n, "verdict broadcast lagged");
@@ -1292,18 +1420,51 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                     // WAL: mark forward complete (removes pending entry).
                     // Runs on the blocking thread pool to avoid stalling
                     // the tokio executor on disk I/O.
+                    //
+                    // Write failures are fatal by default: a silent WAL
+                    // error would orphan pending entries with no recovery
+                    // record, permanently breaking the 1:1 join invariant
+                    // between ShareAcceptedEvent and ShareForwardResultEvent.
+                    // Set VELDRA_WAL_WRITE_FAILURE_MODE=accept_silent to
+                    // temporarily preserve the pre-R-152 behaviour; this
+                    // flag is intended for one-release migrations only and
+                    // will be removed in v1.3.0.
                     if let Some(ref wal) = share_wal {
                         let wal = Arc::clone(wal);
                         let sid = result.share_id_hex.clone();
                         let eid = result.event_id_hex.clone();
-                        let _ = tokio::task::spawn_blocking(move || {
-                            if let Ok(mut w) = wal.lock() {
-                                w.mark_completed(&sid, &eid);
-                            } else {
-                                error!("wal: mutex poisoned in mark_completed");
-                            }
+                        let sid_trace = result.share_id_hex.clone();
+                        let wal_result = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+                            let mut w = wal.lock().map_err(|_| {
+                                std::io::Error::other("wal mutex poisoned in mark_completed")
+                            })?;
+                            w.mark_completed(&sid, &eid)
                         })
                         .await;
+                        let io_err = match wal_result {
+                            Ok(Ok(())) => None,
+                            Ok(Err(e)) => Some(e),
+                            Err(join_err) => Some(std::io::Error::other(format!(
+                                "wal mark_completed spawn_blocking: {join_err}"
+                            ))),
+                        };
+                        if let Some(e) = io_err {
+                            let mode = std::env::var("VELDRA_WAL_WRITE_FAILURE_MODE")
+                                .unwrap_or_else(|_| "fatal".to_string());
+                            error!(
+                                share_id = %sid_trace,
+                                op = "mark_completed",
+                                error = %e,
+                                mode = %mode,
+                                reason_code = "wal_write_failure",
+                                "wal: write failure; durability cannot be preserved"
+                            );
+                            if mode != "accept_silent" {
+                                readiness.set_draining();
+                                let _ = shutdown_tx.send(true);
+                                break;
+                            }
+                        }
                     }
 
                     let forward_evt = sv2_gateway::shares::ShareForwardResultEvent::from_relay(
@@ -1354,22 +1515,51 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                     channel_registry.update_share(evt.channel_id, accepted, evt.difficulty_u64).await;
 
                     // WAL: track accepted shares that require a forward result.
-                    // Must complete before downstream SV2 ACK so a crash
-                    // between here and the forward result is recoverable.
+                    // Write-ordering note: the SV2 ACK for this share has
+                    // already been sent by the connection handler by the
+                    // time this event is received, so failure here cannot
+                    // "un-ACK" the share. What it MUST prevent is the next
+                    // share being accepted into a state where durability
+                    // has silently broken. See the fatality comment on the
+                    // share_result_rx arm above.
                     if evt.sv2_response == "success"
                         && let Some(ref wal) = share_wal
                     {
                         let wal = Arc::clone(wal);
                         let sid = evt.share_id_hex.clone();
                         let eid = evt.event_id_hex.clone();
-                        let _ = tokio::task::spawn_blocking(move || {
-                            if let Ok(mut w) = wal.lock() {
-                                w.mark_pending(&sid, &eid);
-                            } else {
-                                error!("wal: mutex poisoned in mark_pending");
-                            }
+                        let sid_trace = evt.share_id_hex.clone();
+                        let wal_result = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+                            let mut w = wal.lock().map_err(|_| {
+                                std::io::Error::other("wal mutex poisoned in mark_pending")
+                            })?;
+                            w.mark_pending(&sid, &eid)
                         })
                         .await;
+                        let io_err = match wal_result {
+                            Ok(Ok(())) => None,
+                            Ok(Err(e)) => Some(e),
+                            Err(join_err) => Some(std::io::Error::other(format!(
+                                "wal mark_pending spawn_blocking: {join_err}"
+                            ))),
+                        };
+                        if let Some(e) = io_err {
+                            let mode = std::env::var("VELDRA_WAL_WRITE_FAILURE_MODE")
+                                .unwrap_or_else(|_| "fatal".to_string());
+                            error!(
+                                share_id = %sid_trace,
+                                op = "mark_pending",
+                                error = %e,
+                                mode = %mode,
+                                reason_code = "wal_write_failure",
+                                "wal: write failure; durability cannot be preserved"
+                            );
+                            if mode != "accept_silent" {
+                                readiness.set_draining();
+                                let _ = shutdown_tx.send(true);
+                                break;
+                            }
+                        }
                     }
                     if let Ok(line) = serde_json::to_string(&evt) {
                         info!(target: "share_events", "{}", line);
@@ -1402,12 +1592,20 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
 
             // Stale hold timer expiry (inline mode only).
             () = stale_hold_sleep => {
-                error!("stale hold timer expired; prevhash switch timed out");
-                // Each connection's run_connection emits a DisconnectEvent
-                // with ShutdownDrain when it observes the shutdown signal.
-                readiness.set_draining();
-                let _ = shutdown_tx.send(true);
-                break;
+                if degraded {
+                    // In degraded mode the stale hold timer is harmless
+                    // because templates are already flowing without
+                    // enforcement. Cancel and continue.
+                    stale_hold_deadline = None;
+                    debug!("stale hold timer expired during degraded mode; ignoring");
+                } else {
+                    error!("stale hold timer expired; prevhash switch timed out");
+                    // Each connection's run_connection emits a DisconnectEvent
+                    // with ShutdownDrain when it observes the shutdown signal.
+                    readiness.set_draining();
+                    let _ = shutdown_tx.send(true);
+                    break;
+                }
             }
 
             // M-5 fix: proactive upstream staleness timer.
@@ -1435,6 +1633,65 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                             );
                         }
                     }
+                }
+            }
+
+            // Automatic inline-to-observe degradation check.
+            _ = degrade_check_ticker.tick() => {
+                if auto_degrade_enabled
+                    && !degraded
+                    && last_verifier_ack.elapsed() > auto_degrade_threshold
+                {
+                    degraded = true;
+                    degraded_since = Some(Instant::now());
+                    unenforced_jobs = 0;
+                    readiness.set_degraded();
+                    // Flush all pending templates: broadcast immediately so
+                    // miners are not starved while enforcement is suspended.
+                    for id in pending_order.drain(..) {
+                        if let Some(pt) = pending_templates.remove(&id) {
+                            broadcast_job_from_template(
+                                &pt.template,
+                                &job_alloc,
+                                &job_table,
+                                &mut active_prev_hash,
+                                &job_broadcast_tx,
+                                &latest_job,
+                            )
+                            .await;
+                            unenforced_jobs += 1;
+                        }
+                    }
+                    pending_templates.clear();
+                    stale_hold_deadline = None;
+                    gw_metrics
+                        .mode_transitions_total
+                        .get_or_create(&ModeTransitionLabels {
+                            direction: "degraded".into(),
+                        })
+                        .inc();
+                    let degrade_evt =
+                        sv2_gateway::shares::ModeTransitionEvent {
+                            event_type: "mode_transition",
+                            direction: "degraded",
+                            timestamp_ms: sv2_gateway::shares::unix_ms_now(),
+                            degraded_duration_ms: 0,
+                            unenforced_jobs,
+                        };
+                    if let Ok(line) = serde_json::to_string(&degrade_evt) {
+                        info!(target: "share_events", "{}", line);
+                    }
+                    error!(
+                        elapsed_ms =
+                            u64::try_from(
+                                last_verifier_ack.elapsed().as_millis()
+                            )
+                            .unwrap_or(u64::MAX),
+                        threshold_ms =
+                            cfg.gateway.auto_degrade_after_ms,
+                        "verifier heartbeat lost; entering degraded \
+                         mode (verdict enforcement suspended)"
+                    );
                 }
             }
 
@@ -1653,6 +1910,10 @@ fn build_template_propose(
         coinbase_sigops: template.coinbase_sigops,
         template_weight: template.template_weight,
         gateway_instance_id: Some(gateway_instance_id.to_string()),
+        // ADR-002 Phase 1: the SV2 gateway does not yet serialize raw
+        // block bytes. The shield runs only for senders that populate
+        // this field. Phase 1b work lands the wire encoding path.
+        raw_block_hex: None,
     }
 }
 
@@ -1765,6 +2026,18 @@ async fn accept_loop(
                             };
 
                             // 2. Run full SV2 session handler.
+                            let retarget_up = conn_metrics
+                                .vardiff_retargets_total
+                                .get_or_create(&VardiffLabels {
+                                    direction: "up".into(),
+                                })
+                                .clone();
+                            let retarget_down = conn_metrics
+                                .vardiff_retargets_total
+                                .get_or_create(&VardiffLabels {
+                                    direction: "down".into(),
+                                })
+                                .clone();
                             let ctx = ConnectionContext {
                                 transport,
                                 peer: addr,
@@ -1779,6 +2052,8 @@ async fn accept_loop(
                                 shutdown: conn_shutdown,
                                 permit,
                                 channel_registry: conn_channel_registry,
+                                vardiff_retarget_up: retarget_up,
+                                vardiff_retarget_down: retarget_down,
                             };
 
                             let exit = sv2_gateway::handler::run_connection(ctx).await;
@@ -1899,7 +2174,7 @@ fn build_verifier_tls(cfg: &GatewayConfig) -> Result<VerifierTlsConfig, String> 
 /// A failed reload (bad file, key mismatch) is logged as an error and the
 /// previous credentials remain active. This is a fail-safe design: operators
 /// can fix the key file and re-signal without a process restart.
-#[allow(clippy::too_many_lines)] // Signal handling loop; splitting breaks reload flow.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn run_key_reload_task(
     keypair_path: String,
     authority_pubkey: String,
@@ -1907,6 +2182,7 @@ async fn run_key_reload_task(
     sighup_enabled: bool,
     poll_interval_secs: u64,
     creds_tx: watch::Sender<Arc<AuthorityCredentials>>,
+    share_hmac_secret: Arc<std::sync::RwLock<Vec<u8>>>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     // Track the last known mtime so file-poll only reloads on actual change.
@@ -2004,6 +2280,34 @@ async fn run_key_reload_task(
                             trigger = %trigger_kind,
                             "keypair reload failed; keeping previous credentials"
                         );
+                    }
+                }
+
+                // On SIGHUP, also re-read the share upstream HMAC secret.
+                // The env var may have been updated by the operator before
+                // sending the signal. File-poll triggers skip this because
+                // the HMAC secret is not file-backed.
+                if matches!(trigger_kind, KeyReloadTrigger::Sighup) {
+                    let new_secret = std::env::var("VELDRA_SHARE_UPSTREAM_SECRET")
+                        .unwrap_or_default()
+                        .into_bytes();
+                    let changed = share_hmac_secret
+                        .read()
+                        .map_or(true, |old| *old != new_secret);
+                    if changed {
+                        match share_hmac_secret.write() {
+                            Ok(mut guard) => {
+                                *guard = new_secret;
+                                info!("share upstream HMAC secret rotated");
+                            }
+                            Err(e) => {
+                                error!(
+                                    error = %e,
+                                    "share_hmac_secret write lock poisoned; \
+                                     secret rotation failed"
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -2144,6 +2448,9 @@ mod key_reload_tests {
         let task_path = path.to_str().unwrap().to_string();
         let task_pubkey = pubkey_hex.clone();
 
+        let test_hmac_secret: Arc<std::sync::RwLock<Vec<u8>>> =
+            Arc::new(std::sync::RwLock::new(Vec::new()));
+
         let handle = tokio::spawn(async move {
             run_key_reload_task(
                 task_path,
@@ -2152,6 +2459,7 @@ mod key_reload_tests {
                 false, // no SIGHUP in test
                 1,     // 1 second poll
                 creds_tx,
+                test_hmac_secret,
                 shutdown_rx,
             )
             .await;

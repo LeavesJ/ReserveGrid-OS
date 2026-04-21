@@ -167,6 +167,11 @@ async fn handle_client(mut stream: TcpStream, cfg: BridgeConfig) -> Result<()> {
             coinbase_sigops: None,
             template_weight: None,
             gateway_instance_id: None,
+
+            // v2.0 Invariant Shield (ADR-002 Phase 1): the synthetic
+            // bridge has no real block bytes, so the shield pass is
+            // skipped for its proposals.
+            raw_block_hex: None,
         };
 
         let json = serde_json::to_string(&tpl)?;

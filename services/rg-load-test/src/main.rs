@@ -536,6 +536,9 @@ fn generate_valid(template_id: u64, rng: &mut ChaCha12Rng) -> TemplatePropose {
         coinbase_sigops: Some(100),
         template_weight: Some(3_000_000),
         gateway_instance_id: Some("rg-load-test".to_string()),
+        // Load test carries no real block bytes; the shield pass is
+        // skipped for synthetic templates (ADR-002 Phase 1).
+        raw_block_hex: None,
     }
 }
 

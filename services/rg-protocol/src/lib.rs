@@ -42,6 +42,16 @@ pub struct TemplatePropose {
     /// another. Optional for backward compatibility.
     #[serde(default)]
     pub gateway_instance_id: Option<String>,
+
+    /// Lowercase hex encoding of the raw serialized block bytes for the
+    /// v2.0 Invariant Shield (ADR-002 Phase 1). When present the verifier
+    /// runs the rg-consensus re-derivations and rejects on mismatch with
+    /// a canonical `v2_invariant_*` reason code. When absent the shield
+    /// pass is silently skipped and the verifier increments
+    /// `verifier_shield_skipped_total`. Older senders omit the field;
+    /// backward compatible via `#[serde(default)]`.
+    #[serde(default)]
+    pub raw_block_hex: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,6 +127,88 @@ pub enum VerdictReason {
 
     /// `coinbase_sigops` outside expected range (observe only in 0.2.2)
     CoinbaseSigopsAbnormal,
+
+    // ── v2.0 Invariant Shield (ADR-002 Phase 1, 18 codes) ──
+    //
+    // Each variant below mirrors a `ConsensusViolation` variant in the
+    // `rg-consensus` facade crate. Canonical `snake_case` strings are
+    // PINNED via explicit `#[serde(rename = "...")]` attributes because
+    // serde's automatic snake_case conversion of CamelCase that starts
+    // with a digit pair (`V2InvariantX`) is not guaranteed to insert
+    // the underscore after the digit. Explicit renames remove that
+    // ambiguity and keep R-13 (canonical reason code strings) safe by
+    // construction rather than by test catch-up.
+    /// Coinbase value disagrees with re-derived.
+    #[serde(rename = "v2_invariant_coinbase_value_mismatch")]
+    V2InvariantCoinbaseValueMismatch,
+
+    /// Declared `template_weight` disagrees with re-derived.
+    #[serde(rename = "v2_invariant_template_weight_mismatch")]
+    V2InvariantTemplateWeightMismatch,
+
+    /// Merkle root does not match re-derived.
+    #[serde(rename = "v2_invariant_merkle_root_mismatch")]
+    V2InvariantMerkleRootMismatch,
+
+    /// Witness commitment missing when segwit transactions are present.
+    #[serde(rename = "v2_invariant_witness_commitment_missing")]
+    V2InvariantWitnessCommitmentMissing,
+
+    /// Witness commitment value does not match re-derived.
+    #[serde(rename = "v2_invariant_witness_commitment_mismatch")]
+    V2InvariantWitnessCommitmentMismatch,
+
+    /// Total sigops disagrees with re-derived.
+    #[serde(rename = "v2_invariant_sigops_mismatch")]
+    V2InvariantSigopsMismatch,
+
+    /// Coinbase sigops disagrees with re-derived.
+    #[serde(rename = "v2_invariant_coinbase_sigops_mismatch")]
+    V2InvariantCoinbaseSigopsMismatch,
+
+    /// Transaction count disagrees with re-derived.
+    #[serde(rename = "v2_invariant_tx_count_mismatch")]
+    V2InvariantTxCountMismatch,
+
+    /// Coinbase script length outside BIP-34 constraints.
+    #[serde(rename = "v2_invariant_coinbase_script_length")]
+    V2InvariantCoinbaseScriptLength,
+
+    /// Coinbase output count outside protocol constraints.
+    #[serde(rename = "v2_invariant_coinbase_output_count")]
+    V2InvariantCoinbaseOutputCount,
+
+    /// Coinbase missing height push (BIP-34).
+    #[serde(rename = "v2_invariant_coinbase_bip34_missing")]
+    V2InvariantCoinbaseBip34Missing,
+
+    /// Coinbase height push disagrees with header height.
+    #[serde(rename = "v2_invariant_coinbase_height_mismatch")]
+    V2InvariantCoinbaseHeightMismatch,
+
+    /// Block weight exceeds consensus maximum.
+    #[serde(rename = "v2_invariant_weight_exceeds_max")]
+    V2InvariantWeightExceedsMax,
+
+    /// Block sigops exceed consensus maximum.
+    #[serde(rename = "v2_invariant_sigops_exceed_max")]
+    V2InvariantSigopsExceedMax,
+
+    /// Non coinbase transaction carries a null prevout.
+    #[serde(rename = "v2_invariant_nontcb_null_prevout")]
+    V2InvariantNontcbNullPrevout,
+
+    /// Block header version below active soft fork floor.
+    #[serde(rename = "v2_invariant_header_version_low")]
+    V2InvariantHeaderVersionLow,
+
+    /// Duplicate transaction in block body.
+    #[serde(rename = "v2_invariant_duplicate_tx")]
+    V2InvariantDuplicateTx,
+
+    /// Raw block bytes fail to deserialize.
+    #[serde(rename = "v2_invariant_decode_failed")]
+    V2InvariantDecodeFailed,
 }
 
 impl VerdictReason {
@@ -137,6 +229,25 @@ impl VerdictReason {
         VerdictReason::TemplateStale,
         VerdictReason::SigopsBudgetWarning,
         VerdictReason::CoinbaseSigopsAbnormal,
+        // v2.0 Invariant Shield (ADR-002)
+        VerdictReason::V2InvariantCoinbaseValueMismatch,
+        VerdictReason::V2InvariantTemplateWeightMismatch,
+        VerdictReason::V2InvariantMerkleRootMismatch,
+        VerdictReason::V2InvariantWitnessCommitmentMissing,
+        VerdictReason::V2InvariantWitnessCommitmentMismatch,
+        VerdictReason::V2InvariantSigopsMismatch,
+        VerdictReason::V2InvariantCoinbaseSigopsMismatch,
+        VerdictReason::V2InvariantTxCountMismatch,
+        VerdictReason::V2InvariantCoinbaseScriptLength,
+        VerdictReason::V2InvariantCoinbaseOutputCount,
+        VerdictReason::V2InvariantCoinbaseBip34Missing,
+        VerdictReason::V2InvariantCoinbaseHeightMismatch,
+        VerdictReason::V2InvariantWeightExceedsMax,
+        VerdictReason::V2InvariantSigopsExceedMax,
+        VerdictReason::V2InvariantNontcbNullPrevout,
+        VerdictReason::V2InvariantHeaderVersionLow,
+        VerdictReason::V2InvariantDuplicateTx,
+        VerdictReason::V2InvariantDecodeFailed,
     ];
 
     /// All canonical `snake_case` reason code strings, for test enumeration
@@ -157,6 +268,25 @@ impl VerdictReason {
         "template_stale",
         "sigops_budget_warning",
         "coinbase_sigops_abnormal",
+        // v2.0 Invariant Shield (ADR-002)
+        "v2_invariant_coinbase_value_mismatch",
+        "v2_invariant_template_weight_mismatch",
+        "v2_invariant_merkle_root_mismatch",
+        "v2_invariant_witness_commitment_missing",
+        "v2_invariant_witness_commitment_mismatch",
+        "v2_invariant_sigops_mismatch",
+        "v2_invariant_coinbase_sigops_mismatch",
+        "v2_invariant_tx_count_mismatch",
+        "v2_invariant_coinbase_script_length",
+        "v2_invariant_coinbase_output_count",
+        "v2_invariant_coinbase_bip34_missing",
+        "v2_invariant_coinbase_height_mismatch",
+        "v2_invariant_weight_exceeds_max",
+        "v2_invariant_sigops_exceed_max",
+        "v2_invariant_nontcb_null_prevout",
+        "v2_invariant_header_version_low",
+        "v2_invariant_duplicate_tx",
+        "v2_invariant_decode_failed",
     ];
 
     /// Returns all canonical `snake_case` reason code strings.
@@ -186,6 +316,37 @@ impl VerdictReason {
             VerdictReason::TemplateStale => "template_stale",
             VerdictReason::SigopsBudgetWarning => "sigops_budget_warning",
             VerdictReason::CoinbaseSigopsAbnormal => "coinbase_sigops_abnormal",
+            // v2.0 Invariant Shield (ADR-002)
+            VerdictReason::V2InvariantCoinbaseValueMismatch => {
+                "v2_invariant_coinbase_value_mismatch"
+            }
+            VerdictReason::V2InvariantTemplateWeightMismatch => {
+                "v2_invariant_template_weight_mismatch"
+            }
+            VerdictReason::V2InvariantMerkleRootMismatch => "v2_invariant_merkle_root_mismatch",
+            VerdictReason::V2InvariantWitnessCommitmentMissing => {
+                "v2_invariant_witness_commitment_missing"
+            }
+            VerdictReason::V2InvariantWitnessCommitmentMismatch => {
+                "v2_invariant_witness_commitment_mismatch"
+            }
+            VerdictReason::V2InvariantSigopsMismatch => "v2_invariant_sigops_mismatch",
+            VerdictReason::V2InvariantCoinbaseSigopsMismatch => {
+                "v2_invariant_coinbase_sigops_mismatch"
+            }
+            VerdictReason::V2InvariantTxCountMismatch => "v2_invariant_tx_count_mismatch",
+            VerdictReason::V2InvariantCoinbaseScriptLength => "v2_invariant_coinbase_script_length",
+            VerdictReason::V2InvariantCoinbaseOutputCount => "v2_invariant_coinbase_output_count",
+            VerdictReason::V2InvariantCoinbaseBip34Missing => "v2_invariant_coinbase_bip34_missing",
+            VerdictReason::V2InvariantCoinbaseHeightMismatch => {
+                "v2_invariant_coinbase_height_mismatch"
+            }
+            VerdictReason::V2InvariantWeightExceedsMax => "v2_invariant_weight_exceeds_max",
+            VerdictReason::V2InvariantSigopsExceedMax => "v2_invariant_sigops_exceed_max",
+            VerdictReason::V2InvariantNontcbNullPrevout => "v2_invariant_nontcb_null_prevout",
+            VerdictReason::V2InvariantHeaderVersionLow => "v2_invariant_header_version_low",
+            VerdictReason::V2InvariantDuplicateTx => "v2_invariant_duplicate_tx",
+            VerdictReason::V2InvariantDecodeFailed => "v2_invariant_decode_failed",
         }
     }
 }
@@ -241,9 +402,10 @@ mod tests {
     fn all_constant_covers_every_variant() {
         // If a variant is added to the enum but not to ALL, this count will
         // mismatch and the serde round-trip test below will not cover it.
+        // 15 original (v1.x) + 18 v2.0 Invariant Shield (ADR-002) = 33.
         assert_eq!(
             VerdictReason::ALL.len(),
-            15,
+            33,
             "VerdictReason::ALL length mismatch — did you add a variant?"
         );
     }
