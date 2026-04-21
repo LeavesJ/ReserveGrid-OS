@@ -200,6 +200,12 @@ pub enum GatewayReason {
     /// Emitted during WAL reconciliation on startup.
     ProcessCrashRecovery,
 
+    /// WAL append failed (disk full, fsync error, mutex poisoned, `spawn_blocking`
+    /// join failure). Emitted as a structured log event immediately before the
+    /// gateway begins graceful shutdown when `VELDRA_WAL_WRITE_FAILURE_MODE` is
+    /// not set to `accept_silent`. Never reaches the SV2 wire.
+    WalWriteFailure,
+
     // ── Connection lifecycle (disconnect telemetry) ──
     /// Peer TCP connection dropped or transport I/O error.
     PeerTransportError,
@@ -280,6 +286,7 @@ impl GatewayReason {
         GatewayReason::ShareEvictedFromQueue,
         GatewayReason::ShareRateLimited,
         GatewayReason::ProcessCrashRecovery,
+        GatewayReason::WalWriteFailure,
         // Connection lifecycle
         GatewayReason::PeerTransportError,
         GatewayReason::ChannelOpenTimeout,
@@ -352,6 +359,7 @@ impl GatewayReason {
         "share_rate_limited",
         // Crash recovery
         "process_crash_recovery",
+        "wal_write_failure",
         // Connection lifecycle
         "peer_transport_error",
         "channel_open_timeout",
@@ -423,6 +431,7 @@ impl GatewayReason {
             GatewayReason::ShareEvictedFromQueue => "share_evicted_from_queue",
             GatewayReason::ShareRateLimited => "share_rate_limited",
             GatewayReason::ProcessCrashRecovery => "process_crash_recovery",
+            GatewayReason::WalWriteFailure => "wal_write_failure",
             // Connection lifecycle
             GatewayReason::PeerTransportError => "peer_transport_error",
             GatewayReason::ChannelOpenTimeout => "channel_open_timeout",
@@ -530,6 +539,50 @@ pub enum ReasonCode {
     SigopsBudgetWarning,
     CoinbaseSigopsAbnormal,
 
+    // ── v2.0 Invariant Shield (ADR-002 Phase 1, verifier-layer) ──
+    //
+    // Explicit `#[serde(rename)]` on every variant because serde's
+    // automatic snake_case conversion does not guarantee an underscore
+    // between a leading digit pair (`V2`) and the following uppercase
+    // word. Pinning the string by hand keeps R-13 drift impossible by
+    // construction.
+    #[serde(rename = "v2_invariant_coinbase_value_mismatch")]
+    V2InvariantCoinbaseValueMismatch,
+    #[serde(rename = "v2_invariant_template_weight_mismatch")]
+    V2InvariantTemplateWeightMismatch,
+    #[serde(rename = "v2_invariant_merkle_root_mismatch")]
+    V2InvariantMerkleRootMismatch,
+    #[serde(rename = "v2_invariant_witness_commitment_missing")]
+    V2InvariantWitnessCommitmentMissing,
+    #[serde(rename = "v2_invariant_witness_commitment_mismatch")]
+    V2InvariantWitnessCommitmentMismatch,
+    #[serde(rename = "v2_invariant_sigops_mismatch")]
+    V2InvariantSigopsMismatch,
+    #[serde(rename = "v2_invariant_coinbase_sigops_mismatch")]
+    V2InvariantCoinbaseSigopsMismatch,
+    #[serde(rename = "v2_invariant_tx_count_mismatch")]
+    V2InvariantTxCountMismatch,
+    #[serde(rename = "v2_invariant_coinbase_script_length")]
+    V2InvariantCoinbaseScriptLength,
+    #[serde(rename = "v2_invariant_coinbase_output_count")]
+    V2InvariantCoinbaseOutputCount,
+    #[serde(rename = "v2_invariant_coinbase_bip34_missing")]
+    V2InvariantCoinbaseBip34Missing,
+    #[serde(rename = "v2_invariant_coinbase_height_mismatch")]
+    V2InvariantCoinbaseHeightMismatch,
+    #[serde(rename = "v2_invariant_weight_exceeds_max")]
+    V2InvariantWeightExceedsMax,
+    #[serde(rename = "v2_invariant_sigops_exceed_max")]
+    V2InvariantSigopsExceedMax,
+    #[serde(rename = "v2_invariant_nontcb_null_prevout")]
+    V2InvariantNontcbNullPrevout,
+    #[serde(rename = "v2_invariant_header_version_low")]
+    V2InvariantHeaderVersionLow,
+    #[serde(rename = "v2_invariant_duplicate_tx")]
+    V2InvariantDuplicateTx,
+    #[serde(rename = "v2_invariant_decode_failed")]
+    V2InvariantDecodeFailed,
+
     // ── Gateway operational (from GatewayReason) ──
     AuthFailed,
     UnsupportedAlgorithm,
@@ -598,6 +651,8 @@ pub enum ReasonCode {
     // ── Crash recovery ──
     /// Synthetic forward result for shares orphaned by a process crash
     ProcessCrashRecovery,
+    /// WAL append failed; gateway is shutting down to preserve durability
+    WalWriteFailure,
 
     // ── Connection lifecycle (disconnect telemetry) ──
     /// Peer TCP connection dropped or transport I/O error
@@ -636,6 +691,25 @@ impl ReasonCode {
         ReasonCode::TemplateStale,
         ReasonCode::SigopsBudgetWarning,
         ReasonCode::CoinbaseSigopsAbnormal,
+        // v2.0 Invariant Shield (ADR-002)
+        ReasonCode::V2InvariantCoinbaseValueMismatch,
+        ReasonCode::V2InvariantTemplateWeightMismatch,
+        ReasonCode::V2InvariantMerkleRootMismatch,
+        ReasonCode::V2InvariantWitnessCommitmentMissing,
+        ReasonCode::V2InvariantWitnessCommitmentMismatch,
+        ReasonCode::V2InvariantSigopsMismatch,
+        ReasonCode::V2InvariantCoinbaseSigopsMismatch,
+        ReasonCode::V2InvariantTxCountMismatch,
+        ReasonCode::V2InvariantCoinbaseScriptLength,
+        ReasonCode::V2InvariantCoinbaseOutputCount,
+        ReasonCode::V2InvariantCoinbaseBip34Missing,
+        ReasonCode::V2InvariantCoinbaseHeightMismatch,
+        ReasonCode::V2InvariantWeightExceedsMax,
+        ReasonCode::V2InvariantSigopsExceedMax,
+        ReasonCode::V2InvariantNontcbNullPrevout,
+        ReasonCode::V2InvariantHeaderVersionLow,
+        ReasonCode::V2InvariantDuplicateTx,
+        ReasonCode::V2InvariantDecodeFailed,
         // Gateway operational
         ReasonCode::AuthFailed,
         ReasonCode::UnsupportedAlgorithm,
@@ -696,6 +770,7 @@ impl ReasonCode {
         ReasonCode::ShareRateLimited,
         // Crash recovery
         ReasonCode::ProcessCrashRecovery,
+        ReasonCode::WalWriteFailure,
         // Connection lifecycle
         ReasonCode::PeerTransportError,
         ReasonCode::ChannelOpenTimeout,
@@ -723,6 +798,25 @@ impl ReasonCode {
         "template_stale",
         "sigops_budget_warning",
         "coinbase_sigops_abnormal",
+        // v2.0 Invariant Shield (ADR-002)
+        "v2_invariant_coinbase_value_mismatch",
+        "v2_invariant_template_weight_mismatch",
+        "v2_invariant_merkle_root_mismatch",
+        "v2_invariant_witness_commitment_missing",
+        "v2_invariant_witness_commitment_mismatch",
+        "v2_invariant_sigops_mismatch",
+        "v2_invariant_coinbase_sigops_mismatch",
+        "v2_invariant_tx_count_mismatch",
+        "v2_invariant_coinbase_script_length",
+        "v2_invariant_coinbase_output_count",
+        "v2_invariant_coinbase_bip34_missing",
+        "v2_invariant_coinbase_height_mismatch",
+        "v2_invariant_weight_exceeds_max",
+        "v2_invariant_sigops_exceed_max",
+        "v2_invariant_nontcb_null_prevout",
+        "v2_invariant_header_version_low",
+        "v2_invariant_duplicate_tx",
+        "v2_invariant_decode_failed",
         "auth_failed",
         "unsupported_algorithm",
         "rate_limited",
@@ -782,6 +876,7 @@ impl ReasonCode {
         "share_rate_limited",
         // Crash recovery
         "process_crash_recovery",
+        "wal_write_failure",
         // Connection lifecycle
         "peer_transport_error",
         "channel_open_timeout",
@@ -793,6 +888,7 @@ impl ReasonCode {
     ];
 
     /// Canonical `snake_case` string for this reason code.
+    #[allow(clippy::too_many_lines)]
     pub fn as_str(&self) -> &'static str {
         match self {
             // Template verification
@@ -810,6 +906,35 @@ impl ReasonCode {
             ReasonCode::TemplateStale => "template_stale",
             ReasonCode::SigopsBudgetWarning => "sigops_budget_warning",
             ReasonCode::CoinbaseSigopsAbnormal => "coinbase_sigops_abnormal",
+            // v2.0 Invariant Shield (ADR-002)
+            ReasonCode::V2InvariantCoinbaseValueMismatch => "v2_invariant_coinbase_value_mismatch",
+            ReasonCode::V2InvariantTemplateWeightMismatch => {
+                "v2_invariant_template_weight_mismatch"
+            }
+            ReasonCode::V2InvariantMerkleRootMismatch => "v2_invariant_merkle_root_mismatch",
+            ReasonCode::V2InvariantWitnessCommitmentMissing => {
+                "v2_invariant_witness_commitment_missing"
+            }
+            ReasonCode::V2InvariantWitnessCommitmentMismatch => {
+                "v2_invariant_witness_commitment_mismatch"
+            }
+            ReasonCode::V2InvariantSigopsMismatch => "v2_invariant_sigops_mismatch",
+            ReasonCode::V2InvariantCoinbaseSigopsMismatch => {
+                "v2_invariant_coinbase_sigops_mismatch"
+            }
+            ReasonCode::V2InvariantTxCountMismatch => "v2_invariant_tx_count_mismatch",
+            ReasonCode::V2InvariantCoinbaseScriptLength => "v2_invariant_coinbase_script_length",
+            ReasonCode::V2InvariantCoinbaseOutputCount => "v2_invariant_coinbase_output_count",
+            ReasonCode::V2InvariantCoinbaseBip34Missing => "v2_invariant_coinbase_bip34_missing",
+            ReasonCode::V2InvariantCoinbaseHeightMismatch => {
+                "v2_invariant_coinbase_height_mismatch"
+            }
+            ReasonCode::V2InvariantWeightExceedsMax => "v2_invariant_weight_exceeds_max",
+            ReasonCode::V2InvariantSigopsExceedMax => "v2_invariant_sigops_exceed_max",
+            ReasonCode::V2InvariantNontcbNullPrevout => "v2_invariant_nontcb_null_prevout",
+            ReasonCode::V2InvariantHeaderVersionLow => "v2_invariant_header_version_low",
+            ReasonCode::V2InvariantDuplicateTx => "v2_invariant_duplicate_tx",
+            ReasonCode::V2InvariantDecodeFailed => "v2_invariant_decode_failed",
             // Gateway operational
             ReasonCode::AuthFailed => "auth_failed",
             ReasonCode::UnsupportedAlgorithm => "unsupported_algorithm",
@@ -870,6 +995,7 @@ impl ReasonCode {
             ReasonCode::ShareRateLimited => "share_rate_limited",
             // Crash recovery
             ReasonCode::ProcessCrashRecovery => "process_crash_recovery",
+            ReasonCode::WalWriteFailure => "wal_write_failure",
             // Connection lifecycle
             ReasonCode::PeerTransportError => "peer_transport_error",
             ReasonCode::ChannelOpenTimeout => "channel_open_timeout",
@@ -909,6 +1035,45 @@ impl From<VerdictReason> for ReasonCode {
             VerdictReason::TemplateStale => ReasonCode::TemplateStale,
             VerdictReason::SigopsBudgetWarning => ReasonCode::SigopsBudgetWarning,
             VerdictReason::CoinbaseSigopsAbnormal => ReasonCode::CoinbaseSigopsAbnormal,
+            // v2.0 Invariant Shield (ADR-002)
+            VerdictReason::V2InvariantCoinbaseValueMismatch => {
+                ReasonCode::V2InvariantCoinbaseValueMismatch
+            }
+            VerdictReason::V2InvariantTemplateWeightMismatch => {
+                ReasonCode::V2InvariantTemplateWeightMismatch
+            }
+            VerdictReason::V2InvariantMerkleRootMismatch => {
+                ReasonCode::V2InvariantMerkleRootMismatch
+            }
+            VerdictReason::V2InvariantWitnessCommitmentMissing => {
+                ReasonCode::V2InvariantWitnessCommitmentMissing
+            }
+            VerdictReason::V2InvariantWitnessCommitmentMismatch => {
+                ReasonCode::V2InvariantWitnessCommitmentMismatch
+            }
+            VerdictReason::V2InvariantSigopsMismatch => ReasonCode::V2InvariantSigopsMismatch,
+            VerdictReason::V2InvariantCoinbaseSigopsMismatch => {
+                ReasonCode::V2InvariantCoinbaseSigopsMismatch
+            }
+            VerdictReason::V2InvariantTxCountMismatch => ReasonCode::V2InvariantTxCountMismatch,
+            VerdictReason::V2InvariantCoinbaseScriptLength => {
+                ReasonCode::V2InvariantCoinbaseScriptLength
+            }
+            VerdictReason::V2InvariantCoinbaseOutputCount => {
+                ReasonCode::V2InvariantCoinbaseOutputCount
+            }
+            VerdictReason::V2InvariantCoinbaseBip34Missing => {
+                ReasonCode::V2InvariantCoinbaseBip34Missing
+            }
+            VerdictReason::V2InvariantCoinbaseHeightMismatch => {
+                ReasonCode::V2InvariantCoinbaseHeightMismatch
+            }
+            VerdictReason::V2InvariantWeightExceedsMax => ReasonCode::V2InvariantWeightExceedsMax,
+            VerdictReason::V2InvariantSigopsExceedMax => ReasonCode::V2InvariantSigopsExceedMax,
+            VerdictReason::V2InvariantNontcbNullPrevout => ReasonCode::V2InvariantNontcbNullPrevout,
+            VerdictReason::V2InvariantHeaderVersionLow => ReasonCode::V2InvariantHeaderVersionLow,
+            VerdictReason::V2InvariantDuplicateTx => ReasonCode::V2InvariantDuplicateTx,
+            VerdictReason::V2InvariantDecodeFailed => ReasonCode::V2InvariantDecodeFailed,
         }
     }
 }
@@ -976,6 +1141,7 @@ impl From<GatewayReason> for ReasonCode {
             GatewayReason::ShareRateLimited => ReasonCode::ShareRateLimited,
             // Crash recovery
             GatewayReason::ProcessCrashRecovery => ReasonCode::ProcessCrashRecovery,
+            GatewayReason::WalWriteFailure => ReasonCode::WalWriteFailure,
             // Connection lifecycle
             GatewayReason::PeerTransportError => ReasonCode::PeerTransportError,
             GatewayReason::ChannelOpenTimeout => ReasonCode::ChannelOpenTimeout,
@@ -1014,7 +1180,7 @@ mod tests {
     fn gateway_all_constant_covers_every_variant() {
         assert_eq!(
             GatewayReason::ALL.len(),
-            58,
+            59,
             "GatewayReason::ALL length mismatch: did you add a variant?"
         );
     }
@@ -1087,10 +1253,11 @@ mod tests {
 
     #[test]
     fn reason_code_all_constant_length() {
-        // 14 verdict (excluding internal_error) + 57 gateway (excluding internal_error) + 1 shared
+        // 32 verdict (excluding internal_error) + 58 gateway (excluding internal_error) + 1 shared
+        // = 91 after ADR-002 Phase 1 mirrored the 18 v2_invariant_* codes from VerdictReason.
         assert_eq!(
             ReasonCode::ALL.len(),
-            72,
+            91,
             "ReasonCode::ALL length mismatch: did you add a variant?"
         );
     }

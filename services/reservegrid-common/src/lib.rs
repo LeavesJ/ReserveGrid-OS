@@ -12,10 +12,12 @@ pub mod config_io;
 pub mod error;
 pub mod metrics;
 pub mod mode;
+pub mod rate_limit;
 pub mod reason;
 pub mod redacted;
 
 // Re-export the most commonly used types at crate root for ergonomics.
 pub use error::ErrorResponse;
 pub use mode::DeployMode;
+pub use rate_limit::RateLimiter;
 pub use reason::{GatewayReason, ReasonCode};
