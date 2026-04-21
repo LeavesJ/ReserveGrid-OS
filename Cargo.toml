@@ -16,6 +16,7 @@ members = [
   "services/rg-feed-server",
   "services/rg-load-test",
   "services/rg-desktop",
+  "services/rg-consensus",
 ]
 
 [workspace.package]

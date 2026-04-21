@@ -1,0 +1,41 @@
+[package]
+name = "rg-consensus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+license = "MIT"
+
+# ──────────────────────────────────────────────────────────────────────
+# rg-consensus: v2.0 Invariant Shield facade
+#
+# This crate is the single entry point through which ReserveGrid OS
+# gains access to consensus critical re-derivation. Per ADR-002, the
+# boundary is deliberately narrow: plain Rust types cross the API,
+# no upstream parser type (rust-bitcoin `Block`, `Transaction`,
+# `Txid`, `WitnessCommitment`, etc.) leaks into callers.
+#
+# Callers (pool-verifier today, anything else later) depend only on
+# this crate. A future swap of the underlying parser changes only
+# `rg-consensus` internals, not the gateway, the NDJSON wire, the
+# reason code taxonomy, or the dashboards.
+#
+# ADR-002 #2 landed 2026-04-21: `bitcoin = "=0.32.8"` pinned per
+# R-131. Only `std` and `rand-std` features enabled; default
+# features disabled so `serde`, `base64`, and other wire facing
+# surface stay out of the facade per the ADR rationale. `cargo vet`
+# exemptions for rust-bitcoin, bitcoin_hashes, secp256k1, hex, and
+# hex-conservative land in the same patch set as action item #7.
+# ──────────────────────────────────────────────────────────────────────
+
+[dependencies]
+# Pinned per R-131. Bump only via an MR that reruns the facade unit
+# tests against mainnet fixtures and the rust-bitcoin upstream
+# vectors referenced in ADR-002 Option A.
+bitcoin = { version = "=0.32.8", default-features = false, features = [
+    "std",
+    "rand-std",
+] }
+
+[lints]
+workspace = true
