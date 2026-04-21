@@ -525,9 +525,9 @@ mod tests {
             // Sandbox without /dev/full; skip rather than fail.
             return;
         }
-        let file = match OpenOptions::new().write(true).open(dev_full_path) {
-            Ok(f) => f,
-            Err(_) => return, // not permitted in this sandbox; skip
+        let Ok(file) = OpenOptions::new().write(true).open(dev_full_path) else {
+            // not permitted in this sandbox; skip
+            return;
         };
         let writer = std::io::BufWriter::new(file);
 
