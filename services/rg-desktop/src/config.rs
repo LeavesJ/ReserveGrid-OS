@@ -328,8 +328,7 @@ mod tests {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0);
             let pid = std::process::id();
-            let path = std::env::temp_dir()
-                .join(format!("rg-test-{tag}-{pid}-{nanos}"));
+            let path = std::env::temp_dir().join(format!("rg-test-{tag}-{pid}-{nanos}"));
             // Belt and suspenders: if the improbable pid+nanos
             // collision ever happens, kill any stale tree before
             // recreating so the test sees a clean directory.

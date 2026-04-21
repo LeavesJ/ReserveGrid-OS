@@ -18,15 +18,12 @@ feature-depth = 1
 # rustls-pemfile v2.2.0 is unmaintained (RUSTSEC-2025-0134); PEM parsing
 # migrated into rustls-pki-types. Suppress until transitive deps update.
 #
-# rustls-webpki v0.102.8 CRL distribution point matching (RUSTSEC-2026-0049);
-# fix requires upgrading rustls 0.22→0.23 which cascades through tungstenite
-# and tokio-tungstenite. Tracked for v1.2 dep bump pass.
-#
-# rand v0.8.5 unsound with custom logger (RUSTSEC-2026-0097); requires a
-# custom `log` logger calling `rand::rng()` during reseeding. ReserveGrid
-# uses `tracing` and never calls `rand::rng()` from a logger. Suppress
-# until SV2 upstream bumps rand to 0.9.3+.
-ignore = ["RUSTSEC-2025-0134", "RUSTSEC-2026-0049", "RUSTSEC-2026-0097"]
+# RUSTSEC-2026-0049 and RUSTSEC-2026-0097 were removed 2026-04-21 after
+# tokio-tungstenite 0.21→0.26 (drops rustls 0.22.4 + rustls-webpki 0.102.8)
+# and libflate 2.2.1→2.3.0 + rand 0.8.5→0.8.6 bumps cleared their match
+# criteria. If either ID resurfaces on a future dep change, re-add with
+# justification rather than silently ignoring.
+ignore = ["RUSTSEC-2025-0134"]
 
 [licenses]
 allow = [

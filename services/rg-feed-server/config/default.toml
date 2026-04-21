@@ -22,11 +22,6 @@ heartbeat_interval_ms = 15000
 channel_capacity = 64
 
 [auth]
-# Comma-separated list of valid license keys for local/dev use.
-# In production, set VELDRA_FEED_VALID_KEYS or use the auth_url endpoint.
-valid_keys = ""
-
-# Optional: rg-auth base URL for key validation.
-# When set, keys are validated via POST {auth_url}/api/keys/validate.
-# When empty, only the static valid_keys list is checked.
-auth_url = ""
+# Base64url encoded Ed25519 public key for offline license key verification.
+# Override with VELDRA_LICENSE_PUBKEY env var.
+license_pubkey = ""

@@ -53,7 +53,7 @@ struct Cli {
 }
 
 // ---------------------------------------------------------------------------
-// WebSocket handshake callback: extracts Bearer token
+// WebSocket handshake callback: validates Bearer token at upgrade time
 // ---------------------------------------------------------------------------
 
 /// Maximum bearer token length to prevent memory abuse. Signed license keys
@@ -61,13 +61,13 @@ struct Cli {
 const MAX_TOKEN_LENGTH: usize = 512;
 
 struct AuthCallback {
-    /// Written during the handshake; read after to decide accept/reject.
-    token: std::sync::Mutex<Option<String>>,
+    validator: KeyValidator,
+    /// Written during the handshake; read after accept to identify the client.
+    validated: std::sync::Mutex<Option<auth::ValidatedKey>>,
 }
 
 impl Callback for &AuthCallback {
     fn on_request(self, request: &Request, response: Response) -> Result<Response, ErrorResponse> {
-        // Use the typed header constant for case-insensitive lookup.
         let auth_header = request
             .headers()
             .get(http::header::AUTHORIZATION)
@@ -77,16 +77,24 @@ impl Callback for &AuthCallback {
         let token = if let Some(stripped) = auth_header.strip_prefix("Bearer ") {
             let trimmed = stripped.trim();
             if trimmed.len() > MAX_TOKEN_LENGTH {
-                String::new()
+                ""
             } else {
-                trimmed.to_string()
+                trimmed
             }
         } else {
-            String::new()
+            ""
         };
 
-        if let Ok(mut guard) = self.token.lock() {
-            *guard = Some(token);
+        let Some(vk) = self.validator.validate(token) else {
+            let mut err = http::Response::new(Some(
+                "unauthorized: invalid or missing license key".to_string(),
+            ));
+            *err.status_mut() = http::StatusCode::UNAUTHORIZED;
+            return Err(err);
+        };
+
+        if let Ok(mut guard) = self.validated.lock() {
+            *guard = Some(vk);
         }
 
         Ok(response)
@@ -124,11 +132,7 @@ async fn main() {
         std::process::exit(1);
     });
 
-    let validator = KeyValidator::new(
-        &cfg.auth.license_pubkey,
-        &cfg.auth.valid_keys,
-        &cfg.auth.auth_url,
-    );
+    let validator = KeyValidator::new(&cfg.auth.license_pubkey);
     let feed_state = Arc::new(FeedState::new());
 
     let (tx, _rx) = broadcast::channel::<Arc<String>>(cfg.feed.channel_capacity);
@@ -284,16 +288,18 @@ async fn handle_connection(
     validator: KeyValidator,
     state: Arc<FeedState>,
 ) {
-    // Perform WebSocket handshake with auth extraction.
+    // Perform WebSocket handshake with inline auth validation.
+    // Unauthenticated clients are rejected during the HTTP upgrade (401)
+    // before a WebSocket connection is established.
     let auth_cb = AuthCallback {
-        token: std::sync::Mutex::new(None),
+        validator,
+        validated: std::sync::Mutex::new(None),
     };
 
-    let ws_config = WebSocketConfig {
-        max_message_size: Some(1024 * 1024), // 1 MiB
-        max_frame_size: Some(256 * 1024),    // 256 KiB
-        ..WebSocketConfig::default()
-    };
+    // tokio-tungstenite 0.26: WebSocketConfig is #[non_exhaustive]; use builder.
+    let ws_config = WebSocketConfig::default()
+        .max_message_size(Some(1024 * 1024)) // 1 MiB
+        .max_frame_size(Some(256 * 1024)); // 256 KiB
 
     let ws_stream =
         match tokio_tungstenite::accept_hdr_async_with_config(stream, &auth_cb, Some(ws_config))
@@ -301,37 +307,14 @@ async fn handle_connection(
         {
             Ok(ws) => ws,
             Err(e) => {
-                info!(%peer, error = %e, "websocket handshake failed");
+                info!(%peer, error = %e, "websocket handshake rejected or failed");
                 return;
             }
         };
 
-    // Extract token from callback.
-    let token = auth_cb
-        .token
-        .lock()
-        .ok()
-        .and_then(|g| g.clone())
-        .unwrap_or_default();
-
-    // Validate the key.
-    let Some(validated) = validator.validate(&token).await else {
-        info!(%peer, "rejected: invalid or missing license key");
-
-        let (mut writer, _reader) = ws_stream.split();
-        let err_frame = serde_json::json!({
-            "type": "error",
-            "ts": feed::now_ts(),
-            "data": {"code": "unauthorized", "detail": "invalid or missing license key"},
-        });
-        if let Ok(msg) = serde_json::to_string(&err_frame)
-            && let Err(e) = writer.send(Message::Text(msg)).await
-        {
-            warn!(%peer, error = %e, "failed to send auth error frame");
-        }
-        if let Err(e) = writer.close().await {
-            warn!(%peer, error = %e, "failed to close rejected connection");
-        }
+    // If we reach here the handshake succeeded, meaning auth passed.
+    let Some(validated) = auth_cb.validated.lock().ok().and_then(|mut g| g.take()) else {
+        error!(%peer, "BUG: handshake succeeded but validated key is missing");
         return;
     };
 
@@ -354,8 +337,9 @@ async fn handle_connection(
                 "rpc_ok": true,
             },
         });
+        // tokio-tungstenite 0.26: Message::Text takes Utf8Bytes.
         if let Ok(msg) = serde_json::to_string(&status_frame)
-            && let Err(e) = writer.send(Message::Text(msg)).await
+            && let Err(e) = writer.send(Message::Text(msg.into())).await
         {
             warn!(%peer, error = %e, "failed to send initial status frame");
             return;
@@ -367,7 +351,7 @@ async fn handle_connection(
             msg = rx.recv() => {
                 match msg {
                     Ok(frame) => {
-                        if writer.send(Message::Text((*frame).clone())).await.is_err() {
+                        if writer.send(Message::Text((*frame).clone().into())).await.is_err() {
                             break;
                         }
                     }

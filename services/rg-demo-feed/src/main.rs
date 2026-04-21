@@ -213,11 +213,10 @@ async fn handle_client(
     mut rx: broadcast::Receiver<Arc<String>>,
     peer: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let ws_config = WebSocketConfig {
-        max_message_size: Some(1024 * 1024), // 1 MiB
-        max_frame_size: Some(256 * 1024),    // 256 KiB
-        ..WebSocketConfig::default()
-    };
+    // tokio-tungstenite 0.26: WebSocketConfig is #[non_exhaustive]; use builder.
+    let ws_config = WebSocketConfig::default()
+        .max_message_size(Some(1024 * 1024)) // 1 MiB
+        .max_frame_size(Some(256 * 1024)); // 256 KiB
 
     let ws_stream = tokio_tungstenite::accept_async_with_config(stream, Some(ws_config)).await?;
     info!(%peer, "client connected");
@@ -229,7 +228,8 @@ async fn handle_client(
             msg = rx.recv() => {
                 match msg {
                     Ok(frame) => {
-                        writer.send(Message::Text((*frame).clone())).await?;
+                        // tokio-tungstenite 0.26: Message::Text takes Utf8Bytes.
+                        writer.send(Message::Text((*frame).clone().into())).await?;
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         warn!(%peer, skipped = n, "client lagging, dropped frames");

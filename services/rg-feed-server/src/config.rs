@@ -50,14 +50,6 @@ pub struct AuthSection {
     /// Loaded from `VELDRA_LICENSE_PUBKEY` env var or `auth.license_pubkey` config.
     #[serde(default)]
     pub license_pubkey: String,
-
-    /// Comma-separated static key list for dev/local use.
-    #[serde(default)]
-    pub valid_keys: String,
-
-    /// Optional rg-auth URL for dynamic key validation (legacy fallback).
-    #[serde(default)]
-    pub auth_url: String,
 }
 
 fn default_listen() -> String {
@@ -112,12 +104,6 @@ pub fn load(path: &str) -> Result<FeedServerConfig, String> {
     }
     if let Ok(v) = std::env::var("VELDRA_LICENSE_PUBKEY") {
         cfg.auth.license_pubkey = v;
-    }
-    if let Ok(v) = std::env::var("VELDRA_FEED_VALID_KEYS") {
-        cfg.auth.valid_keys = v;
-    }
-    if let Ok(v) = std::env::var("VELDRA_FEED_AUTH_URL") {
-        cfg.auth.auth_url = v;
     }
     if let Some(n) = std::env::var("VELDRA_FEED_MAX_CONNECTIONS")
         .ok()
@@ -178,16 +164,14 @@ heartbeat_interval_ms = 5000
 channel_capacity = 128
 
 [auth]
-valid_keys = "key1,key2,key3"
-auth_url = "http://rg-auth:3000"
+license_pubkey = "dGVzdA"
 "#;
         let cfg = parse_toml(toml).expect("should parse full config");
         assert_eq!(cfg.feed.listen, "127.0.0.1:9999");
         assert_eq!(cfg.feed.rpc_user, "rpc");
         assert_eq!(cfg.feed.poll_interval_ms, 1000);
         assert_eq!(cfg.feed.channel_capacity, 128);
-        assert_eq!(cfg.auth.valid_keys, "key1,key2,key3");
-        assert_eq!(cfg.auth.auth_url, "http://rg-auth:3000");
+        assert_eq!(cfg.auth.license_pubkey, "dGVzdA");
     }
 
     #[test]
@@ -198,7 +182,6 @@ listen = "0.0.0.0:9200"
 rpc_url = ""
 "#;
         let cfg = parse_toml(toml).expect("TOML parses");
-        // Simulate the validation that `load` performs.
         assert!(cfg.feed.rpc_url.is_empty());
     }
 
@@ -209,15 +192,14 @@ rpc_url = ""
 rpc_url = "http://localhost:8332"
 "#;
         let cfg = parse_toml(toml).expect("should parse");
-        assert!(cfg.auth.valid_keys.is_empty());
-        assert!(cfg.auth.auth_url.is_empty());
+        assert!(cfg.auth.license_pubkey.is_empty());
     }
 
     #[test]
     fn missing_feed_section_fails() {
         let toml = r#"
 [auth]
-valid_keys = "abc"
+license_pubkey = "abc"
 "#;
         let result = parse_toml(toml);
         assert!(result.is_err(), "config without [feed] must fail");
