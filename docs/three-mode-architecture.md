@@ -2,7 +2,7 @@
 
 **Status:** Implemented
 **Version:** v1.1.0
-**Date:** 2026-03-10
+**Date:** 2026-04-14
 
 ## Overview
 
@@ -190,23 +190,25 @@ mode = "shadow"  # or "observe" or "inline"
 
 ### What Mode Controls
 
-| Behavior | Shadow | Observe | Inline |
-|---|---|---|---|
-| Data source | rg-demo-feed (public) | rg-feed-server (authenticated) | operator bitcoind |
-| template-manager target | rg-feed-adapter | rg-feed-adapter | bitcoind directly |
-| Verifier enforcement | observe-only | observe-only | enforcing |
-| Gateway active | no | no | yes |
-| Dashboard policy editing | disabled | enabled | enabled |
-| Dashboard settings mutation | disabled | enabled | enabled |
-| Dashboard CSV export | disabled | enabled | enabled |
-| Dashboard dry-run preview | disabled | enabled | enabled |
-| Verdict persistence (WAL) | in-memory only | disk WAL | disk WAL |
-| License key required | no | yes | no (own infra) |
-| Miner connections accepted | no | no | yes |
+| Behavior | Shadow | Observe | Inline | Dev |
+|---|---|---|---|---|
+| Data source | rg-demo-feed (public) | rg-feed-server (authenticated) | operator bitcoind | any (stack-dependent) |
+| template-manager target | rg-feed-adapter | rg-feed-adapter | bitcoind directly | any |
+| Verifier enforcement | observe-only | observe-only | enforcing | stack-dependent |
+| Gateway active | no | no | yes | stack-dependent |
+| Dashboard policy editing | disabled | enabled | enabled | enabled |
+| Dashboard settings mutation | disabled | enabled | enabled | enabled |
+| Dashboard CSV export | disabled | enabled | enabled | enabled |
+| Dashboard dry-run preview | disabled | enabled | enabled | enabled |
+| Verdict persistence (WAL) | in-memory only | disk WAL | disk WAL | stack-dependent |
+| License key required | no | yes | no (own infra) | dev passkey |
+| Miner connections accepted | no | no | yes | stack-dependent |
+
+**Dev mode** is not a backend deployment mode. It is a client-side override activated by the developer passkey (compile-time `--features dev-passkey`). The backend services still run in whichever mode the compose stack configures. Dev mode unlocks all dashboard UI features regardless of the backend mode, and displays a purple DEV badge in the top bar.
 
 ### Dashboard Feature Gating
 
-The dashboard reads `VELDRA_MODE` at startup and applies feature gates in the frontend.
+The dashboard reads `VELDRA_MODE` at startup and applies feature gates in the frontend. When the license tier is `dev` (developer passkey), the frontend overrides the deploy mode to `dev` and unlocks all features.
 
 **Shadow (limited):**
 - Overview: full (read-only KPIs, acceptance rate, recent verdicts)
@@ -215,6 +217,7 @@ The dashboard reads `VELDRA_MODE` at startup and applies feature gates in the fr
 - Miners: hidden (no miners in shadow/observe)
 - Policy: view-only (shows current policy, no edit, no dry-run)
 - Settings: all read-only
+- LicenseGate requires `rg-feed-adapter` healthy before granting access
 
 **Observe (full except miners):**
 - Overview: full
@@ -228,6 +231,12 @@ The dashboard reads `VELDRA_MODE` at startup and applies feature gates in the fr
 **Inline (full):**
 - All features enabled
 - Miners page visible (connected workers, hashrate, shares)
+
+**Dev (all unlocked, developer passkey only):**
+- All features enabled regardless of backend mode
+- Miners page visible (may show no data if gateway is not running)
+- Purple badge in top bar
+- Not a backend mode; overrides frontend gating only
 
 ### Verifier Mode Behavior
 
@@ -437,7 +446,7 @@ All work in this spec is v1.0.0 scope. The three mode architecture, feed service
 - **v1.0.0:** rg-feed-adapter, rg-demo-feed, rg-feed-server, mode gating across all services, dashboard feature gates. Shadow, observe, and inline all functional.
 - **v1.0.1:** Security hardening (111 findings across 14 services, done), unified signed license key format (EX-046/047/048, rg-auth done, rg-feed-server done), desktop key persistence (done), website license page copy-to-clipboard (done), auth.veldra.org deployment (done).
 - **v1.0.2:** Config.rs unsafe lint fix, dev passkey bypass (SHA-256 hashed, debug-only), in-app auto-updater (Tauri updater + Settings card + tray menu), stale-diff bug fix across all 4 dashboard save handlers, version bumps, website content refresh.
-- **v1.1.0:** Automatic mode degradation (inline→observe on verifier unreachable), extended channels + vardiff (PB-6), full per-IP rate limiter module, gateway Phase 1, policy model economic improvements.
+- **v1.1.0:** Automatic mode degradation (inline→observe on verifier unreachable), extended channels + vardiff (PB-6), full per-IP rate limiter module, gateway Phase 1, policy model economic improvements. Shadow readiness gate (LicenseGate blocks access when shadow feed services absent). Dev deploy mode (purple badge, all features unlocked via dev passkey tier). Multi-pubkey license validation (ADR-001). `feed_adapter_url` dashboard health probe.
 
 ## Risks and Edge Cases
 

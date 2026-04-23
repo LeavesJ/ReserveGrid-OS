@@ -4,8 +4,8 @@ Production deployment guide for pool operators. Covers all three deployment
 modes (shadow, observe, inline), security configuration, monitoring, backup,
 upgrade procedures, and troubleshooting.
 
-Version: 1.0.2
-Last updated: 2026-04-07
+Version: 1.1.0
+Last updated: 2026-04-12
 
 ---
 
@@ -54,7 +54,8 @@ you start.
 **Shadow** (free trial, zero risk). Synthetic template feed from Veldra
 infrastructure. No connection to your bitcoind. No miners. Demonstrates the
 verification surface with curated edge cases. Use this to evaluate the product
-before committing any infrastructure.
+before committing any infrastructure. The desktop app gates access until the
+shadow feed services (`rg-demo-feed`, `rg-feed-adapter`) are confirmed healthy.
 
 ```
 docker compose -f docker-compose.shadow.yml up --build
@@ -76,6 +77,14 @@ rejected before reaching miners. This is the production mode.
 
 ```
 docker compose up --build
+```
+
+**Dev** (local development only). Activated by the developer passkey, which is
+a compile-time feature (`--features dev-passkey`). Unlocks all dashboard
+features regardless of backend mode. Not a backend deployment mode. Build with:
+
+```
+VELDRA_DEV_PASSKEY_HASH="<sha256 hex>" scripts/desktop-build.sh dev
 ```
 
 The rest of this runbook focuses on inline mode. Shadow and observe mode
@@ -195,6 +204,23 @@ Fill in the TODO fields:
 2. `gateway_instance_id`: a unique string per gateway instance (e.g., `prod-gw-us-east-01`)
 3. `template_url`: your template-manager URL (default `http://template-manager:8082` if same compose stack)
 4. Verify `wal_path` points to a persistent volume mount
+
+**Tunable gateway keys (defaults shown, all optional):**
+
+| Key | Default | What it does |
+|---|---|---|
+| `extranonce_prefix_len` | `4` | Bytes of extranonce reserved by the gateway for per-channel prefix allocation. Downstream miners get `16 - extranonce_prefix_len` bytes for their own extranonce2 search space. |
+| `extended_channels_enabled` | `true` | Accept `OpenExtendedMiningChannel` requests. Disable to force every client onto standard channels. |
+| `vardiff_enabled` | `false` | Per-connection target difficulty retargeting based on observed share rate. Off by default so operators opt in after baselining share volume. |
+| `vardiff_target_shares_per_min` | `20.0` | Target share submission rate per channel once vardiff is enabled. |
+| `vardiff_retarget_interval_secs` | `90` | How often vardiff evaluates share rate and adjusts target. |
+| `vardiff_min_difficulty` | `1` | Floor for retargeting. Prevents vardiff from collapsing into single-share-per-block territory on small miners. |
+| `vardiff_max_difficulty` | `u64::MAX` | Ceiling for retargeting. Only set if the pool imposes a policy limit. |
+| `vardiff_max_adjustment_factor` | `4.0` | Maximum single-step multiplier up or down per retarget. Dampens oscillation under bursty share rates. |
+| `auto_degrade` | `true` | When the verifier heartbeat is lost for longer than `auto_degrade_after_ms`, the gateway flips readiness to degraded and keeps distributing jobs without enforcement. See "Degradation Behavior" further down. |
+| `auto_degrade_after_ms` | `10000` | Heartbeat-loss threshold for degraded mode. Must be at least `verifier.heartbeat_interval_ms` or the gateway will refuse to start. |
+
+These keys are TOML-only at v1.1.0. There are no `VELDRA_` env overrides yet. If you need per-instance overrides, use separate TOML files per instance, as shown in the multi-gateway section of this runbook.
 
 **Policy config (`config/policy.toml`):**
 
@@ -440,6 +466,7 @@ Grafana alerting is not pre-configured. Recommended alert rules to add:
 | Rejection rate > 10% sustained 5m | Warning | `rate(verifier_verdicts_total{verdict="rejected"}[5m]) / rate(verifier_verdicts_total[5m]) > 0.1` |
 | Active connections drop to 0 | Critical | `svtwo_connections_active == 0` |
 | WAL pending entries > 500 | Warning | (custom metric, if exposed) |
+| WAL write failure | Critical | `increase(gateway_share_events{reason_code="wal_write_failure"}[1m]) > 0` |
 | Gateway health probe stale | Critical | Prometheus target down for > 30s |
 
 ---
@@ -490,7 +517,106 @@ The gateway WAL provides crash-durable share delivery. On restart:
 No manual intervention required. The WAL auto-compacts after
 `wal_compaction_threshold` completions (default 1000).
 
+### WAL Write Failure Drains the Gateway
+
+As of v1.1.0 (R-152), any failure to append or fsync a WAL record is fatal. The
+gateway logs a structured error with `reason_code = "wal_write_failure"` and
+`op = "mark_pending"` or `op = "mark_completed"`, transitions the readiness
+probe to draining, broadcasts shutdown over the watch channel, and exits the
+main loop. Every active SV2 connection observes the shutdown signal and emits
+`DisconnectEvent` with `reason_code = "shutdown_drain"`, so the disconnect
+counter will jump by the current connection count on the way out. The pool
+stops accepting new shares immediately.
+
+This is the intended behaviour. A silent WAL error leaves accepted shares with
+no recovery record and permanently breaks the 1:1 accepted-to-forward-result
+join invariant, which costs miners payout credit. Halting and forcing operators
+to intervene is safer than silently losing shares.
+
+**Operator playbook when this alert fires:**
+
+1. Check free space on the WAL volume with `df -h` on the path from
+   `wal_path`. ENOSPC is by far the most common cause.
+2. Check filesystem health (`dmesg | tail`, `journalctl -k | tail`). Read only
+   remounts from EIO events also surface as WAL write failures.
+3. Confirm the mount is still writable by running `touch $(dirname
+   $wal_path)/.probe` as the gateway user.
+4. Restart the gateway only after the underlying disk or mount issue is
+   resolved. The WAL recovery path on startup replays orphaned pending entries
+   as `process_crash_recovery` events, so no shares are lost as long as the WAL
+   file itself survived.
+
+**Migration shim:** operators running on known flaky storage (overprovisioned
+PVs, misbehaving NFS) can temporarily opt back into the pre-R-152 behaviour by
+setting `VELDRA_WAL_WRITE_FAILURE_MODE=accept_silent`. In that mode the gateway
+logs the error and continues, matching v1.0.x behaviour. This flag exists for a
+single release transition and is scheduled for removal in v1.2.0. Any
+environment still relying on it at that point will silently violate the join
+invariant and is expected to have fixed its storage layer before then.
+
 ---
+
+## Breaking Changes in v1.1.0
+
+### HMAC gateway signature now covers body hash (S-8)
+
+The `gateway_signature_hex` field in `ShareSubmission` is now computed as
+`HMAC-SHA256(secret, event_id || SHA256(canonical_body))` where `canonical_body`
+is the JSON serialization of the submission with `gateway_signature_hex` set to
+the empty string. Previously the signature covered only `event_id`.
+
+Any upstream service that verifies the HMAC signature must be updated before
+deploying sv2-gateway v1.1.0. The verification procedure is:
+
+1. Copy the received `gateway_signature_hex` value.
+2. Set `gateway_signature_hex` to `""` in the received JSON object.
+3. Serialize the object to JSON (canonical form, no extra whitespace).
+4. Compute `body_hash = SHA256(canonical_json)`.
+5. Decode `event_id_hex` from the object to 32 bytes.
+6. Verify `HMAC-SHA256(secret, event_id || body_hash)` matches the copied signature.
+
+Deploying sv2-gateway v1.1.0 against an upstream verifier that uses the old
+signature scheme will cause all signature checks to fail.
+
+### Tier rename: observe_free to shadow (S-1)
+
+The `observe_free` tier string is renamed to `shadow` across the entire stack.
+A SQLite migration (`v4`) updates existing rows. Any external tooling that
+matches on the `observe_free` tier string must be updated to use `shadow`.
+
+## Desktop Signing Key Custody
+
+Two independent cryptographic systems govern the desktop app. Do not confuse them.
+
+| System | Purpose | Where it lives | Rotation procedure |
+|---|---|---|---|
+| License signing (Ed25519) | Validates `veldra_lic_*` keys entered by operators | Private: `~/.veldra/license-signing.key` + backup. Pubkey list baked into desktop at build time via `VELDRA_LICENSE_PUBKEY` (supports comma-separated list, see ADR-001). | Issue new pubkey, ship desktop release with both old and new pubkey embedded, drop old after one release cycle. |
+| Tauri updater signing (rsign) | Signs the auto-update tarball so installed desktops verify authenticity before applying an update | Private: `~/.tauri/reservegrid-updater.key` (password protected) + backup. Pubkey embedded in `services/rg-desktop/tauri.conf.json`. | See `docs/runbooks/tauri-updater-key-rotation.md`. |
+
+Both private keys must exist in at least two durable locations at all times. GitHub Actions secrets are write-only and do not count as a durable copy. Required storage:
+
+1. Primary: local file under `~/.tauri/` or `~/.veldra/` on the operator's machine.
+2. Backup: password manager (1Password recommended) or encrypted offline storage.
+3. Deployment: GitHub Actions secrets (convenience, not a backup).
+
+Minimum password manager entries for Veldra:
+
+- Veldra Tauri updater signing key (private key contents + password + generation date)
+- Veldra license signing key (private key contents + generation date)
+- Fly.io API token
+- GitHub PAT (if used outside browser session)
+- SMTP credentials for rg-auth
+
+Without 1Password or equivalent, a single laptop loss forces emergency key rotation on all systems. With it, recovery is minutes.
+
+Local desktop builds use the wrapper script:
+
+```
+scripts/desktop-build.sh dev      # fast, no signing, no updater bundle
+scripts/desktop-build.sh release  # full signed release
+```
+
+Release mode requires `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` in env. Dev mode requires nothing.
 
 ## Upgrade Procedure
 
@@ -667,6 +793,285 @@ Run through this checklist before exposing any service to the internet.
 | 9091 | Prometheus | HTTP | Internal only |
 | 18443 | bitcoind RPC (regtest) | HTTP | Internal only |
 | 8332 | bitcoind RPC (mainnet) | HTTP | Internal only |
+
+---
+
+## Multi-Gateway Deployment (Active/Standby)
+
+A single sv2-gateway instance can serve thousands of miners but represents a
+single point of failure. For production pools that require high availability,
+deploy two or more gateway instances behind a TCP load balancer in an
+active/standby configuration.
+
+### Architecture Overview
+
+```
+                ┌──────────────┐
+  Miners ──────>│  TCP Load    │
+                │  Balancer    │
+                │  (HAProxy /  │
+                │   AWS NLB)   │
+                └──┬───────┬───┘
+                   │       │
+            ┌──────▼──┐ ┌──▼──────┐
+            │ GW-A    │ │ GW-B    │
+            │ (active)│ │(standby)│
+            └────┬────┘ └────┬────┘
+                 │           │
+          ┌──────▼───────────▼──────┐
+          │  Shared Backend:        │
+          │  pool-verifier          │
+          │  template-manager       │
+          │  rg-auth                │
+          └─────────────────────────┘
+```
+
+Each gateway instance runs its own SV2 listener, Noise handshake, and
+connection handler stack. All gateway instances connect to the same
+pool-verifier, template-manager, and rg-auth backend.
+
+The load balancer routes new miner connections to the active gateway. If the
+active gateway fails its health check, the load balancer redirects new
+connections to the standby. Existing connections on the failed gateway are lost
+and miners reconnect through the load balancer to the surviving instance.
+
+SV2 is a long-lived TCP protocol. Miners hold open connections for hours or
+days. The load balancer must operate at L4 (TCP) with connection-level
+affinity, not request-level HTTP routing.
+
+### What Is Shared and What Is Per-Instance
+
+| Component | Scope | Notes |
+|---|---|---|
+| Noise keypair | Per instance | Each gateway generates its own keypair. All instances must use the same `authority_pubkey` so miners configure one authority key. |
+| Job ID allocator | Per instance | Each gateway allocates job IDs from its own monotonic counter. The `gateway_instance_id` config field disambiguates share origins in the WAL and upstream relay. |
+| Channel state | Per instance | Channel allocation, extranonce assignment, and vardiff state are local to each gateway process. There is no cross-instance channel coordination. |
+| WAL | Per instance | Each gateway writes its own `share_wal.ndjson` on its local persistent volume. |
+| Readiness state | Per instance | Each gateway reports its own `/readyz` status independently. |
+| pool-verifier | Shared | One verifier serves all gateway instances. The verifier accepts multiple TCP streams concurrently. |
+| template-manager | Shared | One template source. All gateways poll the same HTTP endpoint. |
+| Policy | Shared | Policy is loaded from the verifier, which serves the same policy to all gateways. |
+| rg-auth / rg-feed-server | Shared | Auth and feed services are gateway-independent. |
+
+### Load Balancer Configuration
+
+The load balancer must satisfy four requirements:
+
+1. **TCP mode (L4).** SV2 uses a Noise NX encrypted TCP stream. The load
+   balancer cannot inspect or modify the payload. Configure as a raw TCP
+   passthrough.
+
+2. **Health check against `/readyz`.** Poll each gateway's management HTTP
+   endpoint at `health_addr` (default `127.0.0.1:8080`). The `/readyz`
+   endpoint returns 200 when the gateway is fully operational or degraded
+   (miners can still connect), and 503 when draining or not yet ready.
+
+3. **Connection draining on failure.** When a gateway's health check fails,
+   the load balancer should stop routing new connections to that instance but
+   allow the TCP drain timeout to expire before forcibly closing existing
+   connections. This gives miners time to detect the disconnect and reconnect
+   through the load balancer.
+
+4. **Sticky connections (no rebalancing).** SV2 connections are stateful.
+   Once a miner is connected to a gateway, that connection must stay on the
+   same backend for its entire lifetime. The load balancer routes only new
+   connections.
+
+#### HAProxy Example
+
+```
+frontend sv2_frontend
+    bind *:3333
+    mode tcp
+    default_backend sv2_gateways
+
+backend sv2_gateways
+    mode tcp
+    balance leastconn
+
+    # Health check against management API (not the SV2 port).
+    # Each gateway must expose health_addr on a routable interface.
+    option httpchk GET /readyz
+    http-check expect status 200
+
+    # Drain timeout: allow 30s for miners to notice and reconnect.
+    timeout server 30s
+
+    server gw-a 10.0.1.10:3333 check port 8080 inter 3s fall 3 rise 2
+    server gw-b 10.0.1.11:3333 check port 8080 inter 3s fall 3 rise 2 backup
+```
+
+The `backup` keyword on `gw-b` makes it a standby server. HAProxy sends
+traffic to `gw-b` only when `gw-a` is marked down. Remove `backup` for
+active/active distribution across both gateways.
+
+#### AWS Network Load Balancer
+
+Create a TCP target group on port 3333. Register both gateway instances.
+Configure health checks:
+
+| Setting | Value |
+|---|---|
+| Protocol | HTTP |
+| Port | 8080 |
+| Path | `/readyz` |
+| Healthy threshold | 2 |
+| Unhealthy threshold | 3 |
+| Interval | 10s |
+
+Set the deregistration delay (drain timeout) to 30 seconds. NLB handles
+connection-level stickiness by default for TCP targets.
+
+### Gateway Instance Configuration
+
+Each gateway instance requires a unique `gateway_instance_id` and its own
+Noise keypair, but must share the same `authority_pubkey`.
+
+**Instance A (`config/gateway-a.toml`):**
+
+```toml
+[gateway]
+listen_addr = "0.0.0.0:3333"
+health_addr = "0.0.0.0:8080"
+noise_keypair_path = "/config/keys/noise-a.key"
+authority_pubkey = "SHARED_AUTHORITY_PUBKEY_HEX"
+gateway_instance_id = "prod-gw-a"
+
+auto_degrade = true
+auto_degrade_after_ms = 10000
+
+[verifier]
+verifier_addr = "pool-verifier:9090"
+```
+
+**Instance B (`config/gateway-b.toml`):**
+
+```toml
+[gateway]
+listen_addr = "0.0.0.0:3333"
+health_addr = "0.0.0.0:8080"
+noise_keypair_path = "/config/keys/noise-b.key"
+authority_pubkey = "SHARED_AUTHORITY_PUBKEY_HEX"
+gateway_instance_id = "prod-gw-b"
+
+auto_degrade = true
+auto_degrade_after_ms = 10000
+
+[verifier]
+verifier_addr = "pool-verifier:9090"
+```
+
+Both instances point to the same verifier. The `gateway_instance_id` appears
+in share WAL entries and upstream relay payloads so downstream systems can
+attribute shares to the originating gateway.
+
+The `health_addr` must bind to a routable interface (`0.0.0.0` or a specific
+internal IP) so the load balancer can reach it. In single-machine deployments
+the default `127.0.0.1:8080` is fine because nothing polls the health endpoint
+externally.
+
+### Connection Draining and Failover Timing
+
+When a gateway receives SIGTERM (from the orchestrator, rolling restart, or
+manual stop):
+
+1. The gateway sets `readiness.draining = true`.
+2. `/readyz` immediately returns 503 with `reason_code: "shutdown_drain"`.
+3. The load balancer detects the 503 within its health check interval (e.g.,
+   3s for HAProxy, 10s for NLB).
+4. The load balancer stops routing new connections to the draining gateway.
+5. The gateway broadcasts a shutdown signal to all connection handlers.
+6. Each handler exits with `HandlerExit::Shutdown`, closing its miner
+   connection cleanly.
+7. Miners detect the disconnect and reconnect through the load balancer,
+   which routes them to the surviving gateway.
+
+**Total failover time** from gateway stop to miners reconnected:
+
+| Component | Time |
+|---|---|
+| Gateway sets draining flag | Instant |
+| LB detects unhealthy (3s interval, 3 failures) | 9s (HAProxy) |
+| Miner detects disconnect | 0s (TCP RST or FIN) |
+| Miner reconnects + Noise handshake | 1-3s |
+| Channel reopen + first job | < 1s |
+| **Total (worst case)** | **~13s** |
+
+During this window miners may submit stale shares that arrive after the
+gateway has stopped accepting them. These shares are lost. The window is short
+enough that the economic impact is negligible for pools with standard block
+intervals.
+
+### Degradation Behavior in Multi-Gateway
+
+When `auto_degrade = true`, each gateway independently monitors its verifier
+connection and enters degraded mode if the heartbeat is lost for longer than
+`auto_degrade_after_ms`. A degraded gateway still returns 200 from `/readyz`
+(with `"status": "degraded"` and `"degraded": true` in the JSON body) because
+miners should stay connected.
+
+If the load balancer needs to distinguish healthy from degraded and prefer
+healthy gateways for new connections, parse the JSON body of the `/readyz`
+response:
+
+```
+# HAProxy agent-check alternative: use an external script that
+# returns "up" or "drain" based on the degraded field.
+```
+
+For most deployments this distinction is unnecessary. A degraded gateway is
+still serving miners correctly (templates flow without enforcement). Prefer
+keeping miners on the degraded gateway rather than forcing a reconnect storm
+to the healthy one.
+
+### Monitoring Multi-Gateway Deployments
+
+Each gateway instance exposes its own Prometheus metrics on `health_addr`. Add
+both instances as scrape targets:
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: sv2-gateway
+    static_configs:
+      - targets:
+          - "10.0.1.10:8080"
+          - "10.0.1.11:8080"
+        labels:
+          cluster: "prod"
+```
+
+All metrics include the `gateway_instance_id` label. Grafana dashboards can
+filter or aggregate by instance. Key metrics to compare across instances:
+
+| Metric | What to look for |
+|---|---|
+| `svtwo_connections_active` | Even distribution in active/active, all on one instance in active/standby |
+| `svtwo_mode_transitions_total` | Degradation events should correlate across instances (same verifier) |
+| `svtwo_vardiff_retarget_up_total` | Per-instance retarget rates indicate hashrate distribution |
+| `svtwo_shares_total` | Share volume should track connection distribution |
+
+### Limitations of Active/Standby (v1.1.0)
+
+v1.1.0 supports active/standby with independent gateway instances. It does
+not support:
+
+1. **Shared job ID allocation.** Each gateway allocates job IDs independently.
+   If both are active simultaneously (active/active), the upstream share
+   processor must handle duplicate job IDs disambiguated by
+   `gateway_instance_id`.
+
+2. **Share deduplication across instances.** Each gateway deduplicates shares
+   within its own process. Two active gateways cannot detect a miner
+   submitting the same share to both.
+
+3. **Channel state migration.** When a miner reconnects to a different
+   gateway, it must reopen channels from scratch. There is no state transfer
+   between gateway instances.
+
+These limitations are acceptable for active/standby where only one gateway
+serves miners at a time. Active/active with shared state is scoped for v1.2+
+(see EX-053 item D-9).
 
 ---
 

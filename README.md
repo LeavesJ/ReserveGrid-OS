@@ -43,13 +43,15 @@ ReserveGrid OS is an ops layer control surface. Pools remain in control.
 
 ## Architecture
 
-ReserveGrid OS supports three deployment modes for progressive rollout:
+ReserveGrid OS supports three deployment modes for progressive rollout, plus a developer mode for internal use:
 
-**Shadow** evaluates templates in parallel without affecting mining. The feed stack (rg-demo-feed or rg-feed-server, rg-feed-adapter) replays or proxies real pool traffic so the verifier can score templates without any operational risk.
+**Shadow** evaluates templates in parallel without affecting mining. The feed stack (rg-demo-feed or rg-feed-server, rg-feed-adapter) replays or proxies real pool traffic so the verifier can score templates without any operational risk. The desktop app gates access until shadow feed services are confirmed healthy, preventing silent degradation to inline mode.
 
 **Observe** connects to a live bitcoind but does not enforce policy. The gateway distributes jobs to miners regardless of the verdict. Operators see what the verifier would reject without blocking any work.
 
 **Inline** enforces policy. The gateway only distributes jobs that the verifier accepts. Rejected templates are held until a passing template arrives or a configurable stale hold timer expires. A dual prevhash buffer holds two pending templates simultaneously during block transitions, with a 50ms verdict window so miners never stall on a prevhash switch. If the verifier becomes unreachable, the gateway automatically degrades to observe behavior (templates flow without enforcement) and recovers when a heartbeat acknowledgment confirms the verifier is back.
+
+**Dev** is a client-side override activated by the developer passkey (compile-time feature). It unlocks all dashboard features regardless of which backend stack is running. A purple DEV badge in the top bar distinguishes it from production modes.
 
 ```
   Inline / Observe mode:
