@@ -133,6 +133,10 @@ services:
       VELDRA_AUTH_ALLOWED_ORIGIN: "http://localhost:8084"
       VELDRA_AUTH_RATE_LIMIT_MULTIPLIER: "${VELDRA_AUTH_RATE_LIMIT_MULTIPLIER:-1}"
       VELDRA_AUTH_TRUST_PROXY: "1"
+      # Required at startup since v1.1.0 (rg-auth hardening sweep). Shadow
+      # uses a deterministic placeholder because no real license signing
+      # happens in shadow mode. Parity with docker-compose.observe.yml.
+      VELDRA_LICENSE_SIGNING_KEY: "${VELDRA_LICENSE_SIGNING_KEY:-KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio}"
     ports:
       - "3030:3030"
     healthcheck:
