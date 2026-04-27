@@ -98,6 +98,17 @@ fn migrate(conn: &Connection) -> Result<()> {
     )
     .context("run db migrations v3 (license_keys)")?;
 
+    // v4: rename tier "observe_free" → "shadow" (S-1, v1.1.0).
+    // SQLite has no ALTER COLUMN DEFAULT, but the column DEFAULT only applies
+    // to INSERT without an explicit value. The Rust constant `tier::SHADOW`
+    // is always supplied explicitly, so the old DEFAULT is harmless. We only
+    // need to migrate existing rows.
+    conn.execute(
+        "UPDATE users SET tier = 'shadow' WHERE tier = 'observe_free'",
+        [],
+    )
+    .context("run db migration v4 (tier rename observe_free → shadow)")?;
+
     Ok(())
 }
 
@@ -132,7 +143,7 @@ pub mod status {
 /// Account tier values. Stable strings — do not rename.
 #[allow(dead_code)] // Used in tests and future billing integration
 pub mod tier {
-    pub const OBSERVE_FREE: &str = "observe_free";
+    pub const SHADOW: &str = "shadow";
     pub const OBSERVE_PAID: &str = "observe_paid";
     pub const INLINE_LICENSED: &str = "inline_licensed";
 }
@@ -161,8 +172,8 @@ pub fn insert_user(
     password_hash: &str,
 ) -> Result<i64> {
     conn.execute(
-        "INSERT INTO users (email, name, org, password) VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![email, name, org, password_hash],
+        "INSERT INTO users (email, name, org, password, tier) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![email, name, org, password_hash, tier::SHADOW],
     )
     .context("insert user")?;
     Ok(conn.last_insert_rowid())
@@ -549,7 +560,7 @@ mod tests {
         assert_eq!(user.name, "Alice");
         assert_eq!(user.org, "Acme Corp");
         assert_eq!(user.status, status::PENDING_VERIFICATION);
-        assert_eq!(user.tier, tier::OBSERVE_FREE);
+        assert_eq!(user.tier, tier::SHADOW);
         assert!(user.stripe_customer_id.is_none());
     }
 
@@ -639,7 +650,7 @@ mod tests {
         let id = insert_user(&conn, "a@b.com", "A", "O", "h").unwrap();
 
         let u = get_user_by_id(&conn, id).unwrap().unwrap();
-        assert_eq!(u.tier, tier::OBSERVE_FREE);
+        assert_eq!(u.tier, tier::SHADOW);
 
         update_user_tier(&conn, id, tier::INLINE_LICENSED).unwrap();
         let u = get_user_by_id(&conn, id).unwrap().unwrap();

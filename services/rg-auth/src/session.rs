@@ -258,10 +258,10 @@ mod tests {
     #[test]
     fn parse_payload_without_verification() {
         let sk = test_keypair();
-        let key = sign_license_key(&sk, "org_parse", "observe_free", &["exporter".into()]);
+        let key = sign_license_key(&sk, "org_parse", "shadow", &["exporter".into()]);
         let payload = parse_license_payload(&key).expect("must parse");
         assert_eq!(payload.org_id, "org_parse");
-        assert_eq!(payload.tier, "observe_free");
+        assert_eq!(payload.tier, "shadow");
         assert_eq!(payload.features, vec!["exporter".to_string()]);
     }
 

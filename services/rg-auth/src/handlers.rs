@@ -789,77 +789,51 @@ pub async fn validate_key(
         );
     }
 
-    // Step 1: Verify signature. Derive the verifying key from the signing
-    // key stored in AppState. If no signing key is configured, fall back
-    // to DB only validation for backward compatibility during rollout.
-    if let Some(ref signing_key) = state.signing_key {
-        let verifying_key = signing_key.verifying_key();
-        match session::verify_license_key(&req.key, &verifying_key) {
-            Some(payload) => {
-                // Step 2: Check expiry.
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                if payload.expires_at < now {
-                    return (
-                        StatusCode::OK,
-                        Json(serde_json::json!({"valid": false, "reason": "key_expired"})),
-                    );
-                }
+    // Step 1: Verify signature.
+    let verifying_key = state.signing_key.verifying_key();
+    let Some(payload) = session::verify_license_key(&req.key, &verifying_key) else {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({"valid": false, "reason": "invalid_signature"})),
+        );
+    };
 
-                // Step 3: DB revocation check.
-                let Ok(conn) = state.db.lock() else {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"valid": false, "reason": "internal_error"})),
-                    );
-                };
-                match db::validate_license_key(&conn, &req.key) {
-                    Ok(Some(_user_id)) => (
-                        StatusCode::OK,
-                        Json(serde_json::json!({
-                            "valid": true,
-                            "tier": payload.tier,
-                            "org_id": payload.org_id,
-                        })),
-                    ),
-                    Ok(None) => (
-                        StatusCode::OK,
-                        Json(serde_json::json!({"valid": false, "reason": "revoked_or_unknown"})),
-                    ),
-                    Err(_) => (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"valid": false, "reason": "internal_error"})),
-                    ),
-                }
-            }
-            None => (
-                StatusCode::OK,
-                Json(serde_json::json!({"valid": false, "reason": "invalid_signature"})),
-            ),
-        }
-    } else {
-        // Fallback: signing key not configured, validate by DB lookup only.
-        // This path exists for backward compatibility during migration from
-        // the old veldra_<hex> format and will be removed in v1.1.0.
-        let Ok(conn) = state.db.lock() else {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"valid": false, "reason": "internal_error"})),
-            );
-        };
-        match db::validate_license_key(&conn, &req.key) {
-            Ok(Some(_user_id)) => (StatusCode::OK, Json(serde_json::json!({"valid": true}))),
-            Ok(None) => (
-                StatusCode::OK,
-                Json(serde_json::json!({"valid": false, "reason": "invalid_or_revoked"})),
-            ),
-            Err(_) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"valid": false, "reason": "internal_error"})),
-            ),
-        }
+    // Step 2: Check expiry.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if payload.expires_at < now {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({"valid": false, "reason": "key_expired"})),
+        );
+    }
+
+    // Step 3: DB revocation check.
+    let Ok(conn) = state.db.lock() else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"valid": false, "reason": "internal_error"})),
+        );
+    };
+    match db::validate_license_key(&conn, &req.key) {
+        Ok(Some(_user_id)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "valid": true,
+                "tier": payload.tier,
+                "org_id": payload.org_id,
+            })),
+        ),
+        Ok(None) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"valid": false, "reason": "revoked_or_unknown"})),
+        ),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"valid": false, "reason": "internal_error"})),
+        ),
     }
 }
 
@@ -933,16 +907,7 @@ pub async fn generate_key(
     headers: HeaderMap,
     Json(req): Json<GenerateKeyRequest>,
 ) -> impl IntoResponse {
-    // Signing key must be configured for key generation.
-    let Some(ref signing_key) = state.signing_key else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(err_json(
-                "signing_key_unavailable",
-                "License signing key not configured",
-            )),
-        );
-    };
+    let signing_key = &state.signing_key;
 
     let Some(token) = extract_bearer(&headers) else {
         return (
@@ -1034,7 +999,7 @@ fn tier_features(tier: &str) -> Vec<String> {
     match tier {
         db::tier::OBSERVE_PAID => vec!["exporter".to_string()],
         db::tier::INLINE_LICENSED => vec!["gateway".to_string(), "exporter".to_string()],
-        // observe_free and any unknown tier get no special features.
+        // shadow and any unknown tier get no special features.
         _ => vec![],
     }
 }

@@ -10,6 +10,7 @@ name = "rg-auth"
 path = "src/main.rs"
 
 [dependencies]
+reservegrid-common = { path = "../reservegrid-common" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 axum = "0.7"
 serde = { version = "1", features = ["derive"] }

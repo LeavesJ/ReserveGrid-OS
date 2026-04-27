@@ -37,7 +37,7 @@ pub struct AppState {
     /// Ed25519 signing key for license key generation. Loaded from
     /// `VELDRA_LICENSE_SIGNING_KEY` (base64url encoded 32 byte seed).
     /// When `None`, the `/auth/keys/generate` endpoint returns 503.
-    pub signing_key: Option<ed25519_dalek::SigningKey>,
+    pub signing_key: ed25519_dalek::SigningKey,
 }
 
 #[tokio::main]
@@ -107,7 +107,12 @@ async fn main() -> anyhow::Result<()> {
         rate_global_ceiling,
     ));
 
-    let signing_key = load_signing_key_from_env();
+    let Some(signing_key) = load_signing_key_from_env() else {
+        anyhow::bail!(
+            "VELDRA_LICENSE_SIGNING_KEY must be set; \
+             v1.1.0 removed the DB-only fallback"
+        );
+    };
 
     let state = AppState {
         db: pool.clone(),
@@ -156,8 +161,23 @@ async fn main() -> anyhow::Result<()> {
         .layer(RequestBodyLimitLayer::new(1024 * 1024))
         .into_make_service_with_connect_info::<SocketAddr>();
 
-    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
-    info!(addr = %bind_addr, "rg-auth listening");
+    // SEC-006: block non-loopback bind unless explicitly opted in.
+    let addr: SocketAddr = bind_addr.parse()?;
+    if !addr.ip().is_loopback() {
+        let allow = std::env::var("VELDRA_ALLOW_NON_LOOPBACK").ok().as_deref() == Some("1");
+        if !allow {
+            error!(
+                %addr,
+                "refusing to bind to non-loopback address; \
+                 set VELDRA_ALLOW_NON_LOOPBACK=1 to override"
+            );
+            std::process::exit(1);
+        }
+        warn!(%addr, "binding to non-loopback address (VELDRA_ALLOW_NON_LOOPBACK=1)");
+    }
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    info!(addr = %addr, "rg-auth listening");
     axum::serve(listener, app).await?;
 
     Ok(())

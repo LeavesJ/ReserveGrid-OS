@@ -123,6 +123,7 @@ services:
       dockerfile: services/rg-auth/Dockerfile
     user: "0"
     environment:
+      VELDRA_ALLOW_NON_LOOPBACK: "1"
       VELDRA_LOG_FORMAT: json
       VELDRA_LOG_FILTER: info
       VELDRA_AUTH_ADDR: "0.0.0.0:3030"
@@ -148,6 +149,7 @@ services:
       dockerfile: services/rg-dashboard/Dockerfile
     user: "0"
     environment:
+      VELDRA_ALLOW_NON_LOOPBACK: "1"
       VELDRA_LOG_FORMAT: json
       VELDRA_LOG_FILTER: info
       VELDRA_DASHBOARD_CONFIG: /config/dashboard.toml
