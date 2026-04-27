@@ -14,6 +14,9 @@ noise_cert_validity_secs = 3600
 noise_handshake_timeout_ms = 10000
 template_poll_interval_ms = 1000
 max_template_age_ms = 30000
+# Regtest-only verdict window. The shipped default is 2000ms (mainnet-safe);
+# regtest uses 50ms because loopback latency is sub-millisecond and tighter
+# windows shake out timing bugs faster. Never use 50ms on mainnet.
 prevhash_verdict_timeout_ms = 50
 prevhash_stale_hold_ms = 5000
 upstream_stale_max_ms = 30000

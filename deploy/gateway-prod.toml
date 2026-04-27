@@ -31,7 +31,10 @@ noise_cert_validity_secs = 3600
 noise_handshake_timeout_ms = 5000
 template_poll_interval_ms = 1000
 max_template_age_ms = 30000
-prevhash_verdict_timeout_ms = 50
+# Mainnet-safe verdict window. 50ms is regtest-only and will cause mass
+# miner disconnection under real network latency. Tune upward (3000-5000)
+# for WAN verifier deployments; must stay < prevhash_stale_hold_ms.
+prevhash_verdict_timeout_ms = 2000
 prevhash_stale_hold_ms = 5000
 upstream_stale_max_ms = 30000
 upstream_failure_policy = "fail_closed"
