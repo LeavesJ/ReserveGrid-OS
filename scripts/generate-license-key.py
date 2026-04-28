@@ -190,7 +190,7 @@ def main():
     parser.add_argument("--org-id", help="Organization ID (e.g., org_acme)")
     parser.add_argument(
         "--tier",
-        choices=["observe_free", "observe_paid", "inline_licensed"],
+        choices=["shadow", "observe_paid", "inline_licensed"],
         help="License tier (must match rg-auth/src/db.rs tier constants)",
     )
     parser.add_argument(

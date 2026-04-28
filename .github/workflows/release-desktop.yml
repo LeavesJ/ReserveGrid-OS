@@ -23,6 +23,11 @@ env:
   NODE_VERSION: "20"
   TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
   TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+  # Comma-separated list of base64url-encoded Ed25519 public keys. Verification
+  # accepts a license signature if it matches ANY listed pubkey. See ADR-001.
+  # Backward compatible: a single pubkey continues to work unchanged.
+  # During key rotation, set to "<new_pubkey>,<previous_pubkey>" so existing
+  # customer keys keep validating until they expire.
   VELDRA_LICENSE_PUBKEY: ${{ secrets.VELDRA_LICENSE_PUBKEY }}
 
 jobs:

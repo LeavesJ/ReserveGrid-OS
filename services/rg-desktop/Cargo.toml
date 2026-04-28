@@ -8,7 +8,7 @@ publish = false
 default-run = "ReserveGrid"
 
 [dependencies]
-tauri = { version = "2", features = ["devtools", "tray-icon"] }
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-shell = "2"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -22,6 +22,16 @@ tauri-plugin-updater = "2"
 ed25519-dalek = { version = "2", features = ["std"] }
 sha2 = "0.10"
 subtle = "2"
+
+[features]
+## Enable WebView devtools. Automatically enabled for debug builds via
+## the profile-based default below. Never enable in CI release builds.
+devtools = ["tauri/devtools"]
+## Enable the developer passkey bypass for local builds.
+## Build with: cargo tauri build --features dev-passkey
+## Then set VELDRA_DEV_PASSKEY_HASH=<hex SHA-256 of your passkey> at runtime.
+## Never enable this feature in CI release builds.
+dev-passkey = []
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
