@@ -51,28 +51,25 @@ pub async fn check_for_update(app: AppHandle) -> Result<UpdateCheckResult, Strin
         format!("update check failed: {e}")
     })?;
 
-    match update {
-        Some(u) => {
-            info!(
-                new_version = %u.version,
-                "update available"
-            );
-            Ok(UpdateCheckResult {
-                update_available: true,
-                version: Some(u.version.clone()),
-                body: u.body.clone(),
-                current_version,
-            })
-        }
-        None => {
-            info!("no update available, already on latest");
-            Ok(UpdateCheckResult {
-                update_available: false,
-                version: None,
-                body: None,
-                current_version,
-            })
-        }
+    if let Some(u) = update {
+        info!(
+            new_version = %u.version,
+            "update available"
+        );
+        Ok(UpdateCheckResult {
+            update_available: true,
+            version: Some(u.version.clone()),
+            body: u.body.clone(),
+            current_version,
+        })
+    } else {
+        info!("no update available, already on latest");
+        Ok(UpdateCheckResult {
+            update_available: false,
+            version: None,
+            body: None,
+            current_version,
+        })
     }
 }
 

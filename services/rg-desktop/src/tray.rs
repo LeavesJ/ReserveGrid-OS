@@ -23,9 +23,15 @@ use tracing::{info, warn};
 /// handles activation internally.
 pub fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
-        let _ = window.unminimize();
-        let _ = window.set_focus();
+        if let Err(e) = window.show() {
+            warn!(error = %e, "failed to show main window");
+        }
+        if let Err(e) = window.unminimize() {
+            warn!(error = %e, "failed to unminimize main window");
+        }
+        if let Err(e) = window.set_focus() {
+            warn!(error = %e, "failed to focus main window");
+        }
         info!("main window restored from tray");
     } else {
         tracing::warn!("main window not found, cannot restore");
