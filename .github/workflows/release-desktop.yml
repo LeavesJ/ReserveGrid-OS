@@ -31,7 +31,95 @@ env:
   VELDRA_LICENSE_PUBKEY: ${{ secrets.VELDRA_LICENSE_PUBKEY }}
 
 jobs:
+  # Preflight guard: signs a dummy file with TAURI_SIGNING_PRIVATE_KEY and
+  # confirms the resulting signature's minisign key ID matches the pubkey
+  # embedded in services/rg-desktop/tauri.conf.json. Fails fast if either
+  # side rotated without the other. R-164 sibling: signing material parity.
+  verify-signing-keys:
+    name: Preflight verify Tauri signing keys
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate required secrets
+        run: |
+          missing=0
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY secret is not set"
+            missing=1
+          fi
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY_PASSWORD secret is not set"
+            missing=1
+          fi
+          if [ "$missing" -eq 1 ]; then
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract embedded pubkey key ID
+        id: embedded
+        run: |
+          set -euo pipefail
+          PUBKEY_B64=$(jq -r '.plugins.updater.pubkey' services/rg-desktop/tauri.conf.json)
+          if [ -z "$PUBKEY_B64" ] || [ "$PUBKEY_B64" = "null" ]; then
+            echo "::error::tauri.conf.json plugins.updater.pubkey is missing or null"
+            exit 1
+          fi
+          EMBEDDED_KEY_ID=$(echo "$PUBKEY_B64" | base64 -d | grep -oE '[A-Fa-f0-9]{16}' | head -1 | tr 'a-f' 'A-F')
+          if [ -z "$EMBEDDED_KEY_ID" ]; then
+            echo "::error::could not extract minisign key ID from embedded pubkey"
+            exit 1
+          fi
+          echo "embedded_key_id=$EMBEDDED_KEY_ID" >> "$GITHUB_OUTPUT"
+          echo "Embedded pubkey ID: $EMBEDDED_KEY_ID"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: verify-signing-keys
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: Sign dummy file and extract signature key ID
+        id: signed
+        run: |
+          set -euo pipefail
+          echo "preflight verify $(date -u +%s)" > /tmp/preflight.txt
+          cargo tauri signer sign /tmp/preflight.txt
+          SIG_KEY_ID=$(grep -oE '[A-Fa-f0-9]{16}' /tmp/preflight.txt.sig | head -1 | tr 'a-f' 'A-F')
+          if [ -z "$SIG_KEY_ID" ]; then
+            echo "::error::could not extract minisign key ID from signature"
+            exit 1
+          fi
+          echo "sig_key_id=$SIG_KEY_ID" >> "$GITHUB_OUTPUT"
+          echo "Signature key ID: $SIG_KEY_ID"
+
+      - name: Compare embedded pubkey vs signing key
+        run: |
+          EMBEDDED='${{ steps.embedded.outputs.embedded_key_id }}'
+          SIGNED='${{ steps.signed.outputs.sig_key_id }}'
+          echo "Embedded pubkey ID: $EMBEDDED"
+          echo "Signing key produces ID: $SIGNED"
+          if [ "$EMBEDDED" != "$SIGNED" ]; then
+            echo "::error::Tauri signing key mismatch."
+            echo "::error::Embedded pubkey in services/rg-desktop/tauri.conf.json: $EMBEDDED"
+            echo "::error::Private key in TAURI_SIGNING_PRIVATE_KEY produces: $SIGNED"
+            echo "::error::Either rotate the secret to match the embedded pubkey,"
+            echo "::error::or revert tauri.conf.json to the pubkey for this private key."
+            echo "::error::See docs/runbooks/tauri-updater-key-rotation.md."
+            exit 1
+          fi
+          echo "Pubkey match confirmed: $EMBEDDED"
+
   build:
+    needs: verify-signing-keys
     strategy:
       fail-fast: true
       matrix:
