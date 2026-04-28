@@ -115,6 +115,17 @@ pub async fn health_check(
         results.push(result);
     }
 
+    // Shadow feed pipeline health when feed_adapter_url is configured.
+    if let Some(ref fa_url) = state.config.feed_adapter_url {
+        let result = probe_health(
+            &state.client,
+            "rg-feed-adapter",
+            &format!("{fa_url}/health"),
+        )
+        .await;
+        results.push(result);
+    }
+
     // Optional gateway.
     if let Some(ref gw_url) = state.config.gateway_url {
         let result = probe_health(&state.client, "sv2-gateway", &format!("{gw_url}/healthz")).await;

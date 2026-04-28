@@ -41,6 +41,7 @@ fn main() {
     info!(
         verifier = %redact_url_credentials(&cfg.verifier_url),
         templates = %redact_url_credentials(&cfg.template_url),
+        feed_adapter = ?cfg.feed_adapter_url.as_deref(),
         "starting rg-desktop"
     );
 
