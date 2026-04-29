@@ -2,7 +2,7 @@
 
 **Status:** Implemented
 **Version:** v1.1.0
-**Date:** 2026-04-14
+**Date:** 2026-04-14 (v2.0 Invariant Shield section added 2026-04-29 per ADR-002 Phase 1 #4b)
 
 ## Overview
 
@@ -71,6 +71,158 @@ sv2-gateway ←→ miners
       ▼
 rg-dashboard (full features)
 ```
+
+## v2.0 Invariant Shield (ADR-002)
+
+The pool-verifier carries a re-derivation pass that runs after policy
+checks but before verdict emission. The shield deserializes the raw
+block bytes the gateway shipped with the template, re-derives the
+consensus quantities the gateway declared, and rejects on disagreement
+with a canonical `v2_invariant_*` reason code.
+
+### Where the shield sits
+
+Inside the pool-verifier process, between template ingress and
+verdict emission:
+
+```
+template ingress
+      │
+      ▼
+basic validity (version, prev_hash)
+      │
+      ▼
+template constraints (tx count, fees, weight ratio)
+      │
+      ▼
+safety constraints (template age, sigops budget)
+      │
+      ▼
+v2.0 Invariant Shield   ◄── ADR-002 Phase 1 #4b
+      │
+      ▼
+verdict emission (Accepted | Rejected{reason_code, detail})
+```
+
+Earlier policy verdicts short-circuit before the shield runs, so the
+shield never overrides a prior rejection. When `raw_block_hex` is
+absent on the wire the shield is skipped silently and the verifier
+increments `verifier_shield_skipped_total` to make Phase 1 rollout
+coverage observable.
+
+### Outcome ladder
+
+The shield emits one of three outcomes per template:
+
+- **Skipped**: the template omitted `raw_block_hex`. The verifier did
+  not run any re-derivation. Counted via `verifier_shield_skipped_total`.
+- **Agreed**: every wired invariant matched its declared value. The
+  template proceeds to verdict emission with whatever the prior policy
+  layers decided.
+- **Rejected**: at least one invariant disagreed. First violation wins;
+  the verdict carries the matching `v2_invariant_*` reason code and a
+  human-readable detail string.
+
+### Wired invariants (Phase 1 #4b, 10 of 18)
+
+Phase 1 #4b ships ten invariants split into Tier 1 (critical) and
+Tier 2 (high). Tier 3 belt-and-suspenders checks defer to Phase 1.5.
+
+**Tier 1 (CRITICAL, direct attack vectors against pool revenue or
+consensus rejection)**
+
+| Reason code | What it catches |
+| --- | --- |
+| `v2_invariant_coinbase_value_mismatch` | Declared coinbase output sum disagrees with re-derived sum from the raw block. Revenue theft. |
+| `v2_invariant_coinbase_height_mismatch` | Declared `block_height` disagrees with the BIP-34 height encoded in the coinbase script. Causes consensus rejection. |
+| `v2_invariant_merkle_root_mismatch` | Header `merkle_root` disagrees with the merkle root computed over the body. Broken block, miners waste hashpower. |
+| `v2_invariant_witness_commitment_mismatch` | Coinbase OP_RETURN witness commitment disagrees with the BIP-141 commitment computed over witness root and reserved value. Segwit miners reject the block. |
+| `v2_invariant_tx_count_mismatch` | Declared `tx_count` disagrees with the actual count in the body. Consistency floor that catches gross tampering early. |
+
+**Tier 2 (HIGH, resource exhaustion vectors and operational-correctness gaps)**
+
+| Reason code | What it catches |
+| --- | --- |
+| `v2_invariant_template_weight_mismatch` | Declared `template_weight` disagrees with re-derived block weight. |
+| `v2_invariant_sigops_mismatch` | Declared `total_sigops` disagrees with re-derived legacy sigop count. |
+| `v2_invariant_coinbase_sigops_mismatch` | Declared `coinbase_sigops` disagrees with re-derived count restricted to the coinbase tx. |
+| `v2_invariant_witness_commitment_missing` | Block has segwit transactions but the coinbase has no BIP-141 commitment in any OP_RETURN output. |
+| `v2_invariant_coinbase_bip34_missing` | Coinbase script does not begin with a valid BIP-34 height push. |
+
+Plus structural fault paths: `v2_invariant_decode_failed` on bad hex
+or unparseable bytes, and the `Skipped` path noted above.
+
+### Deferred invariants (Phase 1.5, 8 of 18)
+
+The following Tier 3 belt-and-suspenders checks are wired in
+`rg-consensus` and mirrored as `VerdictReason` and `ReasonCode`
+variants but not yet called from the pool-verifier shield. They land
+in Phase 1.5 after Phase 1 has been observed in shadow mode for at
+least one production cycle.
+
+```
+v2_invariant_coinbase_script_length     coinbase scriptSig <= 100 bytes
+v2_invariant_coinbase_output_count      coinbase has at least one output
+v2_invariant_weight_exceeds_max         total weight <= 4_000_000
+v2_invariant_sigops_exceed_max          total sigops <= 80_000
+v2_invariant_nontcb_null_prevout        non-coinbase txs do not have null prevouts
+v2_invariant_header_version_low         header.version >= 4
+v2_invariant_duplicate_tx               no duplicate txid in the block body
+```
+
+### Mode interaction
+
+The shield runs in all three modes. The verdict it produces is
+treated according to the mode:
+
+- **Shadow**: shield rejections appear in `template_verdict` events
+  and on the dashboard, but no template flow is gated. The mode
+  exists to surface coverage gaps and false positives before they
+  matter.
+- **Observe**: same as Shadow. Shield rejections are observed,
+  not enforced.
+- **Inline**: shield rejections gate the template. A rejected
+  template never reaches `sv2-gateway`, miners never receive jobs
+  derived from the rejected template.
+
+### Threat model boundary
+
+The shield catches two attacker classes:
+
+1. **Internal raw_block tampering.** The raw block bytes contain a
+   header, a coinbase, and a body that must be internally consistent.
+   If header.merkle_root disagrees with the body merkle, or the
+   coinbase OP_RETURN witness commitment disagrees with the
+   wtxid-tree commitment, the shield rejects.
+2. **TemplatePropose vs raw_block mismatches.** The gateway sends
+   declared values (coinbase_value, tx_count, block_height, etc.)
+   alongside the raw block. If the declared values disagree with what
+   re-derivation from the bytes shows, the shield rejects.
+
+The shield does NOT catch one attacker class:
+
+3. **Consistent template-manager tampering.** A malicious or
+   compromised template-manager can produce a TemplatePropose where
+   both the declared values and the raw_block bytes are tampered in
+   a way that keeps internal consistency. The shield sees agreement
+   on every wired invariant and emits Agreed. ADR-002 explicitly
+   names this gap. Phase 2 closes it by cross-verifying against an
+   independent mempool ground truth (rg-feed-server's bitcoind RPC),
+   so that the shield can detect when the template's claimed
+   transaction set differs from what the network mempool actually
+   contains.
+
+### Metrics
+
+- `verifier_shield_skipped_total` (counter): incremented once per
+  template where the shield ran but `raw_block_hex` was absent.
+  Drives the Phase 1 rollout coverage dashboard. As gateways are
+  upgraded to ship raw block bytes, this counter trends to zero.
+- `verifier_verdicts_total{reason_code, accepted}` (existing counter
+  vector): every shield rejection appears here keyed off the canonical
+  `v2_invariant_*` reason code. Dashboards can filter to the
+  `v2_invariant_` prefix to surface shield-specific rejection rates
+  separately from policy rejections.
 
 ## New Services
 
