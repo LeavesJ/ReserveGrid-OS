@@ -25,6 +25,12 @@ pub struct DashboardConfig {
     #[serde(default)]
     pub gateway_url: Option<String>,
 
+    /// Base URL of the `rg-feed-adapter` HTTP API (e.g. `http://rg-feed-adapter:18444`).
+    /// Required in shadow mode so the dashboard can probe feed pipeline health
+    /// and gate access until the shadow services are ready.
+    #[serde(default)]
+    pub feed_adapter_url: Option<String>,
+
     /// Health probe URLs for services that only expose /healthz.
     /// Keys are display names, values are base URLs.
     #[serde(default)]
@@ -117,6 +123,7 @@ auth_url = "http://auth:8083"
         assert_eq!(cfg.listen, "127.0.0.1:8084");
         assert_eq!(cfg.verifier_url, "http://verifier:8080");
         assert!(cfg.health_probes.is_empty());
+        assert!(cfg.feed_adapter_url.is_none());
     }
 
     #[test]
@@ -126,6 +133,7 @@ listen = "127.0.0.1:9000"
 verifier_url = "http://verifier:8080"
 template_url = "http://template:8082"
 auth_url = "http://auth:8083"
+feed_adapter_url = "http://rg-feed-adapter:18444"
 
 [[health_probes]]
 name = "sv2-gateway"
@@ -139,6 +147,10 @@ url = "http://rg-gw:3001"
         assert_eq!(cfg.listen, "127.0.0.1:9000");
         assert_eq!(cfg.health_probes.len(), 2);
         assert_eq!(cfg.health_probes[0].name, "sv2-gateway");
+        assert_eq!(
+            cfg.feed_adapter_url.as_deref(),
+            Some("http://rg-feed-adapter:18444")
+        );
     }
 
     #[test]

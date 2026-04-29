@@ -1548,7 +1548,7 @@ interface ServiceProbe {
   latency_ms?: number;
 }
 
-function LicenseGate({ onValidated }: { onValidated: () => void }) {
+function LicenseGate({ onValidated }: { onValidated: (tier: string | null) => void }) {
   const [step, setStep] = useState<OnboardingStep>("license");
   const [key, setKey] = useState("");
   const [loading, setLoading] = useState(true);
@@ -1556,12 +1556,14 @@ function LicenseGate({ onValidated }: { onValidated: () => void }) {
   const [checking, setChecking] = useState(false);
   const [services, setServices] = useState<ServiceProbe[]>([]);
   const [probing, setProbing] = useState(false);
+  const [licenseTier, setLicenseTier] = useState<string | null>(null);
   const probeInterval = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // On mount, check if a valid license already exists.
   useEffect(() => {
     getLicenseStatus().then((status) => {
       if (status.valid) {
+        setLicenseTier(status.tier);
         setStep("connect");
       }
       setLoading(false);
@@ -1614,6 +1616,7 @@ function LicenseGate({ onValidated }: { onValidated: () => void }) {
     try {
       const result = await setLicenseKey(trimmed);
       if (result.ok) {
+        setLicenseTier(result.tier ?? null);
         setStep("connect");
       } else {
         setError("Invalid license key. Check the key and try again.");
@@ -1625,8 +1628,13 @@ function LicenseGate({ onValidated }: { onValidated: () => void }) {
     }
   };
 
-  const coreReady = services.some((s) => s.name === "pool-verifier" && s.status === "ok")
+  const baseReady = services.some((s) => s.name === "pool-verifier" && s.status === "ok")
     && services.some((s) => s.name === "template-manager" && s.status === "ok");
+  // Shadow tier requires the demo feed pipeline to be healthy.
+  // Without it the dashboard silently degrades to inline mode.
+  const shadowFeedReady = licenseTier !== "shadow"
+    || services.some((s) => s.name === "rg-feed-adapter" && s.status === "ok");
+  const coreReady = baseReady && shadowFeedReady;
 
   if (loading) {
     return (
@@ -1674,10 +1682,20 @@ function LicenseGate({ onValidated }: { onValidated: () => void }) {
 
           {!coreReady && services.length > 0 && (
             <div className="mb-4 p-3 rounded text-xs" style={{ background: V.bgAlt, border: `1px solid ${V.border}`, color: V.steel }}>
-              <p className="mb-1" style={{ color: V.warning }}>Backend services not detected</p>
-              <p>Start the compose stack:</p>
+              <p className="mb-1" style={{ color: V.warning }}>
+                {baseReady && !shadowFeedReady
+                  ? "Shadow feed services not detected"
+                  : "Backend services not detected"}
+              </p>
+              <p>
+                {baseReady && !shadowFeedReady
+                  ? "Shadow mode requires the demo feed pipeline. Start the shadow stack:"
+                  : "Start the compose stack:"}
+              </p>
               <code className="block mt-1 px-2 py-1 rounded text-xs" style={{ background: V.bg, color: V.amber, fontFamily: "var(--mono)" }}>
-                docker compose up -d
+                {licenseTier === "shadow"
+                  ? "docker compose -f docker-compose.shadow.yml up -d"
+                  : "docker compose up -d"}
               </code>
             </div>
           )}
@@ -1685,7 +1703,7 @@ function LicenseGate({ onValidated }: { onValidated: () => void }) {
           <button
             onClick={() => {
               if (probeInterval.current) clearInterval(probeInterval.current);
-              onValidated();
+              onValidated(licenseTier);
             }}
             disabled={!coreReady && services.length > 0 && !probing}
             className="w-full py-2 rounded text-sm font-medium transition-opacity"
@@ -1710,7 +1728,7 @@ function LicenseGate({ onValidated }: { onValidated: () => void }) {
             <button
               onClick={() => {
                 if (probeInterval.current) clearInterval(probeInterval.current);
-                onValidated();
+                onValidated(licenseTier);
               }}
               className="text-xs underline"
               style={{ color: V.steelDim }}
@@ -2353,14 +2371,15 @@ type AuthView = "login" | "register" | "verify" | "forgot" | "reset";
  */
 export default function App() {
   const [licensed, setLicensed] = useState(false);
+  const [licenseTierApp, setLicenseTierApp] = useState<string | null>(null);
 
   // Tauri path: license key gate, no auth service.
   if (isTauri()) {
     if (!licensed) {
-      return <LicenseGate onValidated={() => setLicensed(true)} />;
+      return <LicenseGate onValidated={(tier) => { setLicenseTierApp(tier); setLicensed(true); }} />;
     }
     const stubUser = { name: "Operator", email: "", org: "" };
-    return <Dashboard user={stubUser} onLogout={async () => { await clearLicense(); setLicensed(false); }} />;
+    return <Dashboard user={stubUser} licenseTier={licenseTierApp} onLogout={async () => { await clearLicense(); setLicensed(false); setLicenseTierApp(null); }} />;
   }
 
   // Browser path: existing auth flow via rg-auth.
@@ -2388,12 +2407,12 @@ function BrowserAuthApp() {
     return <LoginPage onLogin={login} loading={authLoading} error={authError} onRegister={() => setAuthView("register")} onForgot={() => setAuthView("forgot")} />;
   }
 
-  return <Dashboard user={user} onLogout={logout} />;
+  return <Dashboard user={user} licenseTier={null} onLogout={logout} />;
 }
 
 /* ── Dashboard (rendered only when authenticated) ── */
 
-function Dashboard({ user, onLogout }: { user: { name: string; email: string; org: string }; onLogout: () => Promise<void> }) {
+function Dashboard({ user, licenseTier, onLogout }: { user: { name: string; email: string; org: string }; licenseTier: string | null; onLogout: () => Promise<void> }) {
   const [page, setPage] = useState<Page>("overview");
 
   const { services, live: healthLive } = useHealth();
@@ -2405,9 +2424,11 @@ function Dashboard({ user, onLogout }: { user: { name: string; email: string; or
 
   const { settings: verifierSettings } = useVerifierSettings();
   const { settings: dashSettings } = useDashboardSettings();
-  // Source of truth for deploy mode is the verifier's own config, not the
-  // dashboard env var (which defaults to "shadow" and drifts in Tauri).
-  const deployMode: DeployMode = verifierSettings.deploy_mode ?? dashSettings.deploy_mode ?? "shadow";
+  // Dev passkey overrides deploy mode to "dev" (all features unlocked).
+  // Otherwise, source of truth is the verifier's own config.
+  const deployMode: DeployMode = licenseTier === "dev"
+    ? "dev"
+    : verifierSettings.deploy_mode ?? dashSettings.deploy_mode ?? "shadow";
   const caps = modeCapabilities(deployMode);
   const visibleNav = NAV.filter((item) => {
     if (item.id === "miners" && !caps.canViewMiners) return false;
@@ -2445,9 +2466,9 @@ function Dashboard({ user, onLogout }: { user: { name: string; email: string; or
         <div className="ml-auto flex items-center gap-4">
           <span className="text-[10px] px-2 py-0.5 rounded font-medium" style={{
             fontFamily: "var(--mono)",
-            color: deployMode === "inline" ? V.success : deployMode === "observe" ? V.amberLight : V.steelDim,
-            background: deployMode === "inline" ? "rgba(34,197,94,.08)" : deployMode === "observe" ? "rgba(212,148,60,.08)" : "rgba(226,232,240,.04)",
-            border: `1px solid ${deployMode === "inline" ? "rgba(34,197,94,.2)" : deployMode === "observe" ? "rgba(212,148,60,.2)" : V.border}`,
+            color: deployMode === "dev" ? "#a78bfa" : deployMode === "inline" ? V.success : deployMode === "observe" ? V.amberLight : V.steelDim,
+            background: deployMode === "dev" ? "rgba(167,139,250,.08)" : deployMode === "inline" ? "rgba(34,197,94,.08)" : deployMode === "observe" ? "rgba(212,148,60,.08)" : "rgba(226,232,240,.04)",
+            border: `1px solid ${deployMode === "dev" ? "rgba(167,139,250,.2)" : deployMode === "inline" ? "rgba(34,197,94,.2)" : deployMode === "observe" ? "rgba(212,148,60,.2)" : V.border}`,
           }}>{deployMode.toUpperCase()}</span>
           <LiveBadge live={anyLive} />
           {degradedCount > 0 && (

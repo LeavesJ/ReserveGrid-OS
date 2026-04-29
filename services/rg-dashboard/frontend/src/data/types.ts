@@ -121,7 +121,7 @@ export interface HealthResponse {
 }
 
 /* ── rg-auth: GET /auth/session ── */
-export type AccountTier = "observe_free" | "observe_paid" | "inline_licensed";
+export type AccountTier = "shadow" | "observe_paid" | "inline_licensed";
 
 export interface SessionUser {
   id: number;
@@ -144,23 +144,33 @@ export interface LoginResponse {
 }
 
 /* ── Deploy mode ── */
-export type DeployMode = "shadow" | "observe" | "inline";
+export type DeployMode = "shadow" | "observe" | "inline" | "dev";
 
 /** Feature capabilities derived from deploy mode. */
 export interface ModeCapabilities {
-  /** Policy editing and apply are available (observe + inline). */
+  /** Policy editing and apply are available (observe + inline + dev). */
   canEditPolicy: boolean;
-  /** CSV export of verdicts is available (observe + inline). */
+  /** CSV export of verdicts is available (observe + inline + dev). */
   canExportCsv: boolean;
-  /** Dry-run simulation is available (observe + inline). */
+  /** Dry-run simulation is available (observe + inline + dev). */
   canDryRun: boolean;
-  /** Miners page is visible (inline only). */
+  /** Miners page is visible (inline + dev). */
   canViewMiners: boolean;
-  /** Settings mutation (save) is available (observe + inline). */
+  /** Settings mutation (save) is available (observe + inline + dev). */
   canEditSettings: boolean;
 }
 
 export function modeCapabilities(mode: DeployMode): ModeCapabilities {
+  // Dev mode unlocks everything regardless of backend stack.
+  if (mode === "dev") {
+    return {
+      canEditPolicy: true,
+      canExportCsv: true,
+      canDryRun: true,
+      canViewMiners: true,
+      canEditSettings: true,
+    };
+  }
   return {
     canEditPolicy: mode !== "shadow",
     canExportCsv: mode !== "shadow",

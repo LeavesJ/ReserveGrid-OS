@@ -165,6 +165,18 @@ pub async fn health_aggregate(State(state): State<Arc<AppState>>) -> Response {
         results.push(result);
     }
 
+    // Shadow feed pipeline health when feed_adapter_url is configured.
+    // This lets the frontend gate access until the shadow services are ready.
+    if let Some(fa_url) = &state.config.feed_adapter_url {
+        let result = probe_health(
+            &state.client,
+            "rg-feed-adapter",
+            &format!("{fa_url}/health"),
+        )
+        .await;
+        results.push(result);
+    }
+
     // First-class gateway health when gateway_url is configured.
     if let Some(gw_url) = &state.config.gateway_url {
         let result = probe_health(&state.client, "sv2-gateway", &format!("{gw_url}/healthz")).await;
@@ -178,7 +190,11 @@ pub async fn health_aggregate(State(state): State<Arc<AppState>>) -> Response {
         results.push(result);
     }
 
-    let body = serde_json::json!({ "services": results });
+    let deploy_mode = std::env::var("VELDRA_MODE").unwrap_or_else(|_| "shadow".into());
+    let body = serde_json::json!({
+        "services": results,
+        "deploy_mode": deploy_mode,
+    });
     (StatusCode::OK, axum::Json(body)).into_response()
 }
 
