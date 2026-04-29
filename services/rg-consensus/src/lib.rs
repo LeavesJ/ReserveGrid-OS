@@ -488,9 +488,7 @@ pub fn check_merkle_root_internal(block: &ParsedBlock) -> Result<(), ConsensusVi
 ///
 /// Returns [`ConsensusViolation::DecodeFailed`] when the block has
 /// no coinbase or no witness root computable.
-pub fn check_witness_commitment_internal(
-    block: &ParsedBlock,
-) -> Result<(), ConsensusViolation> {
+pub fn check_witness_commitment_internal(block: &ParsedBlock) -> Result<(), ConsensusViolation> {
     let coinbase = block
         .0
         .txdata

@@ -739,9 +739,7 @@ pub fn check_invariant_shield(template: &TemplatePropose) -> ShieldOutcome {
         if re_derived != declared {
             return ShieldOutcome::Rejected {
                 reason: VerdictReason::V2InvariantSigopsMismatch,
-                detail: format!(
-                    "total_sigops declared={declared} re_derived={re_derived}"
-                ),
+                detail: format!("total_sigops declared={declared} re_derived={re_derived}"),
             };
         }
     }
@@ -752,9 +750,7 @@ pub fn check_invariant_shield(template: &TemplatePropose) -> ShieldOutcome {
         if re_derived != declared {
             return ShieldOutcome::Rejected {
                 reason: VerdictReason::V2InvariantCoinbaseSigopsMismatch,
-                detail: format!(
-                    "coinbase_sigops declared={declared} re_derived={re_derived}"
-                ),
+                detail: format!("coinbase_sigops declared={declared} re_derived={re_derived}"),
             };
         }
     }
@@ -1411,7 +1407,10 @@ mod tests {
 
     #[test]
     fn shield_agrees_on_genesis_happy_path() {
-        assert_eq!(check_invariant_shield(&genesis_template()), ShieldOutcome::Agreed);
+        assert_eq!(
+            check_invariant_shield(&genesis_template()),
+            ShieldOutcome::Agreed
+        );
     }
 
     #[test]
