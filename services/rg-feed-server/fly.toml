@@ -1,0 +1,25 @@
+app = "rg-feed-server-veldra"
+primary_region = "sjc"
+
+[build]
+  dockerfile = "Dockerfile"
+  # Deploy from repo root: scripts/fly-deploy.sh rg-feed-server --remote-only
+
+[env]
+  VELDRA_LOG_FORMAT = "json"
+  VELDRA_LOG_FILTER = "info"
+  VELDRA_FEED_LISTEN = "0.0.0.0:9200"
+  VELDRA_FEED_POLL_INTERVAL_MS = "3000"
+
+# Secrets set via `fly secrets set`:
+#   VELDRA_LICENSE_PUBKEY          — base64url Ed25519 public key for license verification
+#   VELDRA_FEED_RPC_URL            — bitcoind JSON-RPC endpoint (e.g. http://bitcoin-node:8332)
+#   VELDRA_FEED_RPC_USER           — bitcoind RPC username
+#   VELDRA_FEED_RPC_PASS           — bitcoind RPC password
+
+[http_service]
+  internal_port = 9200
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
