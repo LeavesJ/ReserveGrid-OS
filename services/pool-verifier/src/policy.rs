@@ -1601,4 +1601,199 @@ mod tests {
             "consensus_violation_to_verdict_reason collapsed two variants onto one reason"
         );
     }
+
+    // ── Regtest segwit block fixture (ADR-002 Phase 1 #4b I-C) ────
+    //
+    // The fixture closes the genesis-only test gap. Genesis is
+    // pre-segwit so it cannot exercise the witness commitment
+    // present-and-matches branch nor the
+    // `WitnessCommitmentMissing` rejection path. The regtest block
+    // below is a freshly mined post-segwit block at height 102 with
+    // one coinbase tx plus one segwit transaction sending 0.5 BTC
+    // back to ourselves. The block has a well-formed BIP-141
+    // witness commitment in the coinbase OP_RETURN.
+    //
+    // Provenance: mined locally on `lncm/bitcoind:v27.0` regtest via
+    // `docker compose exec bitcoind bitcoin-cli -regtest
+    // generatetoaddress`. See `docs/lessons.md` R-154 for why we
+    // hardcode the bytes rather than depend on `bitcoin` as a
+    // dev-dependency.
+
+    const REGTEST_SEGWIT_BLOCK_HEX: &str =
+        include_str!("../tests/fixtures/regtest_segwit_block.hex");
+    const REGTEST_SEGWIT_BLOCK_HEIGHT: u32 = 102;
+    const REGTEST_SEGWIT_COINBASE_SATS: u64 = 5_000_000_141;
+    const REGTEST_SEGWIT_TX_COUNT: u32 = 2;
+
+    /// Build a `TemplatePropose` whose declared fields all agree
+    /// with the regtest segwit block fixture. Re-derive sigops via
+    /// the facade so we never hand-encode counts that drift if the
+    /// sigop accounting changes.
+    fn regtest_segwit_template() -> TemplatePropose {
+        let bytes =
+            hex::decode(REGTEST_SEGWIT_BLOCK_HEX.trim()).expect("REGTEST_SEGWIT_BLOCK_HEX decodes");
+        let weight =
+            rg_consensus::re_derive_template_weight(&bytes).expect("regtest weight re-derives");
+        let parsed = rg_consensus::parse_block(&bytes).expect("regtest block parses");
+        let total = rg_consensus::total_sigops(&parsed);
+        let coinbase = rg_consensus::coinbase_sigops(&parsed);
+
+        TemplatePropose {
+            coinbase_value: REGTEST_SEGWIT_COINBASE_SATS,
+            tx_count: REGTEST_SEGWIT_TX_COUNT,
+            block_height: REGTEST_SEGWIT_BLOCK_HEIGHT,
+            template_weight: Some(weight),
+            total_sigops: Some(total),
+            coinbase_sigops: Some(coinbase),
+            raw_block_hex: Some(REGTEST_SEGWIT_BLOCK_HEX.trim().to_string()),
+            ..base_template()
+        }
+    }
+
+    /// Find the BIP-141 witness commitment magic in a serialized
+    /// block and apply `f` to the 6-byte commitment header start
+    /// position. Re-computes and updates the header merkle root so
+    /// downstream checks reach past the merkle root gate. Returns
+    /// the modified block hex.
+    fn modify_witness_commitment(hex_str: &str, f: impl FnOnce(&mut [u8], usize)) -> String {
+        let mut bytes = hex::decode(hex_str.trim()).expect("hex decodes");
+        // OP_RETURN OP_PUSHBYTES_36 magic is 0x6a 0x24 0xaa 0x21 0xa9 0xed.
+        let pattern = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+        let idx = bytes
+            .windows(pattern.len())
+            .position(|w| w == pattern)
+            .expect("witness commitment magic not found in block");
+        f(&mut bytes, idx);
+        fixup_merkle_root_in_block(&mut bytes);
+        hex::encode(bytes)
+    }
+
+    /// Re-derive the merkle root from the tampered body and write
+    /// it back into the header at offset 36..68. Without this, any
+    /// byte tamper inside coinbase or non-coinbase txs trips the
+    /// shield's `MerkleRootMismatch` check before it can reach the
+    /// deeper invariant the test is targeting. Block header merkle
+    /// root is in the same internal byte order that
+    /// `re_derive_merkle_root` returns, so a direct copy is correct.
+    fn fixup_merkle_root_in_block(bytes: &mut [u8]) {
+        let new_root = rg_consensus::re_derive_merkle_root(bytes)
+            .expect("merkle root re-derives after tampering");
+        bytes[36..68].copy_from_slice(&new_root);
+    }
+
+    #[test]
+    fn regtest_segwit_block_has_witness_data() {
+        // Sanity check: the fixture really does carry segwit data.
+        // If the fixture file ever drifts to a non-segwit block, the
+        // witness commitment tests below silently lose coverage.
+        let bytes = hex::decode(REGTEST_SEGWIT_BLOCK_HEX.trim()).unwrap();
+        let commit = rg_consensus::re_derive_witness_commitment(&bytes)
+            .expect("regtest witness commitment derives");
+        assert!(
+            commit.is_some(),
+            "regtest fixture must carry a witness commitment"
+        );
+    }
+
+    #[test]
+    fn shield_agrees_on_regtest_segwit_block() {
+        // Real-world happy path. Exercises every Tier 1+2 check
+        // including the witness commitment present-and-matches branch
+        // that genesis cannot reach.
+        assert_eq!(
+            check_invariant_shield(&regtest_segwit_template()),
+            ShieldOutcome::Agreed
+        );
+    }
+
+    #[test]
+    fn shield_witness_commitment_missing_when_op_return_tampered() {
+        // Replace the OP_RETURN opcode (0x6a) with OP_NOP (0x61) so
+        // the extractor no longer recognizes the commitment output.
+        // The block still deserializes (script bytes are arbitrary),
+        // has_segwit is still true, but the extractor returns None.
+        let tampered = modify_witness_commitment(REGTEST_SEGWIT_BLOCK_HEX, |bytes, idx| {
+            bytes[idx] = 0x61; // OP_NOP
+        });
+        let t = TemplatePropose {
+            raw_block_hex: Some(tampered),
+            ..regtest_segwit_template()
+        };
+        match check_invariant_shield(&t) {
+            ShieldOutcome::Rejected { reason, .. } => {
+                assert_eq!(reason, VerdictReason::V2InvariantWitnessCommitmentMissing);
+            }
+            other => {
+                panic!("expected Rejected(V2InvariantWitnessCommitmentMissing) got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn shield_witness_commitment_mismatch_when_commitment_byte_tampered() {
+        // Flip one bit in the 32-byte commitment. The OP_RETURN
+        // structure stays well-formed so the extractor returns
+        // Some(declared); the extractor's value disagrees with the
+        // BIP-141 computed commitment so the shield rejects.
+        let tampered = modify_witness_commitment(REGTEST_SEGWIT_BLOCK_HEX, |bytes, idx| {
+            // The commitment starts at idx + 6 (OP_RETURN + push len
+            // + 4 magic bytes). Flip the first commitment byte.
+            bytes[idx + 6] ^= 0x01;
+        });
+        let t = TemplatePropose {
+            raw_block_hex: Some(tampered),
+            ..regtest_segwit_template()
+        };
+        match check_invariant_shield(&t) {
+            ShieldOutcome::Rejected { reason, .. } => {
+                assert_eq!(reason, VerdictReason::V2InvariantWitnessCommitmentMismatch);
+            }
+            other => {
+                panic!("expected Rejected(V2InvariantWitnessCommitmentMismatch) got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn shield_coinbase_bip34_missing_when_first_byte_tampered() {
+        // Tamper the first byte of the coinbase scriptSig so the
+        // BIP-34 decoder rejects the integer push. The BIP-34 push
+        // for height 102 starts with opcode 0x01 (push one byte)
+        // followed by 0x66 (=102). Replace the push opcode with
+        // 0x00 (OP_0) which the decoder rejects.
+        //
+        // After tampering, the body merkle root no longer matches
+        // the header's merkle_root; we fix that up so the shield
+        // reaches the BIP-34 check past the merkle gate.
+        let mut bytes = hex::decode(REGTEST_SEGWIT_BLOCK_HEX.trim()).unwrap();
+        // Locate the coinbase scriptSig start by scanning past the
+        // header (80 bytes), tx count varint (1 byte for our
+        // 2-tx block), coinbase version (4), segwit marker+flag (2),
+        // input count varint (1), prevout (32+4), scriptSig length
+        // varint (1). For our regtest block these fields are all
+        // single-byte varints so the push opcode lives at offset
+        // 80 + 1 + 4 + 2 + 1 + 36 + 1 = 125.
+        let push_opcode_offset = 125;
+        // Sanity-check: the push opcode at this offset should be in
+        // the BIP-34 direct-push range (0x01..=0x04). If the fixture
+        // ever changes shape this assertion makes the drift loud.
+        assert!(
+            (0x01..=0x04).contains(&bytes[push_opcode_offset]),
+            "fixture shape changed: byte at offset 125 is {:#x}, expected BIP-34 push opcode",
+            bytes[push_opcode_offset]
+        );
+        bytes[push_opcode_offset] = 0x00;
+        fixup_merkle_root_in_block(&mut bytes);
+        let tampered = hex::encode(bytes);
+        let t = TemplatePropose {
+            raw_block_hex: Some(tampered),
+            ..regtest_segwit_template()
+        };
+        match check_invariant_shield(&t) {
+            ShieldOutcome::Rejected { reason, .. } => {
+                assert_eq!(reason, VerdictReason::V2InvariantCoinbaseBip34Missing);
+            }
+            other => panic!("expected Rejected(V2InvariantCoinbaseBip34Missing) got {other:?}"),
+        }
+    }
 }
