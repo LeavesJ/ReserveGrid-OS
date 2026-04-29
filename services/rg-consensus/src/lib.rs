@@ -514,13 +514,12 @@ pub fn check_witness_commitment_internal(
         (false, _) => Ok(()),
         (true, None) => Err(ConsensusViolation::WitnessCommitmentMissing),
         (true, Some(decl)) => {
-            let witness_root =
-                block
-                    .0
-                    .witness_root()
-                    .ok_or(ConsensusViolation::DecodeFailed {
-                        detail: "witness_root_empty_block",
-                    })?;
+            let witness_root = block
+                .0
+                .witness_root()
+                .ok_or(ConsensusViolation::DecodeFailed {
+                    detail: "witness_root_empty_block",
+                })?;
 
             // BIP-141: witness reserved value is the first stack
             // element of the coinbase input witness. Missing or
@@ -655,9 +654,7 @@ pub fn bip34_height(block: &ParsedBlock) -> Result<u32, ConsensusViolation> {
 ///
 /// Format per BIP-141: `OP_RETURN OP_PUSHBYTES_36 0xaa21a9ed <32 bytes>`.
 /// The first matching output wins.
-fn extract_witness_commitment_from_coinbase(
-    coinbase: &bitcoin::Transaction,
-) -> Option<[u8; 32]> {
+fn extract_witness_commitment_from_coinbase(coinbase: &bitcoin::Transaction) -> Option<[u8; 32]> {
     const OP_RETURN: u8 = 0x6a;
     const OP_PUSHBYTES_36: u8 = 0x24;
     const MAGIC: [u8; 4] = [0xaa, 0x21, 0xa9, 0xed];
@@ -987,7 +984,10 @@ mod tests {
     #[test]
     fn decode_bip34_height_rejects_invalid_opcode() {
         // 0x05 is outside the direct-push range we accept.
-        assert_eq!(decode_bip34_height(&[0x05, 0x00, 0x00, 0x00, 0x00, 0x00]), None);
+        assert_eq!(
+            decode_bip34_height(&[0x05, 0x00, 0x00, 0x00, 0x00, 0x00]),
+            None
+        );
         // OP_0 (0x00) is rejected: BIP-34 requires an integer push.
         assert_eq!(decode_bip34_height(&[0x00]), None);
     }
