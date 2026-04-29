@@ -134,3 +134,6 @@ resource_exhaustion_audit.md
 # Claude Code config
 CLAUDE.md
 .claude/
+
+# PowerPoint autosave noise
+*.pptx
