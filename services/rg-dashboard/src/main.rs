@@ -135,11 +135,18 @@ async fn main() -> std::process::ExitCode {
         }
     };
 
+    // SEC-006: block non-loopback bind unless explicitly opted in.
     if !addr.ip().is_loopback() {
-        warn!(
-            %addr,
-            "dashboard binding to non-loopback address; ensure network access is intentional"
-        );
+        let allow = std::env::var("VELDRA_ALLOW_NON_LOOPBACK").ok().as_deref() == Some("1");
+        if !allow {
+            error!(
+                %addr,
+                "refusing to bind to non-loopback address; \
+                 set VELDRA_ALLOW_NON_LOOPBACK=1 to override"
+            );
+            return std::process::ExitCode::FAILURE;
+        }
+        warn!(%addr, "binding to non-loopback address (VELDRA_ALLOW_NON_LOOPBACK=1)");
     }
 
     info!(addr = %addr, "rg-dashboard listening");
