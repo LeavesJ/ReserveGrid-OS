@@ -590,17 +590,41 @@ fn consensus_violation_to_verdict_reason(v: &ConsensusViolation) -> VerdictReaso
 
 /// Run the v2.0 Invariant Shield pass against a template.
 ///
-/// Phase 1 scope: only the fields the wire already carries declared
-/// values for are checked against re-derived values. That is:
-/// `coinbase_value` (always) and `template_weight` (when present).
-/// The remaining invariants need declared wire fields to compare
-/// against and land in Phase 1b.
+/// Phase 1 #4b scope: 10 of 18 invariants wired (Tier 1 + Tier 2 per
+/// ADR-002 criticality tiering). Tier 3 belt-and-suspenders checks
+/// land in Phase 1.5.
+///
+/// Wired invariants:
+///
+/// Class S (standalone internal-consistency):
+///   - `MerkleRootMismatch`         `header.merkle_root` vs computed
+///   - `WitnessCommitmentMissing`   segwit txs without commitment
+///   - `WitnessCommitmentMismatch`  commitment vs computed
+///   - `CoinbaseBip34Missing`       coinbase script begins with height push
+///
+/// Class D (declared-mismatch, runs only when declared field is `Some`):
+///   - `CoinbaseValueMismatch`      always (declared field non-Option)
+///   - `TemplateWeightMismatch`     when `template_weight.is_some()`
+///   - `TxCountMismatch`            always (declared field non-Option)
+///   - `SigopsMismatch`             when `total_sigops.is_some()`
+///   - `CoinbaseSigopsMismatch`     when `coinbase_sigops.is_some()`
+///   - `CoinbaseHeightMismatch`     always (declared field non-Option)
+///
+/// First violation wins, short-circuit. The shield deserializes
+/// `raw_block_hex` once via `rg_consensus::parse_block` and reuses
+/// the resulting `ParsedBlock` across every per-invariant check.
 ///
 /// When `raw_block_hex` is `None` the shield is silently skipped and
 /// the caller increments `verifier_shield_skipped_total` via the
 /// `shield_skipped` field on `EvalResult`. When the hex decode fails
 /// the shield emits `v2_invariant_decode_failed` so bad gateway
 /// encodings surface loudly rather than silently bypassing the shield.
+// Ten Tier 1+2 invariants make the body length cross the default 100-line
+// `clippy::too_many_lines` threshold. Splitting into per-check helpers
+// would scatter the short-circuit return chain across many small fns
+// without improving readability; an explicit allow with this rationale
+// reads better.
+#[allow(clippy::too_many_lines)]
 pub fn check_invariant_shield(template: &TemplatePropose) -> ShieldOutcome {
     let Some(hex_str) = template.raw_block_hex.as_deref() else {
         return ShieldOutcome::Skipped;
@@ -616,7 +640,19 @@ pub fn check_invariant_shield(template: &TemplatePropose) -> ShieldOutcome {
         }
     };
 
-    // Coinbase value re-derivation is always comparable.
+    // Single deserialize. All Class S checks and Class D accessors
+    // operate on the resulting ParsedBlock without re-parsing.
+    let parsed = match rg_consensus::parse_block(&raw_block) {
+        Ok(p) => p,
+        Err(v) => {
+            return ShieldOutcome::Rejected {
+                reason: consensus_violation_to_verdict_reason(&v),
+                detail: v.to_string(),
+            };
+        }
+    };
+
+    // ── Class D: CoinbaseValueMismatch (always comparable) ────────
     match rg_consensus::re_derive_coinbase_value(&raw_block) {
         Ok(re_derived) => {
             if re_derived != template.coinbase_value {
@@ -637,9 +673,7 @@ pub fn check_invariant_shield(template: &TemplatePropose) -> ShieldOutcome {
         }
     }
 
-    // Template weight re-derivation only runs when the sender declared
-    // a value. Senders that omit template_weight still benefit from the
-    // coinbase value check above.
+    // ── Class D: TemplateWeightMismatch (when declared) ───────────
     if let Some(declared) = template.template_weight {
         match rg_consensus::re_derive_template_weight(&raw_block) {
             Ok(re_derived) => {
@@ -658,6 +692,91 @@ pub fn check_invariant_shield(template: &TemplatePropose) -> ShieldOutcome {
                     detail: v.to_string(),
                 };
             }
+        }
+    }
+
+    // ── Class S: MerkleRootMismatch ───────────────────────────────
+    if let Err(v) = rg_consensus::check_merkle_root_internal(&parsed) {
+        return ShieldOutcome::Rejected {
+            reason: consensus_violation_to_verdict_reason(&v),
+            detail: v.to_string(),
+        };
+    }
+
+    // ── Class S: WitnessCommitment{Missing,Mismatch} ──────────────
+    if let Err(v) = rg_consensus::check_witness_commitment_internal(&parsed) {
+        return ShieldOutcome::Rejected {
+            reason: consensus_violation_to_verdict_reason(&v),
+            detail: v.to_string(),
+        };
+    }
+
+    // ── Class S: CoinbaseBip34Missing ─────────────────────────────
+    if let Err(v) = rg_consensus::check_coinbase_bip34_present(&parsed) {
+        return ShieldOutcome::Rejected {
+            reason: consensus_violation_to_verdict_reason(&v),
+            detail: v.to_string(),
+        };
+    }
+
+    // ── Class D: TxCountMismatch (always comparable) ──────────────
+    {
+        let re_derived = rg_consensus::tx_count(&parsed);
+        if re_derived != template.tx_count {
+            return ShieldOutcome::Rejected {
+                reason: VerdictReason::V2InvariantTxCountMismatch,
+                detail: format!(
+                    "tx_count declared={} re_derived={}",
+                    template.tx_count, re_derived
+                ),
+            };
+        }
+    }
+
+    // ── Class D: SigopsMismatch (when declared) ───────────────────
+    if let Some(declared) = template.total_sigops {
+        let re_derived = rg_consensus::total_sigops(&parsed);
+        if re_derived != declared {
+            return ShieldOutcome::Rejected {
+                reason: VerdictReason::V2InvariantSigopsMismatch,
+                detail: format!(
+                    "total_sigops declared={declared} re_derived={re_derived}"
+                ),
+            };
+        }
+    }
+
+    // ── Class D: CoinbaseSigopsMismatch (when declared) ───────────
+    if let Some(declared) = template.coinbase_sigops {
+        let re_derived = rg_consensus::coinbase_sigops(&parsed);
+        if re_derived != declared {
+            return ShieldOutcome::Rejected {
+                reason: VerdictReason::V2InvariantCoinbaseSigopsMismatch,
+                detail: format!(
+                    "coinbase_sigops declared={declared} re_derived={re_derived}"
+                ),
+            };
+        }
+    }
+
+    // ── Class D: CoinbaseHeightMismatch (always comparable) ───────
+    match rg_consensus::bip34_height(&parsed) {
+        Ok(re_derived) => {
+            if re_derived != template.block_height {
+                return ShieldOutcome::Rejected {
+                    reason: VerdictReason::V2InvariantCoinbaseHeightMismatch,
+                    detail: format!(
+                        "block_height declared={} re_derived={}",
+                        template.block_height, re_derived
+                    ),
+                };
+            }
+        }
+        Err(v) => {
+            return ShieldOutcome::Rejected {
+                reason: consensus_violation_to_verdict_reason(&v),
+                detail: v.to_string(),
+            };
         }
     }
 
@@ -1264,29 +1383,144 @@ mod tests {
         }
     }
 
-    #[test]
-    fn shield_agrees_on_genesis_happy_path() {
+    /// Build a `TemplatePropose` whose declared fields all agree with
+    /// the genesis block bytes. Used by every shield happy-path test
+    /// so the Tier 1+2 invariants land Agreed instead of one of them
+    /// rejecting on a stale `base_template` default.
+    ///
+    /// `tx_count` is 1 (genesis is coinbase-only). `block_height` is
+    /// `GENESIS_BIP34_HEIGHT` because the BIP-34 decoder reads the
+    /// difficulty bits push at the start of the genesis coinbase
+    /// script and reports them as the integer 0x1d00ffff. Genesis
+    /// predates BIP-34 so this is a quirk of the test fixture, not a
+    /// real height; production templates always carry the actual
+    /// height in the BIP-34 push and the shield enforces the match.
+    const GENESIS_BIP34_HEIGHT: u32 = 0x1d00_ffff;
+
+    fn genesis_template() -> TemplatePropose {
         let weight = genesis_weight_via_facade();
-        let t = TemplatePropose {
+        TemplatePropose {
             coinbase_value: GENESIS_COINBASE_SATS,
+            tx_count: 1,
+            block_height: GENESIS_BIP34_HEIGHT,
             template_weight: Some(weight),
             raw_block_hex: Some(GENESIS_RAW_HEX.to_string()),
             ..base_template()
-        };
-        assert_eq!(check_invariant_shield(&t), ShieldOutcome::Agreed);
+        }
+    }
+
+    #[test]
+    fn shield_agrees_on_genesis_happy_path() {
+        assert_eq!(check_invariant_shield(&genesis_template()), ShieldOutcome::Agreed);
     }
 
     #[test]
     fn shield_agrees_when_template_weight_absent() {
         // No declared template_weight means the weight re-derivation
-        // is skipped; the coinbase value check must still pass alone.
+        // is skipped; the other Tier 1+2 checks must still pass.
         let t = TemplatePropose {
-            coinbase_value: GENESIS_COINBASE_SATS,
             template_weight: None,
-            raw_block_hex: Some(GENESIS_RAW_HEX.to_string()),
-            ..base_template()
+            ..genesis_template()
         };
         assert_eq!(check_invariant_shield(&t), ShieldOutcome::Agreed);
+    }
+
+    #[test]
+    fn shield_tx_count_mismatch_rejects() {
+        let t = TemplatePropose {
+            tx_count: 999,
+            ..genesis_template()
+        };
+        match check_invariant_shield(&t) {
+            ShieldOutcome::Rejected { reason, detail } => {
+                assert_eq!(reason, VerdictReason::V2InvariantTxCountMismatch);
+                assert!(
+                    detail.contains("declared=999"),
+                    "detail missing declared value: {detail}"
+                );
+            }
+            other => panic!("expected Rejected(V2InvariantTxCountMismatch) got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shield_total_sigops_mismatch_rejects() {
+        let t = TemplatePropose {
+            total_sigops: Some(99_999),
+            ..genesis_template()
+        };
+        match check_invariant_shield(&t) {
+            ShieldOutcome::Rejected { reason, .. } => {
+                assert_eq!(reason, VerdictReason::V2InvariantSigopsMismatch);
+            }
+            other => panic!("expected Rejected(V2InvariantSigopsMismatch) got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shield_coinbase_sigops_mismatch_rejects() {
+        let t = TemplatePropose {
+            coinbase_sigops: Some(99_999),
+            ..genesis_template()
+        };
+        match check_invariant_shield(&t) {
+            ShieldOutcome::Rejected { reason, .. } => {
+                assert_eq!(reason, VerdictReason::V2InvariantCoinbaseSigopsMismatch);
+            }
+            other => panic!("expected Rejected(V2InvariantCoinbaseSigopsMismatch) got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shield_block_height_mismatch_rejects() {
+        let t = TemplatePropose {
+            block_height: 100,
+            ..genesis_template()
+        };
+        match check_invariant_shield(&t) {
+            ShieldOutcome::Rejected { reason, detail } => {
+                assert_eq!(reason, VerdictReason::V2InvariantCoinbaseHeightMismatch);
+                assert!(
+                    detail.contains("declared=100"),
+                    "detail missing declared value: {detail}"
+                );
+            }
+            other => panic!("expected Rejected(V2InvariantCoinbaseHeightMismatch) got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shield_total_sigops_skipped_when_declared_none() {
+        // Class D checks skip individually when the declared field is
+        // None. Genesis has total_sigops=None in genesis_template
+        // (base_template default), shield must reach Agreed.
+        let t = TemplatePropose {
+            total_sigops: None,
+            coinbase_sigops: None,
+            ..genesis_template()
+        };
+        assert_eq!(check_invariant_shield(&t), ShieldOutcome::Agreed);
+    }
+
+    #[test]
+    fn shield_merkle_root_mismatch_rejects_on_tampered_header() {
+        // Flip one bit in the serialized merkle root byte at offset 36
+        // (header start at 0; merkle root spans bytes 36..68).
+        // GENESIS_RAW_HEX byte 36 is hex chars 72..74.
+        let mut hex = GENESIS_RAW_HEX.to_string();
+        let mut bytes = hex::decode(&hex).unwrap();
+        bytes[36] ^= 0x01;
+        hex = hex::encode(&bytes);
+        let t = TemplatePropose {
+            raw_block_hex: Some(hex),
+            ..genesis_template()
+        };
+        match check_invariant_shield(&t) {
+            ShieldOutcome::Rejected { reason, .. } => {
+                assert_eq!(reason, VerdictReason::V2InvariantMerkleRootMismatch);
+            }
+            other => panic!("expected Rejected(V2InvariantMerkleRootMismatch) got {other:?}"),
+        }
     }
 
     #[test]
@@ -1325,16 +1559,11 @@ mod tests {
 
     #[test]
     fn evaluate_dynamic_clears_shield_skipped_when_shield_runs() {
-        let weight = genesis_weight_via_facade();
         let cfg = PolicyConfig::default_with_protocol(PROTOCOL_VERSION);
-        let t = TemplatePropose {
-            coinbase_value: GENESIS_COINBASE_SATS,
-            template_weight: Some(weight),
-            raw_block_hex: Some(GENESIS_RAW_HEX.to_string()),
-            ..base_template()
-        };
-        let result = evaluate(&t, &cfg);
-        assert!(result.reason.is_none());
+        // Use the genesis_template() helper so all Tier 1+2 checks
+        // agree (tx_count, block_height, etc.).
+        let result = evaluate(&genesis_template(), &cfg);
+        assert!(result.reason.is_none(), "got reason: {:?}", result.reason);
         assert!(!result.shield_skipped);
     }
 
