@@ -404,6 +404,322 @@ pub fn count_sigops(raw_block: &[u8]) -> Result<u32, ConsensusViolation> {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// ParsedBlock and single-parse facade (ADR-002 Phase 1 #4b)
+//
+// `ParsedBlock` is an opaque newtype around `bitcoin::Block`. The
+// pool-verifier shield calls `parse_block` once per template and
+// passes the resulting `ParsedBlock` to every per-invariant check.
+// This avoids the N-deserializations cost of the older `&[u8]`
+// facade when running many checks against the same template.
+//
+// R-154 dep narrowness: `ParsedBlock` does not expose `bitcoin`
+// types. Callers receive only `u32`, `[u8; 32]`, and
+// `Result<(), ConsensusViolation>`. The newtype's inner field stays
+// private so no caller can extract a `bitcoin::Block`.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Parsed block wrapper. Construct via [`parse_block`]. Pass by
+/// reference into the per-invariant check and re-derive functions.
+///
+/// The inner `bitcoin::Block` is private and never crosses the
+/// crate boundary. Adding a public method that returns `&Block` or
+/// `Block` would breach ADR-002 Option A. Add scoped accessors
+/// instead.
+pub struct ParsedBlock(Block);
+
+/// Deserialize a raw block once. Subsequent shield checks operate
+/// on the returned [`ParsedBlock`] without re-parsing.
+///
+/// # Errors
+///
+/// Returns [`ConsensusViolation::DecodeFailed`] on parse failure.
+pub fn parse_block(raw: &[u8]) -> Result<ParsedBlock, ConsensusViolation> {
+    deserialize(raw)
+        .map(ParsedBlock)
+        .map_err(|_| ConsensusViolation::DecodeFailed {
+            detail: "block_deserialize",
+        })
+}
+
+// ─── Class S: standalone internal-consistency checks ───────────────
+
+/// Verify the block header `merkle_root` matches the `sha256d`
+/// merkle root computed over the block body.
+///
+/// Catches tampering of the header field independent of any
+/// declared value in `TemplatePropose`.
+///
+/// # Errors
+///
+/// Returns [`ConsensusViolation::MerkleRootMismatch`] when the
+/// header value disagrees with the body computation. Returns
+/// [`ConsensusViolation::DecodeFailed`] on an empty block body
+/// where no merkle root can be computed.
+pub fn check_merkle_root_internal(block: &ParsedBlock) -> Result<(), ConsensusViolation> {
+    let computed = block
+        .0
+        .compute_merkle_root()
+        .ok_or(ConsensusViolation::DecodeFailed {
+            detail: "merkle_root_empty_block",
+        })?;
+    let declared = block.0.header.merkle_root;
+    if declared != computed {
+        return Err(ConsensusViolation::MerkleRootMismatch {
+            declared: declared.to_byte_array(),
+            re_derived: computed.to_byte_array(),
+        });
+    }
+    Ok(())
+}
+
+/// Verify the coinbase witness commitment matches the BIP-141
+/// witness root commitment computed over the block body.
+///
+/// Three outcomes:
+/// - Legacy block (no segwit transactions): returns `Ok(())`.
+/// - Segwit transactions present, commitment in coinbase
+///   `OP_RETURN` matches the computed value: returns `Ok(())`.
+/// - Segwit transactions present and commitment missing: returns
+///   [`ConsensusViolation::WitnessCommitmentMissing`].
+/// - Segwit transactions present and commitment disagrees with
+///   computed value: returns [`ConsensusViolation::WitnessCommitmentMismatch`].
+///
+/// # Errors
+///
+/// Returns [`ConsensusViolation::DecodeFailed`] when the block has
+/// no coinbase or no witness root computable.
+pub fn check_witness_commitment_internal(
+    block: &ParsedBlock,
+) -> Result<(), ConsensusViolation> {
+    let coinbase = block
+        .0
+        .txdata
+        .first()
+        .ok_or(ConsensusViolation::DecodeFailed {
+            detail: "block_has_no_coinbase",
+        })?;
+
+    // BIP-141: a block carries a witness commitment iff any non
+    // coinbase transaction contains witness data.
+    let has_segwit = block
+        .0
+        .txdata
+        .iter()
+        .skip(1)
+        .any(|tx| tx.input.iter().any(|i| !i.witness.is_empty()));
+
+    let declared = extract_witness_commitment_from_coinbase(coinbase);
+
+    match (has_segwit, declared) {
+        (false, _) => Ok(()),
+        (true, None) => Err(ConsensusViolation::WitnessCommitmentMissing),
+        (true, Some(decl)) => {
+            let witness_root =
+                block
+                    .0
+                    .witness_root()
+                    .ok_or(ConsensusViolation::DecodeFailed {
+                        detail: "witness_root_empty_block",
+                    })?;
+
+            // BIP-141: witness reserved value is the first stack
+            // element of the coinbase input witness. Missing or
+            // malformed falls back to 32 zero bytes.
+            let reserved: [u8; 32] = coinbase
+                .input
+                .first()
+                .and_then(|i| i.witness.iter().next())
+                .and_then(|w| <[u8; 32]>::try_from(w).ok())
+                .unwrap_or([0u8; 32]);
+
+            let mut buf = [0u8; 64];
+            buf[..32].copy_from_slice(&witness_root.to_byte_array());
+            buf[32..].copy_from_slice(&reserved);
+            let computed = sha256d::Hash::hash(&buf).to_byte_array();
+
+            if decl == computed {
+                Ok(())
+            } else {
+                Err(ConsensusViolation::WitnessCommitmentMismatch {
+                    declared: decl,
+                    re_derived: computed,
+                })
+            }
+        }
+    }
+}
+
+/// Verify the coinbase script begins with a BIP-34 height push.
+///
+/// The shield does not validate the height value here; that is the
+/// declaration-mismatch check via [`bip34_height`]. This function
+/// only enforces presence: a coinbase that omits the BIP-34 push
+/// breaches the post-block-227836 consensus rule.
+///
+/// # Errors
+///
+/// Returns [`ConsensusViolation::CoinbaseBip34Missing`] when the
+/// coinbase script does not begin with a valid integer push, or
+/// [`ConsensusViolation::DecodeFailed`] on a malformed coinbase.
+pub fn check_coinbase_bip34_present(block: &ParsedBlock) -> Result<(), ConsensusViolation> {
+    let _ = bip34_height(block)?;
+    Ok(())
+}
+
+// ─── Class D: re-derive accessors for declared-mismatch checks ─────
+
+/// Number of transactions in the block. Caller compares against
+/// `TemplatePropose.tx_count` and emits
+/// `v2_invariant_tx_count_mismatch` on disagreement.
+///
+/// The conversion saturates to `u32::MAX`; any block with more than
+/// 4 billion transactions is structurally impossible under the
+/// current weight limit.
+pub fn tx_count(block: &ParsedBlock) -> u32 {
+    u32::try_from(block.0.txdata.len()).unwrap_or(u32::MAX)
+}
+
+/// Total legacy sigops summed across every input `script_sig` and
+/// every output `script_pubkey` in the block.
+///
+/// Unit semantics match [`count_sigops`]: legacy count, not BIP-141
+/// sigop cost. Callers comparing against `TemplatePropose.total_sigops`
+/// must populate the declared field with the same legacy count to
+/// avoid false mismatches. BIP-141 cost is a Phase 1.5 concern.
+pub fn total_sigops(block: &ParsedBlock) -> u32 {
+    let mut total: u64 = 0;
+    for tx in &block.0.txdata {
+        for input in &tx.input {
+            total = total.saturating_add(input.script_sig.count_sigops_legacy() as u64);
+        }
+        for output in &tx.output {
+            total = total.saturating_add(output.script_pubkey.count_sigops_legacy() as u64);
+        }
+    }
+    u32::try_from(total).unwrap_or(u32::MAX)
+}
+
+/// Legacy sigops summed across the coinbase transaction only.
+/// Caller compares against `TemplatePropose.coinbase_sigops` and
+/// emits `v2_invariant_coinbase_sigops_mismatch` on disagreement.
+///
+/// Unit semantics match [`total_sigops`].
+pub fn coinbase_sigops(block: &ParsedBlock) -> u32 {
+    let Some(coinbase) = block.0.txdata.first() else {
+        return 0;
+    };
+    let mut total: u64 = 0;
+    for input in &coinbase.input {
+        total = total.saturating_add(input.script_sig.count_sigops_legacy() as u64);
+    }
+    for output in &coinbase.output {
+        total = total.saturating_add(output.script_pubkey.count_sigops_legacy() as u64);
+    }
+    u32::try_from(total).unwrap_or(u32::MAX)
+}
+
+/// Extract the BIP-34 block height from the coinbase script.
+///
+/// BIP-34 mandates that the coinbase script begins with a serialized
+/// `CScriptNum` push of the block height. This function decodes that
+/// push and returns the height as a `u32`.
+///
+/// # Errors
+///
+/// Returns [`ConsensusViolation::CoinbaseBip34Missing`] when the
+/// coinbase script does not begin with a valid integer push or the
+/// integer is negative. Returns [`ConsensusViolation::DecodeFailed`]
+/// when the block has no coinbase.
+pub fn bip34_height(block: &ParsedBlock) -> Result<u32, ConsensusViolation> {
+    let coinbase = block
+        .0
+        .txdata
+        .first()
+        .ok_or(ConsensusViolation::DecodeFailed {
+            detail: "block_has_no_coinbase",
+        })?;
+    let input = coinbase
+        .input
+        .first()
+        .ok_or(ConsensusViolation::DecodeFailed {
+            detail: "coinbase_has_no_input",
+        })?;
+    let bytes = input.script_sig.as_bytes();
+    decode_bip34_height(bytes).ok_or(ConsensusViolation::CoinbaseBip34Missing)
+}
+
+// ─── Internal helpers ──────────────────────────────────────────────
+
+/// Locate the first BIP-141 witness commitment output in a coinbase.
+/// Returns the 32-byte commitment when present.
+///
+/// Format per BIP-141: `OP_RETURN OP_PUSHBYTES_36 0xaa21a9ed <32 bytes>`.
+/// The first matching output wins.
+fn extract_witness_commitment_from_coinbase(
+    coinbase: &bitcoin::Transaction,
+) -> Option<[u8; 32]> {
+    const OP_RETURN: u8 = 0x6a;
+    const OP_PUSHBYTES_36: u8 = 0x24;
+    const MAGIC: [u8; 4] = [0xaa, 0x21, 0xa9, 0xed];
+
+    for output in &coinbase.output {
+        let bytes = output.script_pubkey.as_bytes();
+        if bytes.len() >= 38
+            && bytes[0] == OP_RETURN
+            && bytes[1] == OP_PUSHBYTES_36
+            && bytes[2..6] == MAGIC
+        {
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&bytes[6..38]);
+            return Some(out);
+        }
+    }
+    None
+}
+
+/// Decode a BIP-34 minimal `CScriptNum` push from the start of a
+/// coinbase script. Returns `None` for missing, oversized, negative,
+/// or non-minimal encodings.
+///
+/// Layout: opcode byte indicating push length (`0x01`..=`0x04`),
+/// followed by that many little endian bytes representing a signed
+/// integer. The most significant byte's high bit is the sign;
+/// negative heights are rejected.
+fn decode_bip34_height(script: &[u8]) -> Option<u32> {
+    let len_byte = *script.first()?;
+    // Reject opcodes outside the direct push range. BIP-34 uses
+    // CScriptNum which serializes 1..=4 bytes for any block height
+    // up to ~2^31. Block heights past that are far beyond the
+    // foreseeable chain.
+    if !(0x01..=0x04).contains(&len_byte) {
+        return None;
+    }
+    let len = len_byte as usize;
+    if script.len() < 1 + len {
+        return None;
+    }
+    let payload = &script[1..=len];
+    // Reject negative (sign bit on the MSB of the most significant
+    // byte) and reject zero-length / leading-zero non-minimal forms.
+    let last = *payload.last()?;
+    if last & 0x80 != 0 {
+        return None;
+    }
+    if len > 1 && last == 0 && (payload[len - 2] & 0x80 == 0) {
+        // Non-minimal encoding: leading zero is only allowed when
+        // disambiguating a sign bit. We saw last byte == 0 with the
+        // previous byte's MSB clear, so the leading zero is redundant.
+        return None;
+    }
+    let mut value: u64 = 0;
+    for (i, &b) in payload.iter().enumerate() {
+        let mask: u64 = if i == len - 1 { 0x7f } else { 0xff };
+        value |= (u64::from(b) & mask) << (i * 8);
+    }
+    u32::try_from(value).ok()
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────
 
@@ -559,5 +875,160 @@ mod tests {
         // Genesis coinbase carries one scriptSig push and a single
         // P2PK output: legacy sigops are strictly bounded.
         assert!(n < 10, "genesis legacy sigops unexpectedly large: {n}");
+    }
+
+    // ── ParsedBlock single-parse tests (Phase 1 #4b I-A) ──────────
+
+    #[test]
+    fn parse_block_accepts_genesis() {
+        let bytes = genesis_bytes();
+        let _block = parse_block(&bytes).expect("genesis parses");
+    }
+
+    #[test]
+    fn parse_block_rejects_junk() {
+        let junk: &[u8] = &[0xff; 16];
+        assert!(matches!(
+            parse_block(junk),
+            Err(ConsensusViolation::DecodeFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn check_merkle_root_internal_passes_on_genesis() {
+        let bytes = genesis_bytes();
+        let block = parse_block(&bytes).unwrap();
+        check_merkle_root_internal(&block).expect("genesis merkle root agrees");
+    }
+
+    #[test]
+    fn check_merkle_root_internal_rejects_tampered_header() {
+        // Tamper byte 36 of the serialized block (start of merkle
+        // root in the header). Re-parsing produces a block whose
+        // declared merkle root no longer matches the body hash.
+        let mut bytes = genesis_bytes();
+        bytes[36] ^= 0x01;
+        let block = parse_block(&bytes).unwrap();
+        assert!(matches!(
+            check_merkle_root_internal(&block),
+            Err(ConsensusViolation::MerkleRootMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn check_witness_commitment_internal_passes_on_legacy_block() {
+        // Genesis is pre-segwit; the check returns Ok regardless of
+        // any commitment presence in the coinbase script.
+        let bytes = genesis_bytes();
+        let block = parse_block(&bytes).unwrap();
+        check_witness_commitment_internal(&block).expect("legacy block needs no commitment");
+    }
+
+    #[test]
+    fn tx_count_on_genesis_is_one() {
+        let bytes = genesis_bytes();
+        let block = parse_block(&bytes).unwrap();
+        assert_eq!(tx_count(&block), 1);
+    }
+
+    #[test]
+    fn total_sigops_on_genesis_matches_count_sigops() {
+        let bytes = genesis_bytes();
+        let block = parse_block(&bytes).unwrap();
+        let parsed_total = total_sigops(&block);
+        let raw_total = count_sigops(&bytes).unwrap();
+        assert_eq!(
+            parsed_total, raw_total,
+            "ParsedBlock total_sigops must agree with count_sigops"
+        );
+    }
+
+    #[test]
+    fn coinbase_sigops_on_genesis_equals_total() {
+        // Genesis has exactly one transaction (the coinbase). All
+        // sigops are coinbase sigops.
+        let bytes = genesis_bytes();
+        let block = parse_block(&bytes).unwrap();
+        assert_eq!(coinbase_sigops(&block), total_sigops(&block));
+    }
+
+    #[test]
+    fn decode_bip34_height_decodes_valid_pushes() {
+        // 1-byte: push 0x42 -> 66
+        assert_eq!(decode_bip34_height(&[0x01, 0x42]), Some(66));
+        // 2-byte little endian: push 0x3412 -> 0x1234 = 4660
+        assert_eq!(decode_bip34_height(&[0x02, 0x34, 0x12]), Some(0x1234));
+        // 3-byte: push 0x563412 -> 0x123456 = 1193046
+        assert_eq!(
+            decode_bip34_height(&[0x03, 0x56, 0x34, 0x12]),
+            Some(0x0012_3456)
+        );
+        // 4-byte covers up to ~2^31. Block 800000 = 0x000c3500.
+        assert_eq!(
+            decode_bip34_height(&[0x03, 0x00, 0x35, 0x0c]),
+            Some(800_000)
+        );
+    }
+
+    #[test]
+    fn decode_bip34_height_rejects_negative_msb() {
+        // Sign bit on the MSB of the most significant byte: rejected.
+        assert_eq!(decode_bip34_height(&[0x01, 0x80]), None);
+        assert_eq!(decode_bip34_height(&[0x02, 0x00, 0x80]), None);
+    }
+
+    #[test]
+    fn decode_bip34_height_rejects_non_minimal_zero_padding() {
+        // Last byte == 0 with the previous byte's MSB clear is
+        // non-minimal: rejected.
+        assert_eq!(decode_bip34_height(&[0x02, 0x42, 0x00]), None);
+    }
+
+    #[test]
+    fn decode_bip34_height_rejects_invalid_opcode() {
+        // 0x05 is outside the direct-push range we accept.
+        assert_eq!(decode_bip34_height(&[0x05, 0x00, 0x00, 0x00, 0x00, 0x00]), None);
+        // OP_0 (0x00) is rejected: BIP-34 requires an integer push.
+        assert_eq!(decode_bip34_height(&[0x00]), None);
+    }
+
+    #[test]
+    fn decode_bip34_height_handles_truncated_script() {
+        // Length byte says push 4 but only 2 bytes follow.
+        assert_eq!(decode_bip34_height(&[0x04, 0x00, 0x00]), None);
+        // Empty script.
+        assert_eq!(decode_bip34_height(&[]), None);
+    }
+
+    #[test]
+    fn extract_witness_commitment_finds_well_formed_op_return() {
+        use bitcoin::Transaction;
+        use bitcoin::consensus::deserialize;
+        // Build a fake coinbase whose first output is a textbook
+        // witness commitment: OP_RETURN(0x6a) PUSH36(0x24)
+        // magic(0xaa21a9ed) + 32 commitment bytes.
+        let bytes = genesis_bytes();
+        let block: Block = deserialize(&bytes).unwrap();
+        let mut coinbase: Transaction = block.txdata[0].clone();
+        let mut commit = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+        let expected: [u8; 32] = [0x42; 32];
+        commit.extend_from_slice(&expected);
+        coinbase.output.push(bitcoin::TxOut {
+            value: bitcoin::Amount::ZERO,
+            script_pubkey: bitcoin::ScriptBuf::from(commit),
+        });
+        assert_eq!(
+            extract_witness_commitment_from_coinbase(&coinbase),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn extract_witness_commitment_returns_none_on_legacy_coinbase() {
+        // Genesis coinbase has no OP_RETURN witness commitment.
+        let bytes = genesis_bytes();
+        let block: Block = deserialize(&bytes).unwrap();
+        let coinbase = &block.txdata[0];
+        assert_eq!(extract_witness_commitment_from_coinbase(coinbase), None);
     }
 }
