@@ -583,6 +583,16 @@ pub enum ReasonCode {
     #[serde(rename = "v2_invariant_decode_failed")]
     V2InvariantDecodeFailed,
 
+    // ── v2.0 Invariant Shield Phase 2 (ADR-003) ──
+    #[serde(rename = "v2_invariant_mempool_tx_unknown")]
+    V2InvariantMempoolTxUnknown,
+    #[serde(rename = "v2_invariant_mempool_tolerance_exceeded")]
+    V2InvariantMempoolToleranceExceeded,
+    #[serde(rename = "v2_invariant_mempool_unavailable")]
+    V2InvariantMempoolUnavailable,
+    #[serde(rename = "v2_invariant_mempool_view_stale")]
+    V2InvariantMempoolViewStale,
+
     // ── Gateway operational (from GatewayReason) ──
     AuthFailed,
     UnsupportedAlgorithm,
@@ -710,6 +720,11 @@ impl ReasonCode {
         ReasonCode::V2InvariantHeaderVersionLow,
         ReasonCode::V2InvariantDuplicateTx,
         ReasonCode::V2InvariantDecodeFailed,
+        // v2.0 Invariant Shield Phase 2 (ADR-003)
+        ReasonCode::V2InvariantMempoolTxUnknown,
+        ReasonCode::V2InvariantMempoolToleranceExceeded,
+        ReasonCode::V2InvariantMempoolUnavailable,
+        ReasonCode::V2InvariantMempoolViewStale,
         // Gateway operational
         ReasonCode::AuthFailed,
         ReasonCode::UnsupportedAlgorithm,
@@ -817,6 +832,10 @@ impl ReasonCode {
         "v2_invariant_header_version_low",
         "v2_invariant_duplicate_tx",
         "v2_invariant_decode_failed",
+        "v2_invariant_mempool_tx_unknown",
+        "v2_invariant_mempool_tolerance_exceeded",
+        "v2_invariant_mempool_unavailable",
+        "v2_invariant_mempool_view_stale",
         "auth_failed",
         "unsupported_algorithm",
         "rate_limited",
@@ -935,6 +954,13 @@ impl ReasonCode {
             ReasonCode::V2InvariantHeaderVersionLow => "v2_invariant_header_version_low",
             ReasonCode::V2InvariantDuplicateTx => "v2_invariant_duplicate_tx",
             ReasonCode::V2InvariantDecodeFailed => "v2_invariant_decode_failed",
+            // v2.0 Invariant Shield Phase 2 (ADR-003)
+            ReasonCode::V2InvariantMempoolTxUnknown => "v2_invariant_mempool_tx_unknown",
+            ReasonCode::V2InvariantMempoolToleranceExceeded => {
+                "v2_invariant_mempool_tolerance_exceeded"
+            }
+            ReasonCode::V2InvariantMempoolUnavailable => "v2_invariant_mempool_unavailable",
+            ReasonCode::V2InvariantMempoolViewStale => "v2_invariant_mempool_view_stale",
             // Gateway operational
             ReasonCode::AuthFailed => "auth_failed",
             ReasonCode::UnsupportedAlgorithm => "unsupported_algorithm",
@@ -1074,6 +1100,15 @@ impl From<VerdictReason> for ReasonCode {
             VerdictReason::V2InvariantHeaderVersionLow => ReasonCode::V2InvariantHeaderVersionLow,
             VerdictReason::V2InvariantDuplicateTx => ReasonCode::V2InvariantDuplicateTx,
             VerdictReason::V2InvariantDecodeFailed => ReasonCode::V2InvariantDecodeFailed,
+            // v2.0 Invariant Shield Phase 2 (ADR-003)
+            VerdictReason::V2InvariantMempoolTxUnknown => ReasonCode::V2InvariantMempoolTxUnknown,
+            VerdictReason::V2InvariantMempoolToleranceExceeded => {
+                ReasonCode::V2InvariantMempoolToleranceExceeded
+            }
+            VerdictReason::V2InvariantMempoolUnavailable => {
+                ReasonCode::V2InvariantMempoolUnavailable
+            }
+            VerdictReason::V2InvariantMempoolViewStale => ReasonCode::V2InvariantMempoolViewStale,
         }
     }
 }
@@ -1255,9 +1290,10 @@ mod tests {
     fn reason_code_all_constant_length() {
         // 32 verdict (excluding internal_error) + 58 gateway (excluding internal_error) + 1 shared
         // = 91 after ADR-002 Phase 1 mirrored the 18 v2_invariant_* codes from VerdictReason.
+        // ADR-003 Phase 2 adds 4 v2_invariant_mempool_* codes, taking the total to 95.
         assert_eq!(
             ReasonCode::ALL.len(),
-            91,
+            95,
             "ReasonCode::ALL length mismatch: did you add a variant?"
         );
     }

@@ -110,6 +110,55 @@ pub enum ConsensusViolation {
     /// Duplicate transaction in block body.
     DuplicateTx,
 
+    /// A specific template transaction is not present in the
+    /// verifier's mempool view (Phase 2 Class M check).
+    ///
+    /// Per ADR-003, the per-tx detail mode emits one verdict record
+    /// per missing tx with the txid in `reason_detail`. The default
+    /// aggregate mode emits a single
+    /// [`ConsensusViolation::MempoolToleranceExceeded`] when the
+    /// unknown ratio crosses the configured tolerance threshold.
+    MempoolTxUnknown {
+        /// Transaction id of the missing tx, internal byte order.
+        txid: [u8; 32],
+    },
+
+    /// The number of template transactions absent from the
+    /// verifier's mempool view exceeded the configured tolerance
+    /// threshold (Phase 2 Class M check).
+    ///
+    /// Aggregate-mode counterpart to `MempoolTxUnknown`. The default
+    /// 4% threshold lives in `policy.toml` as `mempool_tolerance_pct`;
+    /// see ADR-003 D-18.2 for tuning rationale.
+    MempoolToleranceExceeded {
+        /// Number of template txs not found in the verifier's view.
+        unknown_count: u32,
+        /// Total number of transactions in the template (excluding coinbase).
+        total: u32,
+    },
+
+    /// Bitcoind RPC has been unreachable beyond the configured
+    /// fail-stale window (Phase 2 Class M check).
+    ///
+    /// Per ADR-003 D-18.4, the verifier serves the last known
+    /// mempool view up to `mempool_max_stale_secs` (default 60s).
+    /// Beyond that, the Phase 2 check is skipped and templates fall
+    /// through to Phase 1 behavior; this variant accompanies the
+    /// resulting verdict to record the degraded path.
+    MempoolUnavailable,
+
+    /// The mempool view age exceeded the staleness threshold during
+    /// a refresh attempt that did not yet trigger fail-stale
+    /// (Phase 2 Class M check).
+    ///
+    /// Observability variant. Fires when a refresh is overdue but
+    /// the view is still being served because the configured
+    /// `mempool_max_stale_secs` window has not yet expired.
+    MempoolViewStale {
+        /// Age of the served mempool view in seconds.
+        age_secs: u64,
+    },
+
     /// Facade is scaffolded but the underlying parser is not yet
     /// wired. Callers treat this as a shield-disabled signal and MUST
     /// NOT emit a `v2_invariant_*` reason code from it; the dedicated
@@ -166,12 +215,20 @@ impl ConsensusViolation {
         ConsensusViolation::NonCoinbaseNullPrevout,
         ConsensusViolation::HeaderVersionLow,
         ConsensusViolation::DuplicateTx,
+        ConsensusViolation::MempoolTxUnknown { txid: [0; 32] },
+        ConsensusViolation::MempoolToleranceExceeded {
+            unknown_count: 0,
+            total: 0,
+        },
+        ConsensusViolation::MempoolUnavailable,
+        ConsensusViolation::MempoolViewStale { age_secs: 0 },
         ConsensusViolation::NotImplemented,
     ];
 
-    /// All canonical reason code strings carried by the 18 shield
-    /// violation variants. `NotImplemented` intentionally routes to a
-    /// separate degraded sentinel and is not in this list.
+    /// All canonical reason code strings carried by the 22 shield
+    /// violation variants (18 Phase 1 + 4 Phase 2 Class M).
+    /// `NotImplemented` intentionally routes to a separate degraded
+    /// sentinel and is not in this list.
     ///
     /// This list is the single source of truth compared against
     /// `rg-protocol::VerdictReason` during cross-crate drift tests.
@@ -194,6 +251,10 @@ impl ConsensusViolation {
         "v2_invariant_nontcb_null_prevout",
         "v2_invariant_header_version_low",
         "v2_invariant_duplicate_tx",
+        "v2_invariant_mempool_tx_unknown",
+        "v2_invariant_mempool_tolerance_exceeded",
+        "v2_invariant_mempool_unavailable",
+        "v2_invariant_mempool_view_stale",
     ];
 
     /// Degraded sentinel emitted when the shield is scaffolded but
@@ -240,6 +301,12 @@ impl ConsensusViolation {
             ConsensusViolation::NonCoinbaseNullPrevout => "v2_invariant_nontcb_null_prevout",
             ConsensusViolation::HeaderVersionLow => "v2_invariant_header_version_low",
             ConsensusViolation::DuplicateTx => "v2_invariant_duplicate_tx",
+            ConsensusViolation::MempoolTxUnknown { .. } => "v2_invariant_mempool_tx_unknown",
+            ConsensusViolation::MempoolToleranceExceeded { .. } => {
+                "v2_invariant_mempool_tolerance_exceeded"
+            }
+            ConsensusViolation::MempoolUnavailable => "v2_invariant_mempool_unavailable",
+            ConsensusViolation::MempoolViewStale { .. } => "v2_invariant_mempool_view_stale",
             ConsensusViolation::NotImplemented => Self::NOT_IMPLEMENTED_CODE,
         }
     }
@@ -723,23 +790,24 @@ fn decode_bip34_height(script: &[u8]) -> Option<u32> {
 mod tests {
     use super::*;
 
-    /// The 18 shield variants must each map to a distinct canonical
-    /// code listed in `ALL_CODES`, and `ALL_CODES` must have length 18.
+    /// The 22 shield variants (18 Phase 1 plus 4 Phase 2 Class M)
+    /// must each map to a distinct canonical code listed in
+    /// `ALL_CODES`, and `ALL_CODES` must have length 22.
     #[test]
-    fn all_codes_has_eighteen_invariant_entries() {
+    fn all_codes_has_twenty_two_invariant_entries() {
         assert_eq!(
             ConsensusViolation::ALL_CODES.len(),
-            18,
-            "ALL_CODES length must match ADR-002 Phase 1 check set"
+            22,
+            "ALL_CODES length must match ADR-002 Phase 1 + ADR-003 Phase 2 check set"
         );
     }
 
     #[test]
-    fn all_has_nineteen_entries_scaffold_plus_shield() {
-        // 18 shield variants plus NotImplemented sentinel.
+    fn all_has_twenty_three_entries_scaffold_plus_shield() {
+        // 22 shield variants plus NotImplemented sentinel.
         assert_eq!(
             ConsensusViolation::ALL.len(),
-            19,
+            23,
             "ALL length drift: did you add a variant?"
         );
     }

@@ -209,6 +209,30 @@ pub enum VerdictReason {
     /// Raw block bytes fail to deserialize.
     #[serde(rename = "v2_invariant_decode_failed")]
     V2InvariantDecodeFailed,
+
+    // ── v2.0 Invariant Shield Phase 2 (ADR-003) ──
+    //
+    // Phase 2 introduces an external mempool view check (Class M)
+    // that runs after Class S (standalone) and Class D (declared
+    // mismatch) checks in the shield short-circuit chain. The four
+    // variants below cover the failure modes per ADR-003 D-18.
+    /// A specific template tx is not in the verifier's mempool view.
+    #[serde(rename = "v2_invariant_mempool_tx_unknown")]
+    V2InvariantMempoolTxUnknown,
+
+    /// Template's unknown-tx ratio exceeded the configured tolerance
+    /// threshold (default 4%).
+    #[serde(rename = "v2_invariant_mempool_tolerance_exceeded")]
+    V2InvariantMempoolToleranceExceeded,
+
+    /// Bitcoind RPC unreachable beyond the fail-stale window.
+    #[serde(rename = "v2_invariant_mempool_unavailable")]
+    V2InvariantMempoolUnavailable,
+
+    /// Mempool view age exceeded the staleness threshold during a
+    /// refresh attempt that did not yet trigger fail-stale.
+    #[serde(rename = "v2_invariant_mempool_view_stale")]
+    V2InvariantMempoolViewStale,
 }
 
 impl VerdictReason {
@@ -248,6 +272,11 @@ impl VerdictReason {
         VerdictReason::V2InvariantHeaderVersionLow,
         VerdictReason::V2InvariantDuplicateTx,
         VerdictReason::V2InvariantDecodeFailed,
+        // v2.0 Invariant Shield Phase 2 (ADR-003)
+        VerdictReason::V2InvariantMempoolTxUnknown,
+        VerdictReason::V2InvariantMempoolToleranceExceeded,
+        VerdictReason::V2InvariantMempoolUnavailable,
+        VerdictReason::V2InvariantMempoolViewStale,
     ];
 
     /// All canonical `snake_case` reason code strings, for test enumeration
@@ -287,6 +316,11 @@ impl VerdictReason {
         "v2_invariant_header_version_low",
         "v2_invariant_duplicate_tx",
         "v2_invariant_decode_failed",
+        // v2.0 Invariant Shield Phase 2 (ADR-003)
+        "v2_invariant_mempool_tx_unknown",
+        "v2_invariant_mempool_tolerance_exceeded",
+        "v2_invariant_mempool_unavailable",
+        "v2_invariant_mempool_view_stale",
     ];
 
     /// Returns all canonical `snake_case` reason code strings.
@@ -347,6 +381,13 @@ impl VerdictReason {
             VerdictReason::V2InvariantHeaderVersionLow => "v2_invariant_header_version_low",
             VerdictReason::V2InvariantDuplicateTx => "v2_invariant_duplicate_tx",
             VerdictReason::V2InvariantDecodeFailed => "v2_invariant_decode_failed",
+            // v2.0 Invariant Shield Phase 2 (ADR-003)
+            VerdictReason::V2InvariantMempoolTxUnknown => "v2_invariant_mempool_tx_unknown",
+            VerdictReason::V2InvariantMempoolToleranceExceeded => {
+                "v2_invariant_mempool_tolerance_exceeded"
+            }
+            VerdictReason::V2InvariantMempoolUnavailable => "v2_invariant_mempool_unavailable",
+            VerdictReason::V2InvariantMempoolViewStale => "v2_invariant_mempool_view_stale",
         }
     }
 }
@@ -405,7 +446,7 @@ mod tests {
         // 15 original (v1.x) + 18 v2.0 Invariant Shield (ADR-002) = 33.
         assert_eq!(
             VerdictReason::ALL.len(),
-            33,
+            37,
             "VerdictReason::ALL length mismatch — did you add a variant?"
         );
     }

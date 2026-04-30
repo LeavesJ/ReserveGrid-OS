@@ -584,6 +584,13 @@ fn consensus_violation_to_verdict_reason(v: &ConsensusViolation) -> VerdictReaso
         ConsensusViolation::NonCoinbaseNullPrevout => VerdictReason::V2InvariantNontcbNullPrevout,
         ConsensusViolation::HeaderVersionLow => VerdictReason::V2InvariantHeaderVersionLow,
         ConsensusViolation::DuplicateTx => VerdictReason::V2InvariantDuplicateTx,
+        // v2.0 Invariant Shield Phase 2 (ADR-003)
+        ConsensusViolation::MempoolTxUnknown { .. } => VerdictReason::V2InvariantMempoolTxUnknown,
+        ConsensusViolation::MempoolToleranceExceeded { .. } => {
+            VerdictReason::V2InvariantMempoolToleranceExceeded
+        }
+        ConsensusViolation::MempoolUnavailable => VerdictReason::V2InvariantMempoolUnavailable,
+        ConsensusViolation::MempoolViewStale { .. } => VerdictReason::V2InvariantMempoolViewStale,
         ConsensusViolation::NotImplemented => VerdictReason::InternalError,
     }
 }
