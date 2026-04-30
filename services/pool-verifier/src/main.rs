@@ -16,6 +16,11 @@ mod state;
 mod types;
 mod verdicts;
 
+// Phase 2 modules (`bitcoind_rpc`, `mempool_view`) live in the library
+// crate (lib.rs) so that policy.rs in the lib can reference them via
+// `crate::mempool_view`. main.rs will import from `pool_verifier::*`
+// when the polling-task wiring lands in a follow-up.
+
 // Re-export commonly used types
 use mempool_client::mempool_url_from_env;
 use state::AppState;
@@ -119,6 +124,66 @@ fn init_metrics() -> (
     (shared, verifier_metrics)
 }
 
+// ── Phase 2 mempool view bootstrap (ADR-003) ──────────────────
+
+/// Construct the Phase 2 [`MempoolView`] and spawn the polling task
+/// when policy enables Class M and the bitcoind RPC creds are
+/// populated. Returns `None` to leave the shield in Phase 1 mode.
+///
+/// `[policy.mempool] rpc_pass` is preferred from the
+/// `VELDRA_BITCOIND_RPC_PASS` env var when set, falling back to the
+/// TOML-stored value. Operators should keep secrets out of
+/// `policy.toml` on disk.
+fn build_phase2_mempool_view(
+    cfg: &pool_verifier::policy::PolicyConfig,
+) -> Option<Arc<pool_verifier::mempool_view::MempoolView>> {
+    let mp = &cfg.mempool;
+    if !mp.enforce {
+        return None;
+    }
+    if mp.rpc_url.is_empty() || mp.rpc_user.is_empty() {
+        tracing::warn!(
+            "policy.mempool.enforce=true but rpc_url or rpc_user is empty; \
+             Phase 2 Class M check disabled (shield runs Phase 1 only)"
+        );
+        return None;
+    }
+    let pass = env::var("VELDRA_BITCOIND_RPC_PASS").unwrap_or_else(|_| mp.rpc_pass.clone());
+    if pass.is_empty() {
+        tracing::warn!(
+            "policy.mempool.enforce=true but no rpc_pass available \
+             (neither VELDRA_BITCOIND_RPC_PASS env nor [policy.mempool] rpc_pass); \
+             Phase 2 Class M check disabled (shield runs Phase 1 only)"
+        );
+        return None;
+    }
+
+    let client = pool_verifier::bitcoind_rpc::BitcoindClient::new(
+        mp.rpc_url.clone(),
+        mp.rpc_user.clone(),
+        pass,
+        std::time::Duration::from_secs(5),
+    );
+    let view = Arc::new(pool_verifier::mempool_view::MempoolView::new(
+        mp.max_stale_secs,
+    ));
+    let handle = Arc::clone(&view).spawn_polling_task(
+        client,
+        std::time::Duration::from_secs(mp.poll_interval_secs),
+    );
+    // Detach the join handle; the task lives for the program lifetime.
+    drop(handle);
+    tracing::info!(
+        rpc_url = %mp.rpc_url,
+        poll_interval_secs = mp.poll_interval_secs,
+        max_stale_secs = mp.max_stale_secs,
+        tolerance_pct = mp.tolerance_pct,
+        per_tx_detail = mp.per_tx_detail,
+        "Phase 2 Class M check enabled; mempool view polling task spawned"
+    );
+    Some(view)
+}
+
 // ── Main ─────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -167,8 +232,15 @@ async fn main() -> anyhow::Result<()> {
         || policy_holder.toml_text.contains("[policy]");
     POLICY_LOADED_OK.store(policy_ok, std::sync::atomic::Ordering::Relaxed);
 
+    // Phase 2 mempool view spawn-on-startup. Wired only when
+    // `[policy.mempool] enforce = true` and the bitcoind RPC creds
+    // are populated. Defaults shipped with `enforce = false`, so
+    // existing deployments run Phase 1 only without operator action.
+    let mempool_view = build_phase2_mempool_view(&policy_holder.config);
+
     let app_state = AppState {
         policy: Arc::new(RwLock::new(policy_holder)),
+        mempool_view,
     };
 
     let (verdict_log, log_id_counter) = load_verdict_log();

@@ -712,6 +712,26 @@ pub fn bip34_height(block: &ParsedBlock) -> Result<u32, ConsensusViolation> {
     decode_bip34_height(bytes).ok_or(ConsensusViolation::CoinbaseBip34Missing)
 }
 
+// ─── Class M accessors: mempool ground truth (Phase 2 / ADR-003) ──
+
+/// Return the list of non-coinbase transaction ids in the block, in
+/// internal byte order. The coinbase tx is intentionally excluded
+/// because it never appears in the network mempool.
+///
+/// Pool-verifier's Phase 2 Class M check iterates these txids
+/// against the verifier's mempool view, counting how many are
+/// unknown. R-154 facade narrowness preserved: returns
+/// `Vec<[u8; 32]>` rather than any `bitcoin::Txid` type.
+pub fn template_txids(block: &ParsedBlock) -> Vec<[u8; 32]> {
+    block
+        .0
+        .txdata
+        .iter()
+        .skip(1)
+        .map(|tx| tx.compute_txid().to_byte_array())
+        .collect()
+}
+
 // ─── Internal helpers ──────────────────────────────────────────────
 
 /// Locate the first BIP-141 witness commitment output in a coinbase.

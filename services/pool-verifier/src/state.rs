@@ -2,6 +2,7 @@ use anyhow::{Context, anyhow};
 use rg_protocol::PROTOCOL_VERSION;
 use tracing::{error, warn};
 
+use pool_verifier::mempool_view::MempoolView;
 use pool_verifier::policy::PolicyConfig;
 
 #[derive(Debug, Clone)]
@@ -13,6 +14,13 @@ pub struct PolicyHolder {
 #[derive(Clone)]
 pub struct AppState {
     pub policy: std::sync::Arc<std::sync::RwLock<PolicyHolder>>,
+
+    /// Phase 2 mempool view. `None` when `[policy.mempool] enforce`
+    /// is `false` (default); the shield then runs Phase 1 only.
+    /// `Some(view)` when the polling task is wired at startup; the
+    /// shield's `evaluate_dynamic` reads a snapshot per template
+    /// and routes through `check_invariant_shield_with_mempool`.
+    pub mempool_view: Option<std::sync::Arc<MempoolView>>,
 }
 
 fn enforce_protocol(cfg: &PolicyConfig) -> anyhow::Result<()> {

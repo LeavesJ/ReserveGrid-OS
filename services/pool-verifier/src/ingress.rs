@@ -18,6 +18,7 @@ use crate::verdicts::{
     LAST_MEMPOOL_OK_UNIX, LogIdCounter, LoggedVerdict, VerdictLog, append_verdict_to_disk,
     current_timestamp, current_timestamp_ms,
 };
+use pool_verifier::mempool_view::MempoolState;
 use rg_protocol::gateway::{InternalMessage, msg_types};
 use rg_protocol::{
     PROTOCOL_VERSION, PolicyContext, TemplatePropose, TemplateVerdict, VerdictReason,
@@ -433,14 +434,63 @@ pub(crate) async fn handle_tcp_connection<R, W>(
             };
 
             let now_ms = current_timestamp_ms();
-            let eval =
-                pool_verifier::policy::evaluate_dynamic(&propose, &cfg, mempool_tx_count, now_ms);
+            // Phase 2 path: if AppState carries a mempool view, snapshot
+            // it and evaluate with Class M wired. Phase 1 path otherwise.
+            let eval = if let Some(view) = state_clone.mempool_view.as_ref() {
+                let snap = view.snapshot().await;
+                pool_verifier::policy::evaluate_dynamic_phase2(
+                    &propose,
+                    &cfg,
+                    Some(&snap),
+                    mempool_tx_count,
+                    now_ms,
+                )
+            } else {
+                pool_verifier::policy::evaluate_dynamic(&propose, &cfg, mempool_tx_count, now_ms)
+            };
 
             let accepted = eval.reason.is_none();
 
             // reason_code string comes from rg-protocol — single source of truth.
             let reason_code_str: Option<String> =
                 eval.reason.as_ref().map(|r| r.as_str().to_string());
+
+            // ── Phase 2 Class M observability (ADR-003) ──
+            // Increments verifier_phase2_checks_total{result} based on
+            // the verdict's reason code. Only fires when the Phase 2
+            // path was taken (mempool_view present in AppState). Mempool
+            // view gauges are refreshed on each snapshot read so
+            // dashboards see freshness without an extra polling loop.
+            if let Some(view) = state_clone.mempool_view.as_ref() {
+                let snap = view.snapshot().await;
+                metrics
+                    .mempool_view_age_seconds
+                    .set(i64::try_from(snap.age_secs).unwrap_or(i64::MAX));
+                metrics
+                    .mempool_view_size
+                    .set(i64::try_from(snap.size).unwrap_or(i64::MAX));
+                let result_label = match (eval.reason.as_ref(), snap.state) {
+                    (
+                        Some(
+                            rg_protocol::VerdictReason::V2InvariantMempoolToleranceExceeded
+                            | rg_protocol::VerdictReason::V2InvariantMempoolTxUnknown,
+                        ),
+                        _,
+                    ) => "rejected",
+                    (_, MempoolState::Degraded) => {
+                        metrics.phase2_degraded_total.inc();
+                        "skipped"
+                    }
+                    (_, MempoolState::Stale) => "stale",
+                    _ => "agreed",
+                };
+                metrics
+                    .phase2_checks_total
+                    .get_or_create(&crate::metrics::Phase2CheckLabels {
+                        result: result_label.to_string(),
+                    })
+                    .inc();
+            }
 
             let reason_detail_str: Option<String> = eval.detail.clone();
 

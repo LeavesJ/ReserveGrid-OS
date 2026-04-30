@@ -140,6 +140,95 @@ pub struct PolicyConfig {
 
     #[serde(default)]
     pub safety: PolicySafety,
+
+    /// v2.0 Invariant Shield Phase 2 mempool ground truth (ADR-003).
+    /// Sub-table at `[policy.mempool]`. All fields are optional with
+    /// defaults so older configs continue to load unchanged; the
+    /// shield's Class M check stays disabled until `enforce = true`.
+    #[serde(default)]
+    pub mempool: PolicyMempool,
+}
+
+/// v2.0 Invariant Shield Phase 2 (ADR-003 D-18) policy keys.
+///
+/// Lives at `[policy.mempool]` in `policy.toml`. Defaults match
+/// the locked decisions in EXECLOG D-18: 4% tolerance, 10-second
+/// poll interval, 60-second fail-stale window, per-tx detail off.
+/// Operators set `enforce = true` to activate the Class M check.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyMempool {
+    /// Master enable for the Class M (mempool ground truth) check.
+    /// Default `false` so the shield ships in Phase 1 behavior; flip
+    /// to `true` once `rpc_url` / `rpc_user` / `rpc_pass` are wired.
+    #[serde(default)]
+    pub enforce: bool,
+
+    /// Percentage of template txs that may be unknown to the
+    /// verifier's mempool view before rejection. ADR-003 D-18.2
+    /// default 4.0. Tunable per operator data; tuning trigger and
+    /// acceptance metric documented in EXECLOG D-18.
+    #[serde(default = "default_mempool_tolerance_pct")]
+    pub tolerance_pct: f64,
+
+    /// `getrawmempool` poll cadence in seconds. Default 10.
+    #[serde(default = "default_mempool_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+
+    /// Fail-stale window. Last known view served up to this many
+    /// seconds after the most recent successful refresh. ADR-003 D3
+    /// default 60.
+    #[serde(default = "default_mempool_max_stale_secs")]
+    pub max_stale_secs: u64,
+
+    /// When `true`, emit one verdict record per missing tx with the
+    /// txid in the detail string. When `false` (default), emit one
+    /// aggregate record listing up to 10 representative txids and
+    /// the total unknown count.
+    #[serde(default)]
+    pub per_tx_detail: bool,
+
+    /// Bitcoind JSON-RPC endpoint. Required when `enforce = true`.
+    #[serde(default)]
+    pub rpc_url: String,
+
+    /// Bitcoind JSON-RPC basic-auth user. Required when `enforce = true`.
+    #[serde(default)]
+    pub rpc_user: String,
+
+    /// Bitcoind JSON-RPC basic-auth password. Required when
+    /// `enforce = true`. Also acceptable via the
+    /// `VELDRA_BITCOIND_RPC_PASS` env var; main.rs reads the env
+    /// var first and only falls back to this field if the var is
+    /// unset, to keep secrets out of policy.toml on disk.
+    #[serde(default)]
+    pub rpc_pass: String,
+}
+
+impl Default for PolicyMempool {
+    fn default() -> Self {
+        Self {
+            enforce: false,
+            tolerance_pct: default_mempool_tolerance_pct(),
+            poll_interval_secs: default_mempool_poll_interval_secs(),
+            max_stale_secs: default_mempool_max_stale_secs(),
+            per_tx_detail: false,
+            rpc_url: String::new(),
+            rpc_user: String::new(),
+            rpc_pass: String::new(),
+        }
+    }
+}
+
+fn default_mempool_tolerance_pct() -> f64 {
+    4.0
+}
+
+fn default_mempool_poll_interval_secs() -> u64 {
+    10
+}
+
+fn default_mempool_max_stale_secs() -> u64 {
+    60
 }
 
 fn default_protocol_version() -> u16 {
@@ -423,6 +512,7 @@ impl PolicyConfig {
             reject_coinbase_zero: false,
             unknown_mempool_as_high: true,
             safety: PolicySafety::default(),
+            mempool: PolicyMempool::default(),
         }
     }
 
@@ -630,9 +720,29 @@ fn consensus_violation_to_verdict_reason(v: &ConsensusViolation) -> VerdictReaso
 // `clippy::too_many_lines` threshold. Splitting into per-check helpers
 // would scatter the short-circuit return chain across many small fns
 // without improving readability; an explicit allow with this rationale
-// reads better.
-#[allow(clippy::too_many_lines)]
+// reads better. Phase 2 adds a Class M (mempool ground truth) section
+// at the tail; same rationale.
 pub fn check_invariant_shield(template: &TemplatePropose) -> ShieldOutcome {
+    check_invariant_shield_inner(template, None)
+}
+
+/// Phase 2 entry point. Runs the full Phase 1 + Class M shield
+/// against a mempool snapshot. `tolerance_pct` is the operator-tuned
+/// threshold from `policy.toml` `[policy.mempool] tolerance_pct`
+/// (default 4.0 per ADR-003 D-18.2).
+pub fn check_invariant_shield_with_mempool(
+    template: &TemplatePropose,
+    mempool: &crate::mempool_view::MempoolSnapshot,
+    tolerance_pct: f64,
+) -> ShieldOutcome {
+    check_invariant_shield_inner(template, Some((mempool, tolerance_pct)))
+}
+
+#[allow(clippy::too_many_lines)]
+fn check_invariant_shield_inner(
+    template: &TemplatePropose,
+    mempool: Option<(&crate::mempool_view::MempoolSnapshot, f64)>,
+) -> ShieldOutcome {
     let Some(hex_str) = template.raw_block_hex.as_deref() else {
         return ShieldOutcome::Skipped;
     };
@@ -783,6 +893,49 @@ pub fn check_invariant_shield(template: &TemplatePropose) -> ShieldOutcome {
         }
     }
 
+    // ── Class M: mempool ground truth (Phase 2 / ADR-003) ─────────
+    // Runs only when the caller supplied a mempool snapshot plus a
+    // tolerance threshold. Every Phase 1 check has already passed
+    // by this point. Class M is strictly additive: a Skipped
+    // mempool snapshot leaves the verdict at Agreed, an
+    // Agreed/Stale mempool snapshot leaves the verdict at Agreed,
+    // and only ToleranceExceeded converts to Rejected.
+    if let Some((snapshot, tolerance_pct)) = mempool {
+        let txids = rg_consensus::template_txids(&parsed);
+        match crate::mempool_view::evaluate(snapshot, &txids, tolerance_pct) {
+            crate::mempool_view::MempoolCheckOutcome::Agreed { .. }
+            | crate::mempool_view::MempoolCheckOutcome::Stale { .. }
+            | crate::mempool_view::MempoolCheckOutcome::Skipped => {
+                // Stale produces an advisory at the metric layer
+                // but does not reject. Skipped means the view is
+                // Degraded and the caller increments
+                // `verifier_phase2_degraded_total`.
+            }
+            crate::mempool_view::MempoolCheckOutcome::ToleranceExceeded {
+                unknown_count,
+                total,
+                sample_unknown,
+            } => {
+                use std::fmt::Write as _;
+                let mut detail = format!(
+                    "mempool tolerance exceeded: {unknown_count}/{total} txs unknown to verifier view"
+                );
+                if !sample_unknown.is_empty() {
+                    let sample_str: String = sample_unknown
+                        .iter()
+                        .map(hex::encode)
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let _ = write!(detail, " sample=[{sample_str}]");
+                }
+                return ShieldOutcome::Rejected {
+                    reason: VerdictReason::V2InvariantMempoolToleranceExceeded,
+                    detail,
+                };
+            }
+        }
+    }
+
     ShieldOutcome::Agreed
 }
 
@@ -791,15 +944,46 @@ pub fn evaluate(template: &TemplatePropose, cfg: &PolicyConfig) -> EvalResult {
     evaluate_dynamic(template, cfg, None, now_unix_ms())
 }
 
+/// Phase 2 entry point. Same as [`evaluate_dynamic`] but with an
+/// explicit mempool snapshot for the Class M (mempool ground truth)
+/// check. Pass `None` to disable Class M for this evaluation; pass
+/// `Some(snapshot)` to run the full Phase 1 + Phase 2 shield.
+///
+/// `tolerance_pct` is the operator-tunable threshold from
+/// `[policy.mempool] tolerance_pct` (default 4.0 per ADR-003 D-18.2).
+pub fn evaluate_dynamic_phase2(
+    template: &TemplatePropose,
+    cfg: &PolicyConfig,
+    mempool_snapshot: Option<&crate::mempool_view::MempoolSnapshot>,
+    mempool_tx: Option<u64>,
+    now_ms: u64,
+) -> EvalResult {
+    evaluate_dynamic_inner(template, cfg, mempool_snapshot, mempool_tx, now_ms)
+}
+
 /// Core policy evaluation. Returns an `EvalResult` whose `reason` field
 /// carries the canonical `rg_protocol::VerdictReason` directly — no
 /// intermediate local enum, no mapping layer.
 ///
 /// `now_ms` is the current unix timestamp in milliseconds, passed explicitly
 /// to keep the function deterministic for testing.
+///
+/// Phase 1 entry point. Equivalent to
+/// [`evaluate_dynamic_phase2`] with `mempool_snapshot = None`.
 pub fn evaluate_dynamic(
     template: &TemplatePropose,
     cfg: &PolicyConfig,
+    mempool_tx: Option<u64>,
+    now_ms: u64,
+) -> EvalResult {
+    evaluate_dynamic_inner(template, cfg, None, mempool_tx, now_ms)
+}
+
+#[allow(clippy::too_many_lines)]
+fn evaluate_dynamic_inner(
+    template: &TemplatePropose,
+    cfg: &PolicyConfig,
+    mempool_snapshot: Option<&crate::mempool_view::MempoolSnapshot>,
     mempool_tx: Option<u64>,
     now_ms: u64,
 ) -> EvalResult {
@@ -828,12 +1012,23 @@ pub fn evaluate_dynamic(
         return result;
     }
 
-    // ── v2.0 Invariant Shield (ADR-002 Phase 1) ──
+    // ── v2.0 Invariant Shield (ADR-002 Phase 1 + ADR-003 Phase 2) ──
     // Runs after safety so earlier policy rejects short circuit first
     // and the shield only sees templates that have already passed every
     // prior check. Strictly additive: templates that omit raw_block_hex
     // bypass the shield without altering the prior verdict path.
-    let shield_skipped = match check_invariant_shield(template) {
+    //
+    // When `mempool_snapshot` is Some, the shield runs the full
+    // Phase 1 + Phase 2 chain. When None, only Phase 1 runs (legacy
+    // behavior, used by tests and any caller that has not wired the
+    // Phase 2 mempool view).
+    let shield_outcome = match mempool_snapshot {
+        Some(snap) => {
+            check_invariant_shield_with_mempool(template, snap, cfg.mempool.tolerance_pct)
+        }
+        None => check_invariant_shield(template),
+    };
+    let shield_skipped = match shield_outcome {
         ShieldOutcome::Skipped => true,
         ShieldOutcome::Agreed => false,
         ShieldOutcome::Rejected { reason, detail } => {
@@ -946,6 +1141,7 @@ mod tests {
             reject_coinbase_zero: true,
             unknown_mempool_as_high: true,
             safety: PolicySafety::default(),
+            mempool: PolicyMempool::default(),
         };
 
         let ts = now_unix_ms();
