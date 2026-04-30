@@ -443,3 +443,22 @@ verifier checks, not gateway checks). A new
     the workspace through a single crate that exposes only plain Rust
     types across its API boundary. No upstream consensus types leak into
     wire schemas, NDJSON exports, or reason code definitions."
+
+## Phase 2 (cross-reference)
+
+Phase 2 closes the consistent-template-manager-tampering attacker class
+(T3 in the formalized threat model) that Phase 1 leaves open. Phase 1's
+shield catches internal raw_block tampering (T1) and TemplatePropose
+versus bytes mismatches (T2) but cannot catch a tampered template that
+is internally consistent by construction. Phase 2 adds an external view
+of the network mempool that the verifier cross-checks every template's
+transaction set against.
+
+Full design including threat model formalization, four locked
+architecture forks, four new `v2_invariant_mempool_*` reason codes,
+eight new policy keys, four new metrics, and seven action items lives
+in [ADR-003: Mempool Ground Truth and Enforcement
+Policy](./ADR-003-mempool-ground-truth.md).
+
+ADR-003 supersedes the open-ended Phase 2 mention in this document's
+Context section. Implementation begins after ADR-003 review.
