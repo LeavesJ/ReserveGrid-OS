@@ -95,7 +95,12 @@ impl VerifierMetrics {
         );
         registry.register(
             "verifier_shield_skipped_total",
-            "Templates that reached the v2.0 Invariant Shield but omitted raw_block_hex",
+            "Phase 1 coverage gap: templates that reached the v2.0 Invariant Shield but \
+             omitted raw_block_hex so the Class S and Class D check chain could not run. \
+             Trends to zero as gateways are upgraded to ship raw block bytes. For Phase 2 \
+             Class M (mempool ground truth) observability see verifier_phase2_checks_total, \
+             verifier_phase2_degraded_total, verifier_mempool_view_age_seconds, and \
+             verifier_mempool_view_size.",
             m.shield_skipped_total.clone(),
         );
         registry.register(

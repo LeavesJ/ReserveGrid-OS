@@ -461,4 +461,11 @@ in [ADR-003: Mempool Ground Truth and Enforcement
 Policy](./ADR-003-mempool-ground-truth.md).
 
 ADR-003 supersedes the open-ended Phase 2 mention in this document's
-Context section. Implementation begins after ADR-003 review.
+Context section. Implementation status as of 2026-04-30: Phase 2 #1
+(four canonical reason codes) shipped in cac223c, and Phase 2 #2
+(mempool view, bitcoind RPC client, polling task, Class M tolerance
+check, four metrics, eight `[policy.mempool]` keys) shipped in e422bd6
+plus the doc surface refresh in 5d1791e. Phase 2 #3 regtest
+integration tests, Phase 2 #6 one-week shadow observation, and the
+public veldra-site `91 → 95` reason code surface sweep remain open.
+See ADR-003 Action Items for the live checkbox state.
