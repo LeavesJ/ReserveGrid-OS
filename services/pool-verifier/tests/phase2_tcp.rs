@@ -94,7 +94,13 @@ struct MockState {
     /// when seeding this list.
     display_hex_txids: Arc<std::sync::RwLock<Vec<String>>>,
     request_count: Arc<AtomicU64>,
+    /// Single-shot failure: returns one 500 then resets to healthy.
     fail_next: Arc<AtomicBool>,
+    /// Sticky failure: every request returns 500 until cleared. Used
+    /// by the kill-the-mock fail-stale Phase 2 #3.5 test to drive
+    /// the verifier's mempool view from `Fresh` to `Degraded`
+    /// without tearing down the axum task.
+    always_fail: Arc<AtomicBool>,
 }
 
 #[derive(Deserialize)]
@@ -113,7 +119,9 @@ async fn rpc_handler(
 ) -> impl IntoResponse {
     state.request_count.fetch_add(1, Ordering::SeqCst);
 
-    if state.fail_next.swap(false, Ordering::SeqCst) {
+    if state.always_fail.load(Ordering::SeqCst)
+        || state.fail_next.swap(false, Ordering::SeqCst)
+    {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({
@@ -171,8 +179,28 @@ async fn spawn_mock(state: MockState) -> SocketAddr {
     addr
 }
 
-fn write_policy_toml(scratch: &Path, mock_addr: SocketAddr) -> PathBuf {
+/// Knobs the kill-the-mock fail-stale test needs to override
+/// (smaller `max_stale_secs` so the view degrades within the test
+/// timeout). All other policy fields stay permissive so Phase 1
+/// gates never short-circuit Phase 2 behavior under test.
+#[derive(Clone, Copy)]
+struct PolicyOverrides {
+    max_stale_secs: u64,
+}
+
+impl Default for PolicyOverrides {
+    fn default() -> Self {
+        Self { max_stale_secs: 60 }
+    }
+}
+
+fn write_policy_toml(
+    scratch: &Path,
+    mock_addr: SocketAddr,
+    overrides: PolicyOverrides,
+) -> PathBuf {
     let policy_path = scratch.join("policy.toml");
+    let max_stale_secs = overrides.max_stale_secs;
     let toml = format!(
         r#"[policy]
 protocol_version = 2
@@ -199,7 +227,7 @@ warn_coinbase_sigops_max = 400
 enforce = true
 tolerance_pct = 4.0
 poll_interval_secs = 1
-max_stale_secs = 60
+max_stale_secs = {max_stale_secs}
 per_tx_detail = false
 rpc_url = "http://{mock_addr}/"
 rpc_user = "rg-test"
@@ -333,12 +361,28 @@ fn make_mock_state(display_hex: Vec<String>) -> MockState {
         display_hex_txids: Arc::new(std::sync::RwLock::new(display_hex)),
         request_count: Arc::new(AtomicU64::new(0)),
         fail_next: Arc::new(AtomicBool::new(false)),
+        always_fail: Arc::new(AtomicBool::new(false)),
     }
 }
 
-async fn boot_verifier_with_mock(
+/// Booted verifier handle. `verifier_port` carries the TCP listener
+/// (TemplatePropose / TemplateVerdict envelopes); `http_port`
+/// carries the public HTTP surface including `/metrics`.
+struct Booted {
+    proc: VerifierProcess,
+    verifier_port: u16,
+    http_port: u16,
+    mock: MockState,
+}
+
+async fn boot_verifier_with_mock(display_hex_txids: Vec<String>) -> Booted {
+    boot_verifier_with_mock_overrides(display_hex_txids, PolicyOverrides::default()).await
+}
+
+async fn boot_verifier_with_mock_overrides(
     display_hex_txids: Vec<String>,
-) -> (VerifierProcess, u16, MockState) {
+    overrides: PolicyOverrides,
+) -> Booted {
     let mock_state = make_mock_state(display_hex_txids);
     let mock_addr = spawn_mock(mock_state.clone()).await;
 
@@ -346,7 +390,7 @@ async fn boot_verifier_with_mock(
     let http_port = discover_free_port().await;
 
     let scratch = ScratchDir::new("phase2-tcp").expect("create scratch dir");
-    let policy_path = write_policy_toml(scratch.path(), mock_addr);
+    let policy_path = write_policy_toml(scratch.path(), mock_addr, overrides);
     let child = spawn_verifier(&policy_path, verifier_port, http_port, scratch.path());
 
     let proc = VerifierProcess {
@@ -359,16 +403,71 @@ async fn boot_verifier_with_mock(
     // Give the verifier one extra poll cycle to install the snapshot.
     tokio::time::sleep(Duration::from_millis(1_500)).await;
 
-    (proc, verifier_port, mock_state)
+    Booted {
+        proc,
+        verifier_port,
+        http_port,
+        mock: mock_state,
+    }
+}
+
+/// Issue a raw HTTP/1.1 GET against the verifier's public `/metrics`
+/// endpoint and return the response body. Avoids pulling reqwest as
+/// a dev-dep (one HTTP GET, no TLS, loopback only).
+async fn fetch_metrics_text(http_port: u16) -> String {
+    use tokio::io::AsyncReadExt;
+    let mut stream = TcpStream::connect(("127.0.0.1", http_port))
+        .await
+        .expect("connect metrics");
+    let req =
+        "GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n".to_string();
+    stream
+        .write_all(req.as_bytes())
+        .await
+        .expect("write metrics req");
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.expect("read metrics");
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    if let Some(idx) = text.find("\r\n\r\n") {
+        text[idx + 4..].to_string()
+    } else {
+        text
+    }
+}
+
+/// Parse a Prometheus counter line of shape `metric_name <number>`
+/// out of the OpenMetrics text export. Returns 0 if absent so the
+/// caller can assert "increased to >= N" without distinguishing
+/// missing from zero.
+fn parse_counter(text: &str, name: &str) -> u64 {
+    for line in text.lines() {
+        if line.starts_with('#') {
+            continue;
+        }
+        // Match "name VALUE" or "name{labels} VALUE".
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix(name) {
+            // Handle either bare metric or label set.
+            let after_labels = rest.split_whitespace().last();
+            if let Some(value) = after_labels
+                && let Ok(parsed) = value.parse::<f64>()
+            {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                return parsed as u64;
+            }
+        }
+    }
+    0
 }
 
 #[tokio::test]
 #[ignore = "Tier 2: spawns pool-verifier subprocess; run with --ignored"]
 async fn phase2_tcp_happy_path_full_overlap_emits_accept() {
     let (template, display_hex) = regtest_segwit_template_and_display_hex();
-    let (_proc, port, _mock) = boot_verifier_with_mock(display_hex).await;
+    let booted = boot_verifier_with_mock(display_hex).await;
 
-    let verdict = round_trip_template(port, template).await;
+    let verdict = round_trip_template(booted.verifier_port, template).await;
+    drop(booted);
 
     assert!(
         verdict.accepted,
@@ -382,9 +481,10 @@ async fn phase2_tcp_happy_path_full_overlap_emits_accept() {
 async fn phase2_tcp_fabrication_path_emits_tolerance_exceeded() {
     let (template, _display_hex) = regtest_segwit_template_and_display_hex();
     // Empty mempool view; template's 1 non-coinbase tx is unknown.
-    let (_proc, port, _mock) = boot_verifier_with_mock(vec![]).await;
+    let booted = boot_verifier_with_mock(vec![]).await;
 
-    let verdict = round_trip_template(port, template).await;
+    let verdict = round_trip_template(booted.verifier_port, template).await;
+    drop(booted);
 
     assert!(!verdict.accepted, "expected reject, got accept");
     assert_eq!(
@@ -407,15 +507,15 @@ async fn phase2_tcp_subsequent_template_uses_refreshed_view() {
     // assert the next template is accepted. Verifies the polling
     // task installs new snapshots without a process restart.
     let (template, display_hex) = regtest_segwit_template_and_display_hex();
-    let (_proc, port, mock) = boot_verifier_with_mock(vec![]).await;
+    let booted = boot_verifier_with_mock(vec![]).await;
 
     // Confirm initial reject under empty view.
-    let verdict_a = round_trip_template(port, template.clone()).await;
+    let verdict_a = round_trip_template(booted.verifier_port, template.clone()).await;
     assert!(!verdict_a.accepted);
 
     // Mutate the mock's view to include the template's tx.
     {
-        let mut g = mock.display_hex_txids.write().expect("mock write lock");
+        let mut g = booted.mock.display_hex_txids.write().expect("mock write lock");
         *g = display_hex;
     }
 
@@ -423,11 +523,70 @@ async fn phase2_tcp_subsequent_template_uses_refreshed_view() {
     // verifier picks up the new view.
     tokio::time::sleep(Duration::from_millis(2_500)).await;
 
-    let verdict_b = round_trip_template(port, template).await;
+    let verdict_b = round_trip_template(booted.verifier_port, template).await;
+    drop(booted);
     assert!(
         verdict_b.accepted,
         "expected accept after refresh, got reason={:?}",
         verdict_b.reason_code
+    );
+}
+
+/// Phase 2 #3.5 kill-the-mock fail-stale scenario.
+///
+/// Boot the verifier under a healthy view, send a TemplatePropose
+/// (asserts accept under Fresh), flip the mock's `always_fail` toggle
+/// so subsequent `getrawmempool` polls return 500, wait long enough
+/// for the view to reach Degraded (`max_stale_secs * 2 + buffer`),
+/// then send another TemplatePropose. The second verdict must still
+/// accept because Class M skips on Degraded and Phase 1 falls
+/// through unchanged. The HTTP `/metrics` surface must show
+/// `verifier_phase2_degraded_total >= 1` confirming the operator
+/// alert path fires.
+#[tokio::test]
+#[ignore = "Tier 2: spawns pool-verifier subprocess; run with --ignored"]
+async fn phase2_tcp_kill_the_mock_drives_view_to_degraded() {
+    let (template, display_hex) = regtest_segwit_template_and_display_hex();
+    // 3-second fail-stale window so the view crosses Degraded
+    // (2 * max_stale_secs = 6s) within the test budget.
+    let overrides = PolicyOverrides { max_stale_secs: 3 };
+    let booted = boot_verifier_with_mock_overrides(display_hex, overrides).await;
+
+    // Sanity: under Fresh, the template accepts.
+    let v_fresh = round_trip_template(booted.verifier_port, template.clone()).await;
+    assert!(
+        v_fresh.accepted,
+        "pre-kill: expected accept under Fresh, got reason={:?}",
+        v_fresh.reason_code
+    );
+
+    // Flip the mock to always-fail. Polls now return 500; the polling
+    // task logs and serves the last view, then transitions to Stale
+    // and finally Degraded as the clock advances.
+    booted.mock.always_fail.store(true, Ordering::SeqCst);
+
+    // 2 * max_stale_secs (6s) + 2s buffer for the polling cycle to
+    // observe failures across the Stale -> Degraded boundary.
+    tokio::time::sleep(Duration::from_secs(8)).await;
+
+    // Class M is now skipped (Degraded). Phase 1 still passes the
+    // template, so the verdict accepts.
+    let v_post = round_trip_template(booted.verifier_port, template).await;
+    assert!(
+        v_post.accepted,
+        "post-kill: expected Phase 1 fall-through accept, got reason={:?}",
+        v_post.reason_code
+    );
+
+    // /metrics must show the degraded counter incremented at least
+    // once (one for each verdict served while view was Degraded).
+    let metrics = fetch_metrics_text(booted.http_port).await;
+    let degraded = parse_counter(&metrics, "verifier_phase2_degraded_total");
+    drop(booted);
+    assert!(
+        degraded >= 1,
+        "expected verifier_phase2_degraded_total >= 1 after kill, got {degraded}\n\
+         --- metrics ---\n{metrics}"
     );
 }
 

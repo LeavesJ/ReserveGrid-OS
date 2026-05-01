@@ -402,24 +402,38 @@ test gates and CI green requirements before the next bucket starts.
    end-to-end test fall to #3.5 below because both depend on wiring
    that has not landed yet.
 
-3.5. [ ] **Phase 2 #3.5 per-tx detail wiring plus fail-stale
-   end-to-end** Two coupled gaps surfaced during Phase 2 #3
-   scoping. First, `check_invariant_shield_inner` does not read
-   `[policy.mempool] per_tx_detail`; the inner function always
-   emits one aggregate `V2InvariantMempoolToleranceExceeded`
-   verdict with up to 10 sample txids in the detail string.
-   Per-tx detail mode requires either a richer `ShieldOutcome`
-   variant that surfaces the full unknown list plus an ingress
-   writer change to emit N verdicts for one TemplatePropose, or
-   a separate side-channel (NDJSON file, dedicated metric label)
-   carrying the per-tx detail. Either path is a protocol surface
-   change with dashboard implications and gets its own commit.
-   Second, the bitcoind-RPC-unavailable scenario from the
-   original Phase 2 #3 plan needs the verifier to hit a closed
-   port and ride the loop's error path through fail-stale into
-   Degraded; the Tier 2 axum mock can simulate this once the
-   subprocess test gains a "kill the mock midway" step plus a
-   metrics-endpoint poll for `verifier_phase2_degraded_total`.
+3.5. [x] **Phase 2 #3.5 per-tx detail wiring plus fail-stale
+   end-to-end** (this commit, 2026-05-01) Per-tx detail wired via
+   the minimum-protocol-surface interpretation: `[policy.mempool]
+   per_tx_detail = true` flips
+   `check_invariant_shield_inner` from emitting up to
+   `SAMPLE_UNKNOWN_CAP` (10) representative txids to emitting
+   every unknown txid in the canonical `sample=[…]` field of
+   the `V2InvariantMempoolToleranceExceeded` rejection detail
+   string. Wire format stays 1:1 (one TemplateVerdict per
+   accepted TemplatePropose); no new `ShieldOutcome` variant,
+   no ingress writer change, no dashboard format change, no new
+   metric. The original ADR text named multi-verdict-per-template
+   as one option but landing the smaller-blast-radius path keeps
+   the gateway-to-verifier protocol contract stable. New pure
+   helper `policy::format_mempool_tolerance_detail` factors the
+   detail-string formatting so Tier 1 tests can prove the cap
+   bypass with synthetic data without a multi-tx fixture.
+
+   Kill-the-mock fail-stale Tier 2 test wired in
+   `tests/phase2_tcp.rs::phase2_tcp_kill_the_mock_drives_view_to_degraded`.
+   `MockState` gains an `always_fail` `AtomicBool` companion to
+   the existing single-shot `fail_next`. Test boots with
+   `max_stale_secs = 3` for fast Degraded transition, sends a
+   TemplatePropose under fresh view (asserts accept), flips
+   `always_fail = true`, waits 8 seconds for the view to cross
+   `2 * max_stale_secs` into Degraded, sends another
+   TemplatePropose, asserts the verdict still accepts (Phase 1
+   fall-through), then curls the public `/metrics` endpoint via
+   raw HTTP/1.1 and asserts `verifier_phase2_degraded_total >= 1`
+   confirming the operator alert path fires. Closes the
+   bitcoind-RPC-unavailable scenario originally listed under
+   Phase 2 #3.
 
 4. [ ] **Phase 2 #4 documentation** Draft this ADR-003 (done as
    part of this design pass). Add a Phase 2 stub section to
@@ -451,11 +465,18 @@ test gates and CI green requirements before the next bucket starts.
    Document the observation results in DEVLOG and in a new
    TESTLOG CL entry that closes Phase 2 verification.
 
-7. [ ] **Phase 2 #7 v3.x precursor markers** Per-tx detail mode
-   and the `verifier_mempool_view_size` metric set up the data
-   shape for v3.x selfish-mining detection. No code work in
-   v2.0, but document the upgrade path in DEVLOG so the v3.x
-   design has the prior art linked.
+7. [x] **Phase 2 #7 v3.x precursor markers** (this commit,
+   2026-05-01) DEVLOG entry captures the v3.x upgrade path:
+   `[policy.mempool] per_tx_detail = true` already emits the
+   full unknown txid list per rejected template, providing
+   per-tx granularity for downstream selfish-mining detection
+   without any v3.x protocol change. The
+   `verifier_mempool_view_size` and
+   `verifier_phase2_checks_total{result}` metrics set up
+   per-template aggregation that selfish-mining detection
+   consumes as a time series. v3.x design begins from the
+   shipped Phase 2 surface, no migration cost beyond enabling
+   per-tx detail mode in operator policy.
 
 ## Notes
 

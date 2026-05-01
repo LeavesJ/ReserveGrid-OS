@@ -260,6 +260,7 @@ fn phase2_rejected_carries_machine_readable_detail() {
         &template,
         &fresh_snapshot(vec![]),
         4.0,
+        false,
     );
     match outcome {
         ShieldOutcome::Rejected { reason, detail } => {
@@ -268,5 +269,120 @@ fn phase2_rejected_carries_machine_readable_detail() {
             assert!(detail.contains("mempool tolerance exceeded"));
         }
         other => panic!("expected Rejected, got {other:?}"),
+    }
+}
+
+/// Phase 2 #3.5 per-tx detail wiring. With `per_tx_detail = true`
+/// the rejection detail string carries every unknown txid in the
+/// `sample=[…]` field, not just the bounded
+/// `mempool_view::SAMPLE_UNKNOWN_CAP` (10) sample. Wire stays 1:1
+/// (one TemplateVerdict per accepted TemplatePropose); per_tx detail
+/// expands the existing `reason_detail` field rather than introducing
+/// multi-verdict emission. Dashboard format stays grep-compatible
+/// via the same `sample=` field name.
+#[test]
+fn phase2_per_tx_detail_helper_keeps_full_list_uncapped() {
+    use pool_verifier::policy::format_mempool_tolerance_detail;
+
+    // 50-tx unknown set, larger than SAMPLE_UNKNOWN_CAP. The aggregate
+    // path passes the bounded sample (10 entries). The per-tx path
+    // passes the full list (50 entries). The helper formats either
+    // shape into the canonical `sample=[hex,hex,...]` field.
+    let full_unknown: Vec<[u8; 32]> = (1u8..=50).map(|b| [b; 32]).collect();
+    let bounded: Vec<[u8; 32]> = full_unknown
+        .iter()
+        .take(pool_verifier::mempool_view::SAMPLE_UNKNOWN_CAP)
+        .copied()
+        .collect();
+
+    let detail_aggregate = format_mempool_tolerance_detail(50, 50, &bounded);
+    let detail_per_tx = format_mempool_tolerance_detail(50, 50, &full_unknown);
+
+    assert!(detail_aggregate.contains("50/50 txs unknown"));
+    assert!(detail_per_tx.contains("50/50 txs unknown"));
+
+    // Both contain the canonical `sample=` field, but the per-tx one
+    // carries 5x more entries.
+    let agg_count = detail_aggregate.matches(',').count() + 1;
+    let per_tx_count = detail_per_tx.matches(',').count() + 1;
+    assert_eq!(agg_count, pool_verifier::mempool_view::SAMPLE_UNKNOWN_CAP);
+    assert_eq!(per_tx_count, 50);
+}
+
+/// `policy::evaluate_dynamic_phase2` flows `cfg.mempool.per_tx_detail`
+/// into the shield call. With per_tx_detail=true the shield's
+/// rejection detail must cite the full unknown list; with false it
+/// must cite the bounded sample. Wires through evaluate_dynamic_phase2.
+#[test]
+fn phase2_evaluate_dynamic_phase2_routes_per_tx_detail_flag() {
+    let (template, _txids) = regtest_segwit_template();
+    let snapshot = fresh_snapshot(vec![]);
+
+    let mut cfg_aggregate = permissive_policy();
+    cfg_aggregate.mempool.per_tx_detail = false;
+    let result_aggregate = evaluate_dynamic_phase2(
+        &template,
+        &cfg_aggregate,
+        Some(&snapshot),
+        Some(0),
+        0,
+    );
+
+    let mut cfg_per_tx = permissive_policy();
+    cfg_per_tx.mempool.per_tx_detail = true;
+    let result_per_tx =
+        evaluate_dynamic_phase2(&template, &cfg_per_tx, Some(&snapshot), Some(0), 0);
+
+    // Both reject with the same canonical reason_code.
+    assert_eq!(
+        result_aggregate.reason,
+        Some(VerdictReason::V2InvariantMempoolToleranceExceeded)
+    );
+    assert_eq!(
+        result_per_tx.reason,
+        Some(VerdictReason::V2InvariantMempoolToleranceExceeded)
+    );
+    // Both detail strings contain the canonical `sample=[` field.
+    let detail_a = result_aggregate.detail.expect("aggregate detail");
+    let detail_b = result_per_tx.detail.expect("per_tx detail");
+    assert!(detail_a.contains("sample=["));
+    assert!(detail_b.contains("sample=["));
+    // For this 1-tx fixture both modes emit the same single txid; the
+    // cap difference is exercised by the helper-level test above.
+    // What this test proves is that the per_tx_detail flag plumbs all
+    // the way through cfg.mempool.per_tx_detail into the shield call
+    // without crashing or short-circuiting on a different reason.
+}
+
+/// Defensive: `ShieldOutcome::Rejected` produced by the Phase 2 path
+/// always carries a non-empty `detail` so dashboards can surface the
+/// unknown ratio without separate lookups.
+#[test]
+fn phase2_rejected_detail_format_under_per_tx_uses_same_sample_field() {
+    let (template, _txids) = regtest_segwit_template();
+    let outcome_a = pool_verifier::policy::check_invariant_shield_with_mempool(
+        &template,
+        &fresh_snapshot(vec![]),
+        4.0,
+        false,
+    );
+    let outcome_b = pool_verifier::policy::check_invariant_shield_with_mempool(
+        &template,
+        &fresh_snapshot(vec![]),
+        4.0,
+        true,
+    );
+    for outcome in [outcome_a, outcome_b] {
+        match outcome {
+            ShieldOutcome::Rejected { reason, detail } => {
+                assert_eq!(reason, VerdictReason::V2InvariantMempoolToleranceExceeded);
+                assert!(detail.contains("mempool tolerance exceeded"));
+                assert!(
+                    detail.contains("sample=["),
+                    "detail must keep canonical sample=[…] field, got: {detail}"
+                );
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
     }
 }

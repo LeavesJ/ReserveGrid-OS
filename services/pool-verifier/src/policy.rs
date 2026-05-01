@@ -726,22 +726,56 @@ pub fn check_invariant_shield(template: &TemplatePropose) -> ShieldOutcome {
     check_invariant_shield_inner(template, None)
 }
 
+/// Format the canonical `V2InvariantMempoolToleranceExceeded`
+/// rejection detail string. Pure function so callers (the shield
+/// inner plus integration tests) share the exact format.
+/// `txids_to_emit` is whatever subset the caller chose: the
+/// `SAMPLE_UNKNOWN_CAP`-bounded sample under aggregate mode, or the
+/// full unknown list under per-tx detail mode.
+pub fn format_mempool_tolerance_detail(
+    unknown_count: u32,
+    total: u32,
+    txids_to_emit: &[[u8; 32]],
+) -> String {
+    use std::fmt::Write as _;
+    let mut detail = format!(
+        "mempool tolerance exceeded: {unknown_count}/{total} txs unknown to verifier view"
+    );
+    if !txids_to_emit.is_empty() {
+        let sample_str: String = txids_to_emit
+            .iter()
+            .map(hex::encode)
+            .collect::<Vec<_>>()
+            .join(",");
+        let _ = write!(detail, " sample=[{sample_str}]");
+    }
+    detail
+}
+
 /// Phase 2 entry point. Runs the full Phase 1 + Class M shield
 /// against a mempool snapshot. `tolerance_pct` is the operator-tuned
 /// threshold from `policy.toml` `[policy.mempool] tolerance_pct`
-/// (default 4.0 per ADR-003 D-18.2).
+/// (default 4.0 per ADR-003 D-18.2). `per_tx_detail` mirrors
+/// `[policy.mempool] per_tx_detail`: when `true`, the rejection
+/// detail string carries every unknown txid in the `sample=[…]`
+/// list rather than the bounded `SAMPLE_UNKNOWN_CAP` sample.
+/// Wire format stays 1:1 (one TemplateVerdict per accepted
+/// TemplatePropose); per_tx detail expands the existing
+/// `reason_detail` field rather than introducing multi-verdict
+/// emission. ADR-003 Phase 2 #3.5.
 pub fn check_invariant_shield_with_mempool(
     template: &TemplatePropose,
     mempool: &crate::mempool_view::MempoolSnapshot,
     tolerance_pct: f64,
+    per_tx_detail: bool,
 ) -> ShieldOutcome {
-    check_invariant_shield_inner(template, Some((mempool, tolerance_pct)))
+    check_invariant_shield_inner(template, Some((mempool, tolerance_pct, per_tx_detail)))
 }
 
 #[allow(clippy::too_many_lines)]
 fn check_invariant_shield_inner(
     template: &TemplatePropose,
-    mempool: Option<(&crate::mempool_view::MempoolSnapshot, f64)>,
+    mempool: Option<(&crate::mempool_view::MempoolSnapshot, f64, bool)>,
 ) -> ShieldOutcome {
     let Some(hex_str) = template.raw_block_hex.as_deref() else {
         return ShieldOutcome::Skipped;
@@ -900,7 +934,7 @@ fn check_invariant_shield_inner(
     // mempool snapshot leaves the verdict at Agreed, an
     // Agreed/Stale mempool snapshot leaves the verdict at Agreed,
     // and only ToleranceExceeded converts to Rejected.
-    if let Some((snapshot, tolerance_pct)) = mempool {
+    if let Some((snapshot, tolerance_pct, per_tx_detail)) = mempool {
         let txids = rg_consensus::template_txids(&parsed);
         match crate::mempool_view::evaluate(snapshot, &txids, tolerance_pct) {
             crate::mempool_view::MempoolCheckOutcome::Agreed { .. }
@@ -916,18 +950,25 @@ fn check_invariant_shield_inner(
                 total,
                 sample_unknown,
             } => {
-                use std::fmt::Write as _;
-                let mut detail = format!(
-                    "mempool tolerance exceeded: {unknown_count}/{total} txs unknown to verifier view"
-                );
-                if !sample_unknown.is_empty() {
-                    let sample_str: String = sample_unknown
+                // Per-tx detail mode emits every unknown txid; default
+                // (aggregate) mode emits the existing bounded sample.
+                // sample_unknown from mempool_view::evaluate is already
+                // capped at SAMPLE_UNKNOWN_CAP, so per-tx mode
+                // recomputes the full list against the snapshot.
+                let txids_to_emit: Vec<[u8; 32]> = if per_tx_detail {
+                    txids
                         .iter()
-                        .map(hex::encode)
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    let _ = write!(detail, " sample=[{sample_str}]");
-                }
+                        .filter(|t| !snapshot.txids.contains(*t))
+                        .copied()
+                        .collect()
+                } else {
+                    sample_unknown
+                };
+                let detail = format_mempool_tolerance_detail(
+                    unknown_count,
+                    total,
+                    &txids_to_emit,
+                );
                 return ShieldOutcome::Rejected {
                     reason: VerdictReason::V2InvariantMempoolToleranceExceeded,
                     detail,
@@ -1023,9 +1064,12 @@ fn evaluate_dynamic_inner(
     // behavior, used by tests and any caller that has not wired the
     // Phase 2 mempool view).
     let shield_outcome = match mempool_snapshot {
-        Some(snap) => {
-            check_invariant_shield_with_mempool(template, snap, cfg.mempool.tolerance_pct)
-        }
+        Some(snap) => check_invariant_shield_with_mempool(
+            template,
+            snap,
+            cfg.mempool.tolerance_pct,
+            cfg.mempool.per_tx_detail,
+        ),
         None => check_invariant_shield(template),
     };
     let shield_skipped = match shield_outcome {

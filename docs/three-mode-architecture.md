@@ -229,12 +229,15 @@ representative unknown txids in the verdict detail string. When the
 view is `Degraded`, the Class M check is skipped and the template
 falls through to Phase 1 behavior, recorded as a
 `verifier_phase2_degraded_total` increment so dashboards can alert
-on extended bitcoind RPC outages. Per-tx detail mode (one verdict
-record per missing tx) is reserved by the
-`[policy.mempool] per_tx_detail` flag but not yet wired to the
-ingress emission path; the flag is parsed and stored as of Phase 2
-#2 so policy.toml stays forward-compatible, with the multi-verdict
-emission path deferred to Phase 2 #3.5.
+on extended bitcoind RPC outages. Per-tx detail mode is enabled by
+`[policy.mempool] per_tx_detail = true` (default `false`); when
+set, the rejection detail string carries every unknown txid in the
+canonical `sample=[…]` field rather than the bounded sample of up
+to 10 representative txids. Wire format stays 1:1, dashboards keep
+parsing the same `sample=` field. Per-tx detail mode is intended
+for forensics and v3.x selfish-mining detection downstream; default
+deployments leave it off to keep verdict log line lengths
+predictable.
 
 ### Metrics
 
