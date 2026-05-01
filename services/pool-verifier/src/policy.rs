@@ -738,9 +738,8 @@ pub fn format_mempool_tolerance_detail(
     txids_to_emit: &[[u8; 32]],
 ) -> String {
     use std::fmt::Write as _;
-    let mut detail = format!(
-        "mempool tolerance exceeded: {unknown_count}/{total} txs unknown to verifier view"
-    );
+    let mut detail =
+        format!("mempool tolerance exceeded: {unknown_count}/{total} txs unknown to verifier view");
     if !txids_to_emit.is_empty() {
         let sample_str: String = txids_to_emit
             .iter()
@@ -759,8 +758,8 @@ pub fn format_mempool_tolerance_detail(
 /// `[policy.mempool] per_tx_detail`: when `true`, the rejection
 /// detail string carries every unknown txid in the `sample=[…]`
 /// list rather than the bounded `SAMPLE_UNKNOWN_CAP` sample.
-/// Wire format stays 1:1 (one TemplateVerdict per accepted
-/// TemplatePropose); per_tx detail expands the existing
+/// Wire format stays 1:1 (one `TemplateVerdict` per accepted
+/// `TemplatePropose`); `per_tx_detail` expands the existing
 /// `reason_detail` field rather than introducing multi-verdict
 /// emission. ADR-003 Phase 2 #3.5.
 pub fn check_invariant_shield_with_mempool(
@@ -964,11 +963,7 @@ fn check_invariant_shield_inner(
                 } else {
                     sample_unknown
                 };
-                let detail = format_mempool_tolerance_detail(
-                    unknown_count,
-                    total,
-                    &txids_to_emit,
-                );
+                let detail = format_mempool_tolerance_detail(unknown_count, total, &txids_to_emit);
                 return ShieldOutcome::Rejected {
                     reason: VerdictReason::V2InvariantMempoolToleranceExceeded,
                     detail,
