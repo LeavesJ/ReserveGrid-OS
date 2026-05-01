@@ -375,10 +375,26 @@ async fn boot_verifier_with_mock(display_hex_txids: Vec<String>) -> Booted {
     boot_verifier_with_mock_overrides(display_hex_txids, PolicyOverrides::default()).await
 }
 
+/// Serializes the boot sequence across parallel Tier 2 tests so the
+/// pre-bind/drop port-discovery dance does not race. cargo test runs
+/// integration tests on multiple threads by default and the kernel
+/// can hand the same `127.0.0.1:0` port to two parallel
+/// `discover_free_port` callers between their drop-and-spawn-verifier
+/// windows; the second subprocess then fails to bind and its mock
+/// never sees a `getrawmempool` poll, surfacing as a flaky
+/// "bitcoind mock never received a poll within 30s" panic on a
+/// different test each run. The lock covers only the racy section
+/// (port discovery, mock spawn, verifier spawn, wait_for_listener);
+/// the actual TemplatePropose / TemplateVerdict round-trips and the
+/// post-boot verdict assertions run in parallel.
+static BOOT_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn boot_verifier_with_mock_overrides(
     display_hex_txids: Vec<String>,
     overrides: PolicyOverrides,
 ) -> Booted {
+    let _boot_guard = BOOT_MUTEX.lock().await;
+
     let mock_state = make_mock_state(display_hex_txids);
     let mock_addr = spawn_mock(mock_state.clone()).await;
 
@@ -395,17 +411,18 @@ async fn boot_verifier_with_mock_overrides(
     };
 
     // Deadlines sized for parallel test execution. cargo test runs
-    // integration tests on multiple threads by default; four Tier 2
-    // tests spinning up four pool-verifier subprocesses plus four
-    // axum mocks contend for CPU and can stretch first-poll latency
-    // well past the original 10s budget. 30s gives comfortable
-    // headroom under load while still failing fast for genuine
-    // boot regressions.
+    // integration tests on multiple threads by default; even with
+    // BOOT_MUTEX serializing port discovery the wait_for_listener
+    // probe still runs while later tests are queued behind the lock,
+    // so the deadline must absorb both the verifier startup cost and
+    // the queueing wait.
     wait_for_listener(verifier_port, Duration::from_secs(30)).await;
     wait_for_first_refresh(&mock_state, Duration::from_secs(30)).await;
     // Give the verifier one extra poll cycle to install the snapshot.
     tokio::time::sleep(Duration::from_millis(1_500)).await;
 
+    // _boot_guard drops here on function exit, releasing BOOT_MUTEX
+    // so the next test's boot can begin.
     Booted {
         _proc: proc,
         verifier_port,
