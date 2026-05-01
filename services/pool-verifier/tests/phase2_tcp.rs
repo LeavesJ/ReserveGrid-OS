@@ -119,9 +119,7 @@ async fn rpc_handler(
 ) -> impl IntoResponse {
     state.request_count.fetch_add(1, Ordering::SeqCst);
 
-    if state.always_fail.load(Ordering::SeqCst)
-        || state.fail_next.swap(false, Ordering::SeqCst)
-    {
+    if state.always_fail.load(Ordering::SeqCst) || state.fail_next.swap(false, Ordering::SeqCst) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({
@@ -194,11 +192,7 @@ impl Default for PolicyOverrides {
     }
 }
 
-fn write_policy_toml(
-    scratch: &Path,
-    mock_addr: SocketAddr,
-    overrides: PolicyOverrides,
-) -> PathBuf {
+fn write_policy_toml(scratch: &Path, mock_addr: SocketAddr, overrides: PolicyOverrides) -> PathBuf {
     let policy_path = scratch.join("policy.toml");
     let max_stale_secs = overrides.max_stale_secs;
     let toml = format!(
@@ -366,10 +360,12 @@ fn make_mock_state(display_hex: Vec<String>) -> MockState {
 }
 
 /// Booted verifier handle. `verifier_port` carries the TCP listener
-/// (TemplatePropose / TemplateVerdict envelopes); `http_port`
-/// carries the public HTTP surface including `/metrics`.
+/// (`TemplatePropose` / `TemplateVerdict` envelopes); `http_port`
+/// carries the public HTTP surface including `/metrics`. `_proc` is
+/// only held for its `Drop` side effect (kills the subprocess and
+/// removes the scratch dir); the field is intentionally unread.
 struct Booted {
-    proc: VerifierProcess,
+    _proc: VerifierProcess,
     verifier_port: u16,
     http_port: u16,
     mock: MockState,
@@ -404,7 +400,7 @@ async fn boot_verifier_with_mock_overrides(
     tokio::time::sleep(Duration::from_millis(1_500)).await;
 
     Booted {
-        proc,
+        _proc: proc,
         verifier_port,
         http_port,
         mock: mock_state,
@@ -419,8 +415,7 @@ async fn fetch_metrics_text(http_port: u16) -> String {
     let mut stream = TcpStream::connect(("127.0.0.1", http_port))
         .await
         .expect("connect metrics");
-    let req =
-        "GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n".to_string();
+    let req = "GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n".to_string();
     stream
         .write_all(req.as_bytes())
         .await
@@ -436,7 +431,7 @@ async fn fetch_metrics_text(http_port: u16) -> String {
 }
 
 /// Parse a Prometheus counter line of shape `metric_name <number>`
-/// out of the OpenMetrics text export. Returns 0 if absent so the
+/// out of the `OpenMetrics` text export. Returns 0 if absent so the
 /// caller can assert "increased to >= N" without distinguishing
 /// missing from zero.
 fn parse_counter(text: &str, name: &str) -> u64 {
@@ -515,7 +510,11 @@ async fn phase2_tcp_subsequent_template_uses_refreshed_view() {
 
     // Mutate the mock's view to include the template's tx.
     {
-        let mut g = booted.mock.display_hex_txids.write().expect("mock write lock");
+        let mut g = booted
+            .mock
+            .display_hex_txids
+            .write()
+            .expect("mock write lock");
         *g = display_hex;
     }
 
@@ -534,11 +533,11 @@ async fn phase2_tcp_subsequent_template_uses_refreshed_view() {
 
 /// Phase 2 #3.5 kill-the-mock fail-stale scenario.
 ///
-/// Boot the verifier under a healthy view, send a TemplatePropose
+/// Boot the verifier under a healthy view, send a `TemplatePropose`
 /// (asserts accept under Fresh), flip the mock's `always_fail` toggle
 /// so subsequent `getrawmempool` polls return 500, wait long enough
 /// for the view to reach Degraded (`max_stale_secs * 2 + buffer`),
-/// then send another TemplatePropose. The second verdict must still
+/// then send another `TemplatePropose`. The second verdict must still
 /// accept because Class M skips on Degraded and Phase 1 falls
 /// through unchanged. The HTTP `/metrics` surface must show
 /// `verifier_phase2_degraded_total >= 1` confirming the operator

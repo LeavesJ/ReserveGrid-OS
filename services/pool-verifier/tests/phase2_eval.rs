@@ -276,7 +276,7 @@ fn phase2_rejected_carries_machine_readable_detail() {
 /// the rejection detail string carries every unknown txid in the
 /// `sample=[…]` field, not just the bounded
 /// `mempool_view::SAMPLE_UNKNOWN_CAP` (10) sample. Wire stays 1:1
-/// (one TemplateVerdict per accepted TemplatePropose); per_tx detail
+/// (one `TemplateVerdict` per accepted `TemplatePropose`); `per_tx_detail`
 /// expands the existing `reason_detail` field rather than introducing
 /// multi-verdict emission. Dashboard format stays grep-compatible
 /// via the same `sample=` field name.
@@ -310,9 +310,9 @@ fn phase2_per_tx_detail_helper_keeps_full_list_uncapped() {
 }
 
 /// `policy::evaluate_dynamic_phase2` flows `cfg.mempool.per_tx_detail`
-/// into the shield call. With per_tx_detail=true the shield's
+/// into the shield call. With `per_tx_detail=true` the shield's
 /// rejection detail must cite the full unknown list; with false it
-/// must cite the bounded sample. Wires through evaluate_dynamic_phase2.
+/// must cite the bounded sample. Wires through `evaluate_dynamic_phase2`.
 #[test]
 fn phase2_evaluate_dynamic_phase2_routes_per_tx_detail_flag() {
     let (template, _txids) = regtest_segwit_template();
@@ -320,13 +320,8 @@ fn phase2_evaluate_dynamic_phase2_routes_per_tx_detail_flag() {
 
     let mut cfg_aggregate = permissive_policy();
     cfg_aggregate.mempool.per_tx_detail = false;
-    let result_aggregate = evaluate_dynamic_phase2(
-        &template,
-        &cfg_aggregate,
-        Some(&snapshot),
-        Some(0),
-        0,
-    );
+    let result_aggregate =
+        evaluate_dynamic_phase2(&template, &cfg_aggregate, Some(&snapshot), Some(0), 0);
 
     let mut cfg_per_tx = permissive_policy();
     cfg_per_tx.mempool.per_tx_detail = true;
