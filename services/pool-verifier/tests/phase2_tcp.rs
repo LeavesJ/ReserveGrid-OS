@@ -394,8 +394,15 @@ async fn boot_verifier_with_mock_overrides(
         _scratch: scratch,
     };
 
-    wait_for_listener(verifier_port, Duration::from_secs(15)).await;
-    wait_for_first_refresh(&mock_state, Duration::from_secs(10)).await;
+    // Deadlines sized for parallel test execution. cargo test runs
+    // integration tests on multiple threads by default; four Tier 2
+    // tests spinning up four pool-verifier subprocesses plus four
+    // axum mocks contend for CPU and can stretch first-poll latency
+    // well past the original 10s budget. 30s gives comfortable
+    // headroom under load while still failing fast for genuine
+    // boot regressions.
+    wait_for_listener(verifier_port, Duration::from_secs(30)).await;
+    wait_for_first_refresh(&mock_state, Duration::from_secs(30)).await;
     // Give the verifier one extra poll cycle to install the snapshot.
     tokio::time::sleep(Duration::from_millis(1_500)).await;
 

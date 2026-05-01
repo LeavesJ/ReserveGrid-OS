@@ -39,6 +39,16 @@ jobs:
       - name: Tests
         run: cargo test --workspace --exclude rg-desktop
 
+      - name: Phase 2 Tier 2 integration tests (subprocess plus axum mock)
+        # Runs the #[ignore]d tests in services/pool-verifier/tests/phase2_tcp.rs
+        # that the standard `cargo test` skips by default. Catches subprocess
+        # races, axum mock API misuse, and verifier-listener regressions that
+        # compile cleanly but break at runtime. Adds roughly 30-60 seconds to
+        # CI wall clock (subprocess spawn plus the 8-second kill-the-mock wait
+        # for the view to cross 2 * max_stale_secs into Degraded). ADR-003
+        # Phase 2 #3 / #3.5 acceptance gate.
+        run: cargo test -p pool-verifier --test phase2_tcp -- --ignored
+
   audit:
     runs-on: ubuntu-latest
     steps:
