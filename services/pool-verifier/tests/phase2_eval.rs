@@ -79,6 +79,14 @@ fn permissive_policy() -> PolicyConfig {
     let mut cfg = PolicyConfig::default_with_protocol(PROTOCOL_VERSION);
     cfg.required_prevhash_len = 64;
     cfg.min_total_fees = 0;
+    // Zero every tier so the test never depends on which fee tier
+    // mempool_tx selects. Without this, a 100-tx mempool routes to
+    // the mid tier (default min_avg_fee_mid=500) and the regtest
+    // fixture's avg fee of 0 trips AvgFeeBelowMinimum before the
+    // Class M check ever runs.
+    cfg.min_avg_fee_lo = 0;
+    cfg.min_avg_fee_mid = 0;
+    cfg.min_avg_fee_hi = 0;
     cfg.reject_empty_templates = false;
     cfg.reject_coinbase_zero = false;
     cfg.unknown_mempool_as_high = true;
