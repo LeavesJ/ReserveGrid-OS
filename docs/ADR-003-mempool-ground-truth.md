@@ -349,31 +349,36 @@ The Phase 2 implementation sequence mirrors Phase 1 #4b's bucketing
 discipline. Each bucket lands as one or more commits with explicit
 test gates and CI green requirements before the next bucket starts.
 
-1. [ ] **Phase 2 #1 rg-consensus** Add `MempoolDisagreement`,
-   `MempoolToleranceExceeded`, `MempoolUnavailable`, and
-   `MempoolViewStale` variants to `ConsensusViolation`. Mirror as
-   four new `VerdictReason::V2InvariantMempool*` and four new
-   `ReasonCode::V2InvariantMempool*` variants. Update `ALL_CODES`
-   length assertions (18 → 22 for ConsensusViolation, 33 → 37 for
-   VerdictReason, 91 → 95 for ReasonCode). Pure facade additions, no
-   wiring or behavior. Tests cover round-trip canonical strings,
-   distinct mapping, and `as_reason_code` exhaustiveness.
+1. [x] **Phase 2 #1 rg-consensus** (cac223c, 2026-04-30) Added
+   `MempoolDisagreement`, `MempoolToleranceExceeded`,
+   `MempoolUnavailable`, and `MempoolViewStale` variants to
+   `ConsensusViolation`. Mirrored as four new
+   `VerdictReason::V2InvariantMempool*` and four new
+   `ReasonCode::V2InvariantMempool*` variants with explicit
+   `#[serde(rename)]` per R-155. `ALL_CODES` length assertions now
+   read 22 / 37 / 95. Pure facade additions, no wiring or behavior.
 
-2. [ ] **Phase 2 #2 pool-verifier** Add `bitcoind_rpc` module
-   (HTTP JSON-RPC client over reqwest, basic auth from
-   `mempool_rpc_user` and `mempool_rpc_pass`). Add `mempool_view`
-   module owning the `HashSet<Txid>` plus `last_refresh_unix_ms`
-   plus a tokio task that polls `getrawmempool` every
-   `mempool_poll_interval_secs`. Add `MempoolState` enum
-   (`Fresh`, `Stale`, `Degraded`) wired to the fail-stale
-   state machine per D3. Extend `check_invariant_shield` with
-   a Class M section after the existing Class S / Class D
-   chain that runs the tolerance check against the current
-   view. Wire the four new reason codes plus per-tx detail
-   mode behind `mempool_per_tx_detail`. Wire the four new
-   metrics. Eight new policy keys parsed from `policy.toml`.
-   `cargo build`, `cargo clippy --all-targets -- -D warnings`,
-   `cargo test` all green for `pool-verifier`.
+2. [x] **Phase 2 #2 pool-verifier** (e422bd6, 2026-04-30) Landed
+   `bitcoind_rpc` (reqwest JSON-RPC client with basic auth) and
+   `mempool_view` (snapshot owning `HashSet<[u8; 32]>` plus
+   `last_refresh_unix_ms` plus a tokio polling task) as new lib
+   modules. `MempoolState` enum (`Fresh`, `Stale`, `Degraded`)
+   wires the fail-stale state machine per D3. `policy::evaluate_dynamic`
+   now routes through `check_invariant_shield_with_mempool` whenever
+   `AppState::mempool_view` is `Some`; tolerance and unknown-tx
+   checks emit the canonical `v2_invariant_mempool_tolerance_exceeded`
+   and `v2_invariant_mempool_tx_unknown` reason codes. Eight policy
+   keys parsed from `[policy.mempool]` (`enforce`, `tolerance_pct`,
+   `poll_interval_secs`, `max_stale_secs`, `per_tx_detail`,
+   `rpc_url`, `rpc_user`, `rpc_pass`). Four metrics emitted
+   (`verifier_mempool_view_age_seconds`, `verifier_mempool_view_size`,
+   `verifier_phase2_checks_total{result}`,
+   `verifier_phase2_degraded_total`). `rg-consensus::template_txids`
+   is the new Class M accessor that returns non-coinbase txids as
+   `Vec<[u8; 32]>` so the verifier facade stays narrow (R-154).
+   `cargo clippy --workspace --exclude rg-desktop --all-targets
+   -- -D warnings` and `cargo test --workspace --exclude rg-desktop`
+   green locally before push.
 
 3. [ ] **Phase 2 #3 pool-verifier integration tests** Add a
    regtest-backed test harness that spins up bitcoind via the

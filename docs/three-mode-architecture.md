@@ -212,6 +212,25 @@ The shield does NOT catch one attacker class:
    transaction set differs from what the network mempool actually
    contains.
 
+### Phase 2 Class M check (ADR-003, shipped 2026-04-30)
+
+The verifier owns its own `mempool_view` populated by a tokio task
+that polls `getrawmempool` against an operator bitcoind every
+`[policy.mempool] poll_interval_secs` seconds (default 10). The
+view carries a `MempoolState` of `Fresh`, `Stale`, or `Degraded`,
+gated by `max_stale_secs` (default 60) per the fail-stale state
+machine in ADR-003 D3. When `[policy.mempool] enforce = true`,
+`check_invariant_shield_with_mempool` runs after the Class S and
+Class D chain, comparing the template's non-coinbase txids
+(`rg_consensus::template_txids`) against the snapshot. Templates
+whose unknown-tx ratio exceeds `tolerance_pct` (default 4.0) emit
+`v2_invariant_mempool_tolerance_exceeded`; per-tx detail mode emits
+one `v2_invariant_mempool_tx_unknown` record per missing txid. When
+the view is `Degraded`, the Class M check is skipped and the
+template falls through to Phase 1 behavior, recorded as a
+`verifier_phase2_degraded_total` increment so dashboards can alert
+on extended bitcoind RPC outages.
+
 ### Metrics
 
 - `verifier_shield_skipped_total` (counter): incremented once per
@@ -223,6 +242,17 @@ The shield does NOT catch one attacker class:
   `v2_invariant_*` reason code. Dashboards can filter to the
   `v2_invariant_` prefix to surface shield-specific rejection rates
   separately from policy rejections.
+- `verifier_mempool_view_age_seconds` (gauge): seconds since the
+  most recent successful `getrawmempool` refresh. Alerts past
+  `max_stale_secs` indicate the view is fail-stale.
+- `verifier_mempool_view_size` (gauge): current snapshot size.
+  Sanity check that the polling task is feeding the view.
+- `verifier_phase2_checks_total{result}` (counter vector): result
+  in `agreed`, `rejected`, `skipped`, `stale`. Dashboards key Phase
+  2 acceptance rate off this label.
+- `verifier_phase2_degraded_total` (counter): increments on every
+  verdict served while the view is `Degraded`. Operator alert
+  threshold for bitcoind RPC outage longer than `max_stale_secs`.
 
 ## New Services
 

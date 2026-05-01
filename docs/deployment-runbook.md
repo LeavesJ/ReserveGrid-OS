@@ -238,6 +238,38 @@ and adjust thresholds to match your pool's requirements:
 Start with the defaults. Tune after observing verdict patterns in the
 dashboard.
 
+**Phase 2 mempool ground truth (`[policy.mempool]`, ADR-003):**
+
+The v2.0 Invariant Shield Class M check runs only when
+`[policy.mempool] enforce = true` and the verifier can reach a
+bitcoind JSON-RPC endpoint. With `enforce = false` (the shipped
+default) the shield runs Phase 1 only and these keys are ignored.
+
+| Field | Default | What it does |
+|---|---|---|
+| `enforce` | `false` | Master enable for the Class M check. Flip to `true` once `rpc_url` / `rpc_user` / `rpc_pass` are wired. |
+| `tolerance_pct` | `4.0` | Percentage of template txs that may be unknown to the verifier's mempool view before rejection. ADR-003 D-18.2. |
+| `poll_interval_secs` | `10` | `getrawmempool` poll cadence. |
+| `max_stale_secs` | `60` | Fail-stale window. After this many seconds without a successful refresh, the view enters `Degraded` and the Class M check is skipped. |
+| `per_tx_detail` | `false` | When `true`, emit one verdict record per missing tx with the txid in the detail string. When `false`, emit one aggregate record with up to 10 representative txids and the total unknown count. |
+| `rpc_url` | `""` | Bitcoind JSON-RPC endpoint (e.g. `http://bitcoind:8332`). Required when `enforce = true`. |
+| `rpc_user` | `""` | Bitcoind RPC basic-auth user. Required when `enforce = true`. |
+| `rpc_pass` | `""` | Bitcoind RPC basic-auth password. Required when `enforce = true`. The pool-verifier reads `VELDRA_BITCOIND_RPC_PASS` first and falls back to this field only if the env var is unset, so production deployments should keep the password out of `policy.toml` on disk and inject via env. |
+
+The pool-verifier consumes the same `VELDRA_BITCOIND_RPC_USER` and
+`VELDRA_BITCOIND_RPC_PASS` env vars that template-manager already
+uses, so a single secret pair covers both services when they share
+a bitcoind. Operators running a separate bitcoind for the verifier
+should set distinct creds in `policy.toml` and override
+`VELDRA_BITCOIND_RPC_PASS` on the pool-verifier service block only.
+
+Phase 2 surfaces four metrics when `enforce = true`:
+`verifier_mempool_view_age_seconds`, `verifier_mempool_view_size`,
+`verifier_phase2_checks_total{result}`, and
+`verifier_phase2_degraded_total`. Dashboards alert past
+`max_stale_secs` on the age gauge and on sustained
+`phase2_degraded_total` increments.
+
 ---
 
 ## Step 4: Prepare Docker Compose for Production
