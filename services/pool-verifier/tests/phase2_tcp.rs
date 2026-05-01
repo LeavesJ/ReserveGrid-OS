@@ -384,9 +384,9 @@ async fn boot_verifier_with_mock(display_hex_txids: Vec<String>) -> Booted {
 /// never sees a `getrawmempool` poll, surfacing as a flaky
 /// "bitcoind mock never received a poll within 30s" panic on a
 /// different test each run. The lock covers only the racy section
-/// (port discovery, mock spawn, verifier spawn, wait_for_listener);
-/// the actual TemplatePropose / TemplateVerdict round-trips and the
-/// post-boot verdict assertions run in parallel.
+/// (port discovery, mock spawn, verifier spawn, `wait_for_listener`);
+/// the actual `TemplatePropose` / `TemplateVerdict` round-trips and
+/// the post-boot verdict assertions run in parallel.
 static BOOT_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn boot_verifier_with_mock_overrides(
