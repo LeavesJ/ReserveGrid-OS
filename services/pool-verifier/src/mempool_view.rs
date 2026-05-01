@@ -108,9 +108,20 @@ impl MempoolView {
     /// Replace the view with a new txid set. Updates the refresh
     /// timestamp and marks the view as primed.
     pub async fn install(&self, txids: HashSet<[u8; 32]>) {
+        self.install_at(txids, unix_ms_now()).await;
+    }
+
+    /// Replace the view with a new txid set, attributing the refresh
+    /// to the caller-supplied unix timestamp in milliseconds. The
+    /// production polling task calls [`MempoolView::install`] which
+    /// stamps `unix_ms_now()`. Integration tests use this entry point
+    /// to drive the fail-stale state machine deterministically without
+    /// waiting on wall-clock time. R-160 friendly: takes a timestamp
+    /// rather than a Duration so the test owns the clock model.
+    pub async fn install_at(&self, txids: HashSet<[u8; 32]>, last_refresh_unix_ms: u64) {
         let mut inner = self.inner.write().await;
         inner.txids = Arc::new(txids);
-        inner.last_refresh_unix_ms = Some(unix_ms_now());
+        inner.last_refresh_unix_ms = Some(last_refresh_unix_ms);
         inner.primed = true;
     }
 

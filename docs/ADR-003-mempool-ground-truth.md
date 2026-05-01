@@ -380,21 +380,46 @@ test gates and CI green requirements before the next bucket starts.
    -- -D warnings` and `cargo test --workspace --exclude rg-desktop`
    green locally before push.
 
-3. [ ] **Phase 2 #3 pool-verifier integration tests** Add a
-   regtest-backed test harness that spins up bitcoind via the
-   existing `lncm/bitcoind:v27.0` container, mines a few blocks,
-   and constructs three test scenarios: (a) happy path where the
-   template's tx set fully overlaps the verifier's mempool view,
-   shield emits Agreed; (b) fabrication path where the template
-   includes a tx not in the mempool, shield emits
-   `v2_invariant_mempool_tolerance_exceeded` when fabricated
-   ratio is above 4%; (c) bitcoind unavailable path where RPC
-   times out, shield enters fail-stale then fail-degraded after
-   60 seconds, counter increments, template falls through to
-   Phase 1 behavior. Plus per-tx detail mode test that flips
-   the policy key and verifies one verdict record per missing
-   tx. Use `tokio::time::pause` to compress the 60s fail-stale
-   window into a fast test.
+3. [x] **Phase 2 #3 pool-verifier integration tests** (this commit,
+   2026-05-01) Two-tier integration test layout. Tier 1 in
+   `services/pool-verifier/tests/phase2_eval.rs` exercises
+   `policy::evaluate_dynamic_phase2` end-to-end against controlled
+   `MempoolSnapshot` values built via the `MempoolView::install_at`
+   injection seam. Tier 2 in `services/pool-verifier/tests/phase2_tcp.rs`
+   spawns the real pool-verifier binary via `CARGO_BIN_EXE_pool-verifier`,
+   stands up an in-process axum mock that answers `getrawmempool` over
+   JSON-RPC, and round-trips `TemplatePropose` plus `TemplateVerdict`
+   envelopes through the listener. Tier 2 tests are `#[ignore]` so the
+   default `cargo test --workspace` stays fast for the pre-commit
+   checklist; run with `cargo test -p pool-verifier --test phase2_tcp
+   -- --ignored`. Three scenarios shipped: happy path full overlap
+   emits Agreed, fabrication path above 4% emits
+   `v2_invariant_mempool_tolerance_exceeded`, and the fail-stale
+   state machine cycles `Fresh -> Stale -> Degraded` driven by
+   `install_at` rather than `tokio::time::pause` because
+   `mempool_view::unix_ms_now` reads `SystemTime::now` directly.
+   Per-tx detail mode test plus the deeper bitcoind-RPC-unavailable
+   end-to-end test fall to #3.5 below because both depend on wiring
+   that has not landed yet.
+
+3.5. [ ] **Phase 2 #3.5 per-tx detail wiring plus fail-stale
+   end-to-end** Two coupled gaps surfaced during Phase 2 #3
+   scoping. First, `check_invariant_shield_inner` does not read
+   `[policy.mempool] per_tx_detail`; the inner function always
+   emits one aggregate `V2InvariantMempoolToleranceExceeded`
+   verdict with up to 10 sample txids in the detail string.
+   Per-tx detail mode requires either a richer `ShieldOutcome`
+   variant that surfaces the full unknown list plus an ingress
+   writer change to emit N verdicts for one TemplatePropose, or
+   a separate side-channel (NDJSON file, dedicated metric label)
+   carrying the per-tx detail. Either path is a protocol surface
+   change with dashboard implications and gets its own commit.
+   Second, the bitcoind-RPC-unavailable scenario from the
+   original Phase 2 #3 plan needs the verifier to hit a closed
+   port and ride the loop's error path through fail-stale into
+   Degraded; the Tier 2 axum mock can simulate this once the
+   subprocess test gains a "kill the mock midway" step plus a
+   metrics-endpoint poll for `verifier_phase2_degraded_total`.
 
 4. [ ] **Phase 2 #4 documentation** Draft this ADR-003 (done as
    part of this design pass). Add a Phase 2 stub section to

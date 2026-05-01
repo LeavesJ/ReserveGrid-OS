@@ -224,12 +224,17 @@ machine in ADR-003 D3. When `[policy.mempool] enforce = true`,
 Class D chain, comparing the template's non-coinbase txids
 (`rg_consensus::template_txids`) against the snapshot. Templates
 whose unknown-tx ratio exceeds `tolerance_pct` (default 4.0) emit
-`v2_invariant_mempool_tolerance_exceeded`; per-tx detail mode emits
-one `v2_invariant_mempool_tx_unknown` record per missing txid. When
-the view is `Degraded`, the Class M check is skipped and the
-template falls through to Phase 1 behavior, recorded as a
+`v2_invariant_mempool_tolerance_exceeded` with up to 10
+representative unknown txids in the verdict detail string. When the
+view is `Degraded`, the Class M check is skipped and the template
+falls through to Phase 1 behavior, recorded as a
 `verifier_phase2_degraded_total` increment so dashboards can alert
-on extended bitcoind RPC outages.
+on extended bitcoind RPC outages. Per-tx detail mode (one verdict
+record per missing tx) is reserved by the
+`[policy.mempool] per_tx_detail` flag but not yet wired to the
+ingress emission path; the flag is parsed and stored as of Phase 2
+#2 so policy.toml stays forward-compatible, with the multi-verdict
+emission path deferred to Phase 2 #3.5.
 
 ### Metrics
 
