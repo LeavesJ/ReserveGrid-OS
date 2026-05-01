@@ -41,17 +41,11 @@ If the bar is not met, tune `tolerance_pct` downward toward `2.0` and re-soak be
      "$VELDRA_BITCOIND_RPC_URL" | jq 'length'
    ```
    Expect a non-zero integer within a few hundred ms. If the call hangs, fix the bitcoind path before T+0.
-3. Baseline the four Phase 2 counters and gauges. Record the values at T minus 1 day:
+3. Baseline the four Phase 2 counters and gauges. Run:
+   ```sh
+   scripts/phase2-baseline.sh
    ```
-   verifier_phase2_checks_total{result="agreed"}    = N_agreed_baseline
-   verifier_phase2_checks_total{result="rejected"}  = N_rejected_baseline
-   verifier_phase2_checks_total{result="skipped"}   = N_skipped_baseline
-   verifier_phase2_checks_total{result="stale"}     = N_stale_baseline
-   verifier_phase2_degraded_total                   = N_degraded_baseline
-   verifier_mempool_view_age_seconds                = (live)
-   verifier_mempool_view_size                       = (live)
-   ```
-   Keep the four counter baselines in DEVLOG so T+7 deltas compute cleanly.
+   The script captures `verifier_phase2_checks_total{result}` for each label, `verifier_phase2_degraded_total`, `verifier_mempool_view_age_seconds`, and `verifier_mempool_view_size` from the verifier's `/metrics` endpoint and writes them to `./data/phase2-baseline.json`. Override the metrics URL with `--metrics-url http://...` or set `VELDRA_PHASE2_METRICS_URL`; override the output path with `--out PATH`. Paste the script's stdout into DEVLOG so the T+7 deltas have an audit trail. Do not delete `phase2-baseline.json` mid-soak; doing so resets the soak math.
 4. Confirm the verdict log file is rotating or is large enough to hold a week of records. Estimate: 200 templates per second peak times 86400 seconds per day times 7 days times 1 KB per record = ~120 GB upper bound. Most pools see far less; size the volume for the upper bound or wire log rotation.
 5. Tail the verifier's stderr to make sure no startup warnings about the Phase 2 path are present:
    ```sh
@@ -69,31 +63,22 @@ If the bar is not met, tune `tolerance_pct` downward toward `2.0` and re-soak be
 
 Three checks at days 1, 3, 5 plus the wrap-up at day 7. Each spot check follows the same procedure. At each, the operator records the four counter deltas since T+0 plus a hand-counted false-positive review.
 
-1. Snapshot the four counters. Compute deltas:
-   ```
-   delta_agreed   = current_agreed   - N_agreed_baseline
-   delta_rejected = current_rejected - N_rejected_baseline
-   delta_skipped  = current_skipped  - N_skipped_baseline
-   delta_stale    = current_stale    - N_stale_baseline
-   delta_degraded = current_degraded - N_degraded_baseline
-   ```
-2. If `delta_rejected > 0`, every rejection is a candidate false positive (shadow mode means real templates are not mined by the verifier; rejections are signal not noise). Pull each rejection from the verdict log:
+1. Snapshot the four counters and list candidate FPs in one shot:
    ```sh
-   jq -c 'select(.reason_code == "v2_invariant_mempool_tolerance_exceeded")
-          | {ts: .timestamp, id: .id, height: .block_height, detail: .reason_detail}' \
-     ./data/verdicts.ndjson | tail -50
+   scripts/phase2-spot-check.sh | tee -a docs/DEVLOG.md.spotchecks
    ```
-3. For each rejection, cross-reference against the pool's block-found feed for the same block height. Three outcomes:
+   The script reads `./data/phase2-baseline.json`, fetches current values from `/metrics`, prints the five counter deltas plus the two live gauges, and dumps every Class M `v2_invariant_mempool_tolerance_exceeded` rejection from `./data/verdicts.ndjson` (last 50 by default; bump with `--max-rejections N`). Output is human readable; pipe to a file so the DEVLOG entry inherits the same shape across all four spot checks. The script also flags a `delta_degraded > 0` warning so an operator-environment fault during the soak is impossible to miss.
+2. For each rejection in the script's output, cross-reference against the pool's block-found feed for the same block height. Three outcomes:
    - **The pool mined the block** at that height with the same coinbase: false positive confirmed. Log to DEVLOG as a counted FP.
    - **A different pool mined the block:** ambiguous; the rejected template may have been a stale work order that the pool itself would have abandoned. Mark as ambiguous in DEVLOG, do not count as FP.
    - **No block at that height yet:** likely a stale template that timed out before the pool reissued. Mark as ambiguous, do not count as FP.
-4. If `delta_degraded > 0`, the bitcoind RPC went away at some point during the window. Check verifier logs for `mempool refresh failed` or `mempool refresh timed out`. Investigate the bitcoind side; this is operator-environment noise, not a Phase 2 bug. Resolve before continuing the soak; if the degraded counter grows beyond a few percent of the polling cadence, the soak window is invalid and resets to T+0 once bitcoind is healthy.
-5. Watch `verifier_mempool_view_age_seconds`. Should stay well under `max_stale_secs = 60` outside of degraded windows. Sustained values above 30 indicate bitcoind RPC latency growing; investigate.
-6. Note all four counter values plus the FP count plus any anomalies in DEVLOG before the next spot check.
+3. If the script reported a `delta_degraded > 0` warning, the bitcoind RPC went away at some point during the window. Check verifier logs for `mempool refresh failed` or `mempool refresh timed out`. Investigate the bitcoind side; this is operator-environment noise, not a Phase 2 bug. Resolve before continuing the soak; if the degraded counter grows beyond a few percent of the polling cadence, the soak window is invalid and resets to T+0 once bitcoind is healthy.
+4. Watch `verifier_mempool_view_age_seconds` in the script's output. Should stay well under `max_stale_secs = 60` outside of degraded windows. Sustained values above 30 indicate bitcoind RPC latency growing; investigate.
+5. Note the script output plus the FP count plus any anomalies in DEVLOG before the next spot check.
 
 ## T+7 Wrap-Up
 
-1. Final counter snapshot. Compute deltas the same way as the spot checks.
+1. Final counter snapshot. Run `scripts/phase2-spot-check.sh | tee -a docs/DEVLOG.md.spotchecks` one more time at T+7. The deltas at this run cover the full soak window.
 2. Total false-positive count `FP_total` is the sum of confirmed FPs across all four spot checks. (Ambiguous rejections do NOT count.)
 3. Compute the false-positive rate against total Class M checks:
    ```
