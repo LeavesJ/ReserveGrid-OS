@@ -19,7 +19,7 @@
 # Defaults:
 #   --metrics-url     http://127.0.0.1:8081/metrics
 #   --baseline        ./data/phase2-baseline.json
-#   --verdict-log     ./data/verdicts.ndjson
+#   --verdict-log     ./data/verdicts.log
 #   --max-rejections  50  (per call; bump if a window has more)
 #
 # Output is human readable; pipe to a log for the DEVLOG entry.
@@ -30,7 +30,7 @@ set -euo pipefail
 
 METRICS_URL="${VELDRA_PHASE2_METRICS_URL:-http://127.0.0.1:8081/metrics}"
 BASELINE_PATH="${VELDRA_PHASE2_BASELINE_PATH:-./data/phase2-baseline.json}"
-VERDICT_LOG="${VELDRA_VERDICT_LOG:-./data/verdicts.ndjson}"
+VERDICT_LOG="${VELDRA_VERDICT_LOG:-./data/verdicts.log}"
 MAX_REJECTIONS=50
 
 while [[ $# -gt 0 ]]; do

@@ -27,7 +27,7 @@ If the bar is not met, tune `tolerance_pct` downward toward `2.0` and re-soak be
 - `[policy.mempool] enforce = true` plus `tolerance_pct = 4.0` plus `poll_interval_secs = 10` plus `max_stale_secs = 60` in the verifier's `policy.toml`.
 - `VELDRA_BITCOIND_RPC_USER` plus `VELDRA_BITCOIND_RPC_PASS` set in the verifier's environment.
 - Grafana or equivalent dashboard wired to the verifier's `/metrics` endpoint with the four Phase 2 metrics surfaced: `verifier_phase2_checks_total{result}`, `verifier_phase2_degraded_total`, `verifier_mempool_view_age_seconds`, `verifier_mempool_view_size`.
-- Verdict log file (`./data/verdicts.ndjson` by default) accessible for forensic spot checks.
+- Verdict log file (`./data/verdicts.log` by default) accessible for forensic spot checks.
 - A way to cross-reference the pool's accepted blocks against the soak window (block explorer, pool's own block-found feed).
 
 ## Pre-Soak Setup (T minus 1 day)
@@ -67,7 +67,7 @@ Three checks at days 1, 3, 5 plus the wrap-up at day 7. Each spot check follows 
    ```sh
    scripts/phase2-spot-check.sh | tee -a docs/DEVLOG.md.spotchecks
    ```
-   The script reads `./data/phase2-baseline.json`, fetches current values from `/metrics`, prints the five counter deltas plus the two live gauges, and dumps every Class M `v2_invariant_mempool_tolerance_exceeded` rejection from `./data/verdicts.ndjson` (last 50 by default; bump with `--max-rejections N`). Output is human readable; pipe to a file so the DEVLOG entry inherits the same shape across all four spot checks. The script also flags a `delta_degraded > 0` warning so an operator-environment fault during the soak is impossible to miss.
+   The script reads `./data/phase2-baseline.json`, fetches current values from `/metrics`, prints the five counter deltas plus the two live gauges, and dumps every Class M `v2_invariant_mempool_tolerance_exceeded` rejection from `./data/verdicts.log` (last 50 by default; bump with `--max-rejections N`). Output is human readable; pipe to a file so the DEVLOG entry inherits the same shape across all four spot checks. The script also flags a `delta_degraded > 0` warning so an operator-environment fault during the soak is impossible to miss.
 2. For each rejection in the script's output, cross-reference against the pool's block-found feed for the same block height. Three outcomes:
    - **The pool mined the block** at that height with the same coinbase: false positive confirmed. Log to DEVLOG as a counted FP.
    - **A different pool mined the block:** ambiguous; the rejected template may have been a stale work order that the pool itself would have abandoned. Mark as ambiguous in DEVLOG, do not count as FP.

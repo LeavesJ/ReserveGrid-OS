@@ -76,6 +76,13 @@ services:
       VELDRA_MODE: shadow
     volumes:
       - ./config:/config:rw
+      # Verdict log lives at /data/verdicts.log inside the container
+      # (verdicts.rs `VERDICT_LOG_PATH = "data/verdicts.log"` plus
+      # `create_dir_all("data")` relative to the verifier's WORKDIR
+      # `/`). Mount ./data on the host so scripts/phase2-spot-check.sh
+      # and any other host-side forensic tooling can read the log
+      # without `docker compose exec`.
+      - ./data:/data:rw
     ports:
       - "9090:9090"
       - "8081:8081"
