@@ -25,7 +25,7 @@ use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::SharedBuffer;
+use crate::{FeedBuffer, SharedBuffer};
 
 // ---------------------------------------------------------------------------
 // JSON-RPC request/response types (bitcoind wire format)
@@ -90,122 +90,103 @@ pub async fn handle_jsonrpc(
     };
 
     let id = req.id.clone();
+    let guard = buf.read().await;
 
-    match req.method.as_str() {
-        "getblocktemplate" => {
-            let guard = buf.read().await;
-            match &guard.block_template {
-                Some(tpl) => (
-                    StatusCode::OK,
-                    axum::Json(RpcResponse {
-                        result: Some(tpl.clone()),
-                        error: None,
-                        id,
-                    }),
-                ),
-                None => (
-                    StatusCode::OK,
-                    axum::Json(RpcResponse {
-                        result: None,
-                        error: Some(RpcError {
-                            code: -28,
-                            message: "feed adapter: no template received yet".into(),
-                        }),
-                        id,
-                    }),
-                ),
-            }
-        }
-        "getmempoolinfo" => {
-            let guard = buf.read().await;
-            match &guard.mempool_info {
-                Some(info) => (
-                    StatusCode::OK,
-                    axum::Json(RpcResponse {
-                        result: Some(info.clone()),
-                        error: None,
-                        id,
-                    }),
-                ),
-                None => (
-                    StatusCode::OK,
-                    axum::Json(RpcResponse {
-                        result: None,
-                        error: Some(RpcError {
-                            code: -28,
-                            message: "feed adapter: no mempool info received yet".into(),
-                        }),
-                        id,
-                    }),
-                ),
-            }
-        }
-        "getrawmempool" => {
-            // ADR-003 Phase 2 Class M synthetic answer: extract every
-            // `txid` field from the latest `blocktemplate.transactions`
-            // array and return them as an array of hex strings, matching
-            // bitcoind's `getrawmempool verbose=false` wire shape. The
-            // resulting synthetic mempool is a superset of (or equal to)
-            // the template's tx set by construction, so the verifier's
-            // Class M check always Agrees and the Setup A smoke soak
-            // validates the Phase 2 wiring without introducing false
-            // positives. See BIZLOG 2026-05-02 staged-validation
-            // commitment for why this is wiring-only and not a
-            // tolerance-threshold validation.
-            let guard = buf.read().await;
-            match &guard.block_template {
-                Some(tpl) => {
-                    let txids: Vec<String> = tpl
-                        .get("transactions")
-                        .and_then(serde_json::Value::as_array)
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|tx| {
-                                    tx.get("txid")
-                                        .and_then(serde_json::Value::as_str)
-                                        .map(String::from)
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    (
-                        StatusCode::OK,
-                        axum::Json(RpcResponse {
-                            result: Some(serde_json::Value::Array(
-                                txids.into_iter().map(serde_json::Value::String).collect(),
-                            )),
-                            error: None,
-                            id,
-                        }),
-                    )
-                }
-                None => (
-                    StatusCode::OK,
-                    axum::Json(RpcResponse {
-                        result: None,
-                        error: Some(RpcError {
-                            code: -28,
-                            message: "feed adapter: no template received yet".into(),
-                        }),
-                        id,
-                    }),
-                ),
-            }
-        }
+    let resp = match req.method.as_str() {
+        "getblocktemplate" => respond_getblocktemplate(&guard, id),
+        "getmempoolinfo" => respond_getmempoolinfo(&guard, id),
+        "getrawmempool" => respond_getrawmempool(&guard, id),
         other => {
             warn!(method = other, "unsupported RPC method");
-            (
-                StatusCode::OK,
-                axum::Json(RpcResponse {
-                    result: None,
-                    error: Some(RpcError {
-                        code: -32601,
-                        message: "method not found".into(),
-                    }),
-                    id,
+            RpcResponse {
+                result: None,
+                error: Some(RpcError {
+                    code: -32601,
+                    message: "method not found".into(),
                 }),
-            )
+                id,
+            }
         }
+    };
+    (StatusCode::OK, axum::Json(resp))
+}
+
+fn respond_getblocktemplate(buf: &FeedBuffer, id: serde_json::Value) -> RpcResponse {
+    match &buf.block_template {
+        Some(tpl) => RpcResponse {
+            result: Some(tpl.clone()),
+            error: None,
+            id,
+        },
+        None => RpcResponse {
+            result: None,
+            error: Some(RpcError {
+                code: -28,
+                message: "feed adapter: no template received yet".into(),
+            }),
+            id,
+        },
+    }
+}
+
+fn respond_getmempoolinfo(buf: &FeedBuffer, id: serde_json::Value) -> RpcResponse {
+    match &buf.mempool_info {
+        Some(info) => RpcResponse {
+            result: Some(info.clone()),
+            error: None,
+            id,
+        },
+        None => RpcResponse {
+            result: None,
+            error: Some(RpcError {
+                code: -28,
+                message: "feed adapter: no mempool info received yet".into(),
+            }),
+            id,
+        },
+    }
+}
+
+/// ADR-003 Phase 2 Class M synthetic answer: extract every `txid`
+/// field from the latest `blocktemplate.transactions` array and
+/// return them as an array of hex strings, matching bitcoind's
+/// `getrawmempool verbose=false` wire shape. The resulting synthetic
+/// mempool is a superset of (or equal to) the template's tx set by
+/// construction, so the verifier's Class M check always Agrees and
+/// the Setup A smoke soak validates the Phase 2 wiring without
+/// introducing false positives. See BIZLOG 2026-05-02
+/// staged-validation commitment for why this is wiring-only and not
+/// a tolerance-threshold validation.
+fn respond_getrawmempool(buf: &FeedBuffer, id: serde_json::Value) -> RpcResponse {
+    match &buf.block_template {
+        Some(tpl) => {
+            let txids: Vec<serde_json::Value> = tpl
+                .get("transactions")
+                .and_then(serde_json::Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|tx| {
+                            tx.get("txid")
+                                .and_then(serde_json::Value::as_str)
+                                .map(|s| serde_json::Value::String(s.to_string()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            RpcResponse {
+                result: Some(serde_json::Value::Array(txids)),
+                error: None,
+                id,
+            }
+        }
+        None => RpcResponse {
+            result: None,
+            error: Some(RpcError {
+                code: -28,
+                message: "feed adapter: no template received yet".into(),
+            }),
+            id,
+        },
     }
 }
 
@@ -300,7 +281,7 @@ mod tests {
         // to) the template's tx set, keeping Setup A soaks Agreed-only
         // by construction.
         let template_with_three_txs = serde_json::json!({
-            "version": 0x20000000_u64,
+            "version": 0x2000_0000_u64,
             "transactions": [
                 {"txid": "aa".repeat(32), "data": "deadbeef"},
                 {"txid": "bb".repeat(32), "data": "cafebabe"},
@@ -337,7 +318,7 @@ mod tests {
         // can pass is one with zero non-coinbase txs (the empty-template
         // case Phase 1 already rejects via reject_empty_templates).
         let template_without_txs = serde_json::json!({
-            "version": 0x20000000_u64
+            "version": 0x2000_0000_u64
         });
         let extracted: Vec<String> = template_without_txs
             .get("transactions")
