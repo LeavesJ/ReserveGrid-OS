@@ -55,17 +55,27 @@ mkdir -p "$(dirname "$OUT_PATH")"
 METRICS_TEXT="$(curl --silent --show-error --fail --max-time 10 "$METRICS_URL")"
 
 # Parse the four Phase 2 counters out of the OpenMetrics text.
-# Lines look like:
-#   verifier_phase2_checks_total{result="agreed"} 12345
-#   verifier_phase2_degraded_total 3
+#
+# Note on metric naming: the prometheus-client crate auto-appends
+# `_total` to counter exports per OpenMetrics convention, AND our
+# registration code already includes `_total` in the registered
+# name, so counters export with a double suffix:
+#   verifier_phase2_checks_total_total{result="agreed"} 12345
+#   verifier_phase2_degraded_total_total 3
+# Gauges are unaffected:
 #   verifier_mempool_view_age_seconds 7
 #   verifier_mempool_view_size 4823
+# The double-suffix is a verifier-side bug filed as PB-12. Scripts
+# accept either single or double suffix so they continue working
+# whether the bug is fixed in a future release or not.
 parse_counter_with_label() {
   local name="$1"
   local label="$2"
   echo "$METRICS_TEXT" \
     | awk -v name="$name" -v label="$label" '
-        $0 !~ /^#/ && index($0, name "{result=\"" label "\"}") == 1 {
+        $0 ~ /^#/ { next }
+        index($0, name "{result=\"" label "\"}") == 1 ||
+        index($0, name "_total{result=\"" label "\"}") == 1 {
           print $NF; exit
         }
       '
@@ -75,7 +85,8 @@ parse_counter() {
   local name="$1"
   echo "$METRICS_TEXT" \
     | awk -v name="$name" '
-        $0 !~ /^#/ && index($0, name " ") == 1 {
+        $0 ~ /^#/ { next }
+        index($0, name " ") == 1 || index($0, name "_total ") == 1 {
           print $NF; exit
         }
       '

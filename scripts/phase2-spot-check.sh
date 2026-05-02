@@ -73,7 +73,9 @@ parse_counter_with_label() {
   local label="$2"
   echo "$METRICS_TEXT" \
     | awk -v name="$name" -v label="$label" '
-        $0 !~ /^#/ && index($0, name "{result=\"" label "\"}") == 1 {
+        $0 ~ /^#/ { next }
+        index($0, name "{result=\"" label "\"}") == 1 ||
+        index($0, name "_total{result=\"" label "\"}") == 1 {
           print $NF; exit
         }
       '
@@ -82,7 +84,8 @@ parse_counter() {
   local name="$1"
   echo "$METRICS_TEXT" \
     | awk -v name="$name" '
-        $0 !~ /^#/ && index($0, name " ") == 1 {
+        $0 ~ /^#/ { next }
+        index($0, name " ") == 1 || index($0, name "_total ") == 1 {
           print $NF; exit
         }
       '
