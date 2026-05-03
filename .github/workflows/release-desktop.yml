@@ -287,14 +287,35 @@ jobs:
           }
           MANIFEST
 
-      # Prefer the version-specific release notes file (e.g. RELEASE_NOTES_V1.1.md
-      # for tag v1.1.0). Fall back to the generic download table when no file exists.
+      # Detect prerelease tags so release-candidate / beta / alpha builds are
+      # not promoted to "latest" on the GitHub Releases page.
+      # v2.0.0-rc1 → true, v1.1.0 → false.
+      - name: Detect prerelease
+        id: prerelease
+        run: |
+          VERSION="${{ steps.tag.outputs.version }}"
+          if echo "$VERSION" | grep -Eq -- '-(rc|beta|alpha)[0-9]*$'; then
+            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Prefer the version-specific release notes file. Naming convention:
+      #   v1.1.0       → RELEASE_NOTES_V1.1.md
+      #   v1.0.2       → RELEASE_NOTES_V1.0.2.md
+      #   v2.0.0-rc1   → RELEASE_NOTES_V2.0.0-rc1.md
+      # Trailing `.0` is stripped only on plain semver tags. Pre-release
+      # suffixes (`-rc1` etc.) are preserved verbatim and case-sensitive.
+      # Fall back to the generic download table when no file exists.
       - name: Resolve release body
         id: body
         run: |
           VERSION="${{ steps.tag.outputs.version }}"
-          # v1.1.0 → V1.1, v1.0.2 → V1.0.2
-          NOTES_SUFFIX=$(echo "$VERSION" | sed 's/^v/V/' | sed 's/\.0$//')
+          NOTES_SUFFIX=$(echo "$VERSION" | sed 's/^v/V/')
+          # Only strip a trailing `.0` when there's no pre-release suffix.
+          if ! echo "$NOTES_SUFFIX" | grep -q -- '-'; then
+            NOTES_SUFFIX=$(echo "$NOTES_SUFFIX" | sed 's/\.0$//')
+          fi
           NOTES_FILE="RELEASE_NOTES_${NOTES_SUFFIX}.md"
           if [ -f "$NOTES_FILE" ]; then
             echo "source=${NOTES_FILE}" >> "$GITHUB_OUTPUT"
@@ -311,7 +332,7 @@ jobs:
           name: "ReserveGrid OS ${{ steps.tag.outputs.version }}"
           body_path: ${{ steps.body.outputs.source }}
           draft: false
-          prerelease: false
+          prerelease: ${{ steps.prerelease.outputs.is_prerelease == 'true' }}
           files: artifacts/*
           fail_on_unmatched_files: false
 
@@ -334,6 +355,6 @@ jobs:
             ### Auto-update
             Existing installations will update automatically via the built-in updater.
           draft: false
-          prerelease: false
+          prerelease: ${{ steps.prerelease.outputs.is_prerelease == 'true' }}
           files: artifacts/*
           fail_on_unmatched_files: false

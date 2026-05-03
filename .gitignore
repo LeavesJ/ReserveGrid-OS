@@ -124,8 +124,8 @@ TEST_COVERAGE_AUDIT.md
 veldra-site/
 veldra-site-v3/
 
-# Release note drafts (consumed by gh release create, not tracked)
-RELEASE_NOTES_*.md
+# Release notes are tracked so the release-desktop.yml runner can read them
+# on a fresh checkout. Local drafts named differently stay ignored if needed.
 
 # Scan and audit scratch outputs
 detailed_findings.md
