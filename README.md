@@ -4,7 +4,9 @@
 
 Built in Rust. Ships as a native macOS/Linux desktop app (`rg-desktop`) with embedded dashboard, or as a `docker compose up` server stack for headless deployment.
 
-**Current version:** v1.1.0
+**Current version:** v2.0.0-rc1
+
+**v2.0 highlights (release candidate):** Independent consensus re-derivation against raw block bytes (Phase 1) plus mempool ground truth via direct bitcoind RPC (Phase 2) ship above the v1.1.0 policy + gateway + observability baseline. Production validation soak in progress; final v2.0.0 ships once the soak completes cleanly. See the [v2.0.0-rc1 release notes](https://github.com/LeavesJ/veldra/releases/tag/v2.0.0-rc1) for the full list.
 
 ---
 
