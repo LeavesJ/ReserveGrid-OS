@@ -455,15 +455,23 @@ test gates and CI green requirements before the next bucket starts.
    machine testing patterns, regtest bitcoind harness
    reuse pattern.
 
-6. [ ] **Phase 2 #6 production observation** After Phase 2 #2
-   and #3 ship and CI is green on origin, run the verifier in
-   shadow mode against an operator bitcoind for one week.
-   Acceptance criteria: zero false positives at the 4% default
-   threshold across the full week. If the bar is not met,
-   tune the default threshold downward toward 2% before any
-   v2.0 launch announcement that names Phase 2 as live.
-   Document the observation results in DEVLOG and in a new
-   TESTLOG CL entry that closes Phase 2 verification.
+6. [~] **Phase 2 #6 production observation** Staged-validation
+   plan: Setup A smoke against the local docker-compose shadow
+   stack runs first to validate the wiring; Setup B/C real soak
+   against an operator-controlled mainnet bitcoind earns the
+   launch claim. Setup A T+0 declared 2026-05-02T10:52:28Z; T+1
+   PASS captured 2026-05-03T03:53:18Z (3940 templates evaluated,
+   0 rejections, 10 degraded events attributable to a single
+   startup race filed as PB-13). T+3, T+5, T+7 wrap on 2026-05-05,
+   05-07, 05-09 respectively. Setup B/C runs once the mainnet
+   bitcoind subscription opens. Acceptance criteria: zero false
+   positives at the 4% default threshold across the full week of
+   Setup B/C operation. If the bar is not met, tune the default
+   threshold downward toward 2% before any v2.0 launch announcement
+   that names Phase 2 as live. See TESTLOG CL-38 for the running
+   soak status board, BIZLOG 2026-05-02 for the staged-validation
+   discipline, and DEVLOG 2026-05-02 / 2026-05-03 entries for the
+   per-checkpoint detail.
 
 7. [x] **Phase 2 #7 v3.x precursor markers** (this commit,
    2026-05-01) DEVLOG entry captures the v3.x upgrade path:

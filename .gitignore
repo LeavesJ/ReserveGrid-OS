@@ -137,3 +137,15 @@ CLAUDE.md
 
 # PowerPoint autosave noise
 *.pptx
+
+# Verifier scratch dir (verdict log, baseline JSON, runtime data) created by
+# pool-verifier and the soak helper scripts. Not tracked.
+data/
+
+# Spotcheck log appended by `scripts/phase2-spot-check.sh | tee -a`. Mirrors
+# the existing DEVLOG.md private-doc convention.
+docs/DEVLOG.md.spotchecks
+
+# Derived PDFs from tracked markdown briefs. Markdown is the single source
+# of truth; regenerate via `pandoc <source>.md -o <source>.pdf` when needed.
+docs/site-redesign-content-additions.pdf
