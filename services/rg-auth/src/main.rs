@@ -232,14 +232,32 @@ async fn cleanup_task(pool: db::DbPool, rate_limiter: Arc<rate_limit::RateLimite
     let _ = tokio::join!(session_cleanup, rate_limit_cleanup);
 }
 
-fn build_cors(allowed_origin: &str) -> anyhow::Result<CorsLayer> {
-    if allowed_origin == "*" {
-        anyhow::bail!("VELDRA_AUTH_ALLOWED_ORIGIN=\"*\" is not allowed; set a specific origin");
+/// Build the CORS layer from a comma-separated list of allowed origins.
+///
+/// `VELDRA_AUTH_ALLOWED_ORIGIN` accepts a single origin
+/// (e.g. `https://veldra.org`) or a comma-separated list
+/// (e.g. `https://veldra.org,https://www.veldra.org`). Whitespace around
+/// commas is tolerated. Empty entries are dropped. A wildcard `*` is
+/// rejected to prevent accidental open-CORS deployments.
+fn build_cors(allowed_origins: &str) -> anyhow::Result<CorsLayer> {
+    let trimmed = allowed_origins.trim();
+    if trimmed == "*" {
+        anyhow::bail!("VELDRA_AUTH_ALLOWED_ORIGIN=\"*\" is not allowed; set specific origins");
     }
-    let header_value: HeaderValue = allowed_origin
-        .parse()
-        .map_err(|_| anyhow::anyhow!("VELDRA_AUTH_ALLOWED_ORIGIN must be a valid header value"))?;
-    let origin = AllowOrigin::exact(header_value);
+    let header_values: Vec<HeaderValue> = trimmed
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<HeaderValue>().map_err(|_| {
+                anyhow::anyhow!("VELDRA_AUTH_ALLOWED_ORIGIN contains invalid origin: {s}")
+            })
+        })
+        .collect::<anyhow::Result<_>>()?;
+    if header_values.is_empty() {
+        anyhow::bail!("VELDRA_AUTH_ALLOWED_ORIGIN must list at least one origin");
+    }
+    let origin = AllowOrigin::list(header_values);
 
     Ok(CorsLayer::new()
         .allow_origin(origin)

@@ -10,6 +10,8 @@ primary_region = "sjc"
   VELDRA_AUTH_DB = "/data/auth.db"
   VELDRA_AUTH_SITE_URL = "https://veldra.org"
   VELDRA_AUTH_URL = "https://auth.veldra.org"
+  # Comma-separated list of allowed CORS origins. Add www. if needed,
+  # or a staging host. Wildcard "*" is rejected.
   VELDRA_AUTH_ALLOWED_ORIGIN = "https://veldra.org"
   VELDRA_AUTH_SESSION_TTL_HOURS = "168"
 

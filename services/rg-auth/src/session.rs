@@ -136,6 +136,13 @@ pub fn load_signing_key(b64_seed: &str) -> Option<SigningKey> {
 
 // ── Session token utilities (unchanged) ─────────────────────────
 
+/// Canonical length of a token emitted by `generate_token`. 32 random bytes
+/// hex encoded yields exactly 64 lowercase hex chars. Any consumer that needs
+/// to validate token shape (admin URL sanitizer, future paste guards) must
+/// reference this constant rather than hardcoding the length, so a future bump
+/// to the token width cannot silently desync the validators.
+pub const TOKEN_HEX_LEN: usize = 32 * 2;
+
 /// Generate a cryptographically random 32-byte hex token (64 hex chars).
 ///
 /// Uses `OsRng` directly for defense in depth: session tokens are
@@ -177,7 +184,7 @@ mod tests {
     #[test]
     fn token_length() {
         let t = generate_token();
-        assert_eq!(t.len(), 64); // 32 bytes -> 64 hex chars
+        assert_eq!(t.len(), TOKEN_HEX_LEN);
     }
 
     #[test]
