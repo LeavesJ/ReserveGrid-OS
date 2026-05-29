@@ -455,23 +455,36 @@ test gates and CI green requirements before the next bucket starts.
    machine testing patterns, regtest bitcoind harness
    reuse pattern.
 
-6. [~] **Phase 2 #6 production observation** Staged-validation
-   plan: Setup A smoke against the local docker-compose shadow
-   stack runs first to validate the wiring; Setup B/C real soak
-   against an operator-controlled mainnet bitcoind earns the
-   launch claim. Setup A T+0 declared 2026-05-02T10:52:28Z; T+1
-   PASS captured 2026-05-03T03:53:18Z (3940 templates evaluated,
-   0 rejections, 10 degraded events attributable to a single
-   startup race filed as PB-13). T+3, T+5, T+7 wrap on 2026-05-05,
-   05-07, 05-09 respectively. Setup B/C runs once the mainnet
-   bitcoind subscription opens. Acceptance criteria: zero false
-   positives at the 4% default threshold across the full week of
-   Setup B/C operation. If the bar is not met, tune the default
-   threshold downward toward 2% before any v2.0 launch announcement
-   that names Phase 2 as live. See TESTLOG CL-38 for the running
-   soak status board, BIZLOG 2026-05-02 for the staged-validation
-   discipline, and DEVLOG 2026-05-02 / 2026-05-03 entries for the
-   per-checkpoint detail.
+6. [x] **Phase 2 #6 production observation (Setup A axis closed)**
+   Staged-validation plan: Setup A smoke against the local
+   docker-compose shadow stack runs first to validate the wiring;
+   Setup B/C real soak against an operator-controlled mainnet
+   bitcoind earns the launch claim. **Setup A closeout: PASS,
+   2026-05-28T03:34:06Z, 25-day cumulative window.** Counters
+   delta from baseline (2026-05-02T10:52:28Z): 103,389 Class M
+   checks evaluated, **0 rejections**, 471 degraded events at a
+   steady 0.76 events per hour (rate stayed constant across the
+   full window, environmental noise traced to macOS Power Nap
+   DarkWake cycles per the T+3 diagnostic, see DEVLOG 2026-05-05).
+   Skipped equals degraded (471), confirming the abstain-on-degraded
+   design: every degraded window cleanly skipped Class M rather
+   than emitting a false rejection. 28 stale templates (0.027% of
+   total) within design tolerance. Earlier checkpoints: T+1 PASS
+   2026-05-03 (3940 templates, 0 rejections, 10 degraded from a
+   single startup race filed as PB-13); T+3 PASS 2026-05-05
+   (10031 templates, 0 rejections, 67 degraded with Power Nap
+   correlation diagnosed). T+5 and T+7 spot checks were never
+   manually executed; the cumulative metric counters captured a
+   stronger 25-day signal than the original 7-day plan called for.
+   **Setup B and Setup C axes remain open** and gate the launch
+   claim. Setup B runs once a mainnet bitcoind subscription opens;
+   Setup C runs once a design partner pool signs on. Acceptance
+   criteria for both remain: zero false positives at the 4% default
+   threshold across the full week. If the bar is not met under
+   real-bitcoind flow, tune the default threshold downward toward
+   2% before any v2.0 launch announcement that names Phase 2 as
+   live. See TESTLOG CL-38 closeout, BIZLOG 2026-05-27 setup-a-wrap
+   entry, and DEVLOG 2026-05-27 for the 25-day cumulative summary.
 
 7. [x] **Phase 2 #7 v3.x precursor markers** (this commit,
    2026-05-01) DEVLOG entry captures the v3.x upgrade path:
