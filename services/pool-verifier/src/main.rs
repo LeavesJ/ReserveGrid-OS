@@ -853,7 +853,7 @@ mod dashboard_tests {
             prometheus_client::metrics::counter::Counter,
         >::default();
         registry.register(
-            "verifier_verdicts_total",
+            "verifier_verdicts",
             "Total verdicts emitted by the verifier",
             family.clone(),
         );

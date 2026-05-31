@@ -608,12 +608,12 @@ impl GatewayMetrics {
             vardiff_retargets_total: Family::default(),
         };
         registry.register(
-            "svtwo_shares_total",
+            "svtwo_shares",
             "Total shares validated by the gateway",
             m.shares_total.clone(),
         );
         registry.register(
-            "svtwo_connections_total",
+            "svtwo_connections",
             "Total TCP connections accepted",
             m.connections_total.clone(),
         );
@@ -628,31 +628,89 @@ impl GatewayMetrics {
             m.channels_active.clone(),
         );
         registry.register(
-            "svtwo_templates_received_total",
+            "svtwo_templates_received",
             "Total templates received from upstream",
             m.templates_received_total.clone(),
         );
         registry.register(
-            "svtwo_verdicts_total",
+            "svtwo_verdicts",
             "Total verifier verdicts received",
             m.verdicts_total.clone(),
         );
         registry.register(
-            "svtwo_share_forward_total",
+            "svtwo_share_forward",
             "Total share forward results from upstream",
             m.share_forward_total.clone(),
         );
         registry.register(
-            "svtwo_mode_transitions_total",
+            "svtwo_mode_transitions",
             "Mode transitions between enforcing and degraded",
             m.mode_transitions_total.clone(),
         );
         registry.register(
-            "svtwo_vardiff_retargets_total",
+            "svtwo_vardiff_retargets",
             "Variable difficulty retarget events",
             m.vardiff_retargets_total.clone(),
         );
         m
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod pb12_metrics_tests {
+    use super::*;
+
+    /// PB-12 regression. `prometheus-client` appends a `_total` suffix
+    /// to every counter on export, so a registered counter name must
+    /// not already carry `_total` or it exports as `_total_total`.
+    #[test]
+    fn gateway_counters_export_single_total_suffix() {
+        let mut registry = Registry::default();
+        let m = GatewayMetrics::new_registered(&mut registry);
+        m.connections_total.inc();
+        m.templates_received_total.inc();
+        m.shares_total
+            .get_or_create(&ShareLabels {
+                result: "accepted".to_string(),
+                reason_code: "ok".to_string(),
+            })
+            .inc();
+        m.verdicts_total
+            .get_or_create(&VerdictLabels {
+                accepted: "true".to_string(),
+            })
+            .inc();
+        m.share_forward_total
+            .get_or_create(&ForwardLabels {
+                result: "forwarded".to_string(),
+            })
+            .inc();
+        m.mode_transitions_total
+            .get_or_create(&ModeTransitionLabels {
+                direction: "to_degraded".to_string(),
+            })
+            .inc();
+        m.vardiff_retargets_total
+            .get_or_create(&VardiffLabels {
+                direction: "up".to_string(),
+            })
+            .inc();
+
+        let (status, _, body) = reservegrid_common::metrics::render_metrics(&registry);
+        assert_eq!(status, 200);
+        assert!(!body.contains("_total_total"), "double suffix in:\n{body}");
+        for name in [
+            "svtwo_shares_total",
+            "svtwo_connections_total",
+            "svtwo_templates_received_total",
+            "svtwo_verdicts_total",
+            "svtwo_share_forward_total",
+            "svtwo_mode_transitions_total",
+            "svtwo_vardiff_retargets_total",
+        ] {
+            assert!(body.contains(name), "missing exported counter `{name}`");
+        }
     }
 }
 

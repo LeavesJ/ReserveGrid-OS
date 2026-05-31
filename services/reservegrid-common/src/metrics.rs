@@ -52,12 +52,15 @@ mod tests {
     fn render_counter() {
         let mut reg = Registry::default();
         let counter = Counter::<u64>::default();
-        reg.register("test_total", "a test counter", counter.clone());
+        reg.register("test", "a test counter", counter.clone());
         counter.inc();
         counter.inc();
         let (status, _, body) = render_metrics(&reg);
         assert_eq!(status, 200);
+        // prometheus-client appends `_total`; registering "test" must
+        // export "test_total", never "test_total_total" (PB-12).
         assert!(body.contains("test_total"));
+        assert!(!body.contains("test_total_total"));
         assert!(body.contains('2'));
     }
 }

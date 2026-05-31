@@ -221,7 +221,7 @@ impl TemplateManagerMetrics {
             poll_errors_total: Counter::default(),
         };
         registry.register(
-            "tmgr_templates_polled_total",
+            "tmgr_templates_polled",
             "Templates polled from backend",
             m.templates_polled_total.clone(),
         );
@@ -231,16 +231,45 @@ impl TemplateManagerMetrics {
             m.templates_cached.clone(),
         );
         registry.register(
-            "tmgr_shares_ingested_total",
+            "tmgr_shares_ingested",
             "Shares ingested via POST /shares",
             m.shares_ingested_total.clone(),
         );
         registry.register(
-            "tmgr_poll_errors_total",
+            "tmgr_poll_errors",
             "Template poll errors",
             m.poll_errors_total.clone(),
         );
         m
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod pb12_metrics_tests {
+    use super::*;
+
+    /// PB-12 regression. `prometheus-client` appends a `_total` suffix
+    /// to every counter on export, so a registered counter name must
+    /// not already carry `_total` or it exports as `_total_total`.
+    #[test]
+    fn tmgr_counters_export_single_total_suffix() {
+        let mut registry = Registry::default();
+        let m = TemplateManagerMetrics::new_registered(&mut registry);
+        m.templates_polled_total.inc();
+        m.shares_ingested_total.inc();
+        m.poll_errors_total.inc();
+
+        let (status, _, body) = reservegrid_common::metrics::render_metrics(&registry);
+        assert_eq!(status, 200);
+        assert!(!body.contains("_total_total"), "double suffix in:\n{body}");
+        for name in [
+            "tmgr_templates_polled_total",
+            "tmgr_shares_ingested_total",
+            "tmgr_poll_errors_total",
+        ] {
+            assert!(body.contains(name), "missing exported counter `{name}`");
+        }
     }
 }
 

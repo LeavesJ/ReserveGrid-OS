@@ -57,17 +57,16 @@ METRICS_TEXT="$(curl --silent --show-error --fail --max-time 10 "$METRICS_URL")"
 # Parse the four Phase 2 counters out of the OpenMetrics text.
 #
 # Note on metric naming: the prometheus-client crate auto-appends
-# `_total` to counter exports per OpenMetrics convention, AND our
-# registration code already includes `_total` in the registered
-# name, so counters export with a double suffix:
-#   verifier_phase2_checks_total_total{result="agreed"} 12345
-#   verifier_phase2_degraded_total_total 3
+# `_total` to counter exports per OpenMetrics convention. The verifier
+# registration code drops the redundant `_total` from counter names
+# (PB-12 fix), so counters export the single-suffix canonical names:
+#   verifier_phase2_checks_total{result="agreed"} 12345
+#   verifier_phase2_degraded_total 3
 # Gauges are unaffected:
 #   verifier_mempool_view_age_seconds 7
 #   verifier_mempool_view_size 4823
-# The double-suffix is a verifier-side bug filed as PB-12. Scripts
-# accept either single or double suffix so they continue working
-# whether the bug is fixed in a future release or not.
+# The parsers below retain dual single/double suffix tolerance so they
+# keep working against both post-fix and any older pre-fix verifier.
 parse_counter_with_label() {
   local name="$1"
   local label="$2"

@@ -79,22 +79,22 @@ impl VerifierMetrics {
             mempool_view_size: Gauge::default(),
         };
         registry.register(
-            "verifier_verdicts_total",
+            "verifier_verdicts",
             "Total verdicts emitted by the verifier",
             m.verdicts_total.clone(),
         );
         registry.register(
-            "verifier_templates_evaluated_total",
+            "verifier_templates_evaluated",
             "Total templates evaluated",
             m.templates_evaluated_total.clone(),
         );
         registry.register(
-            "verifier_policy_reloads_total",
+            "verifier_policy_reloads",
             "Total policy reload attempts",
             m.policy_reloads_total.clone(),
         );
         registry.register(
-            "verifier_shield_skipped_total",
+            "verifier_shield_skipped",
             "Phase 1 coverage gap: templates that reached the v2.0 Invariant Shield but \
              omitted raw_block_hex so the Class S and Class D check chain could not run. \
              Trends to zero as gateways are upgraded to ship raw block bytes. For Phase 2 \
@@ -104,12 +104,12 @@ impl VerifierMetrics {
             m.shield_skipped_total.clone(),
         );
         registry.register(
-            "verifier_phase2_degraded_total",
+            "verifier_phase2_degraded",
             "Templates where the Phase 2 Class M check was skipped due to a Degraded mempool view",
             m.phase2_degraded_total.clone(),
         );
         registry.register(
-            "verifier_phase2_checks_total",
+            "verifier_phase2_checks",
             "Phase 2 Class M check outcomes by result label",
             m.phase2_checks_total.clone(),
         );
@@ -140,4 +140,62 @@ pub(crate) async fn verifier_metrics_handler(
         [(axum::http::header::CONTENT_TYPE, content_type)],
         body,
     )
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// PB-12 regression. `prometheus-client` appends a `_total` suffix
+    /// to every counter on export, so a registered counter name must
+    /// not already carry `_total` or it exports as `_total_total`.
+    #[test]
+    fn counters_export_single_total_suffix() {
+        let mut registry = Registry::default();
+        let m = VerifierMetrics::new_registered(&mut registry);
+
+        // Emit a sample line per counter. Family counters print only
+        // their metadata lines until a labeled child exists.
+        m.templates_evaluated_total.inc();
+        m.shield_skipped_total.inc();
+        m.phase2_degraded_total.inc();
+        m.verdicts_total
+            .get_or_create(&VerdictLabels {
+                accepted: "true".to_string(),
+                reason_code: "ok".to_string(),
+            })
+            .inc();
+        m.policy_reloads_total
+            .get_or_create(&PolicyReloadLabels {
+                result: "ok".to_string(),
+            })
+            .inc();
+        m.phase2_checks_total
+            .get_or_create(&Phase2CheckLabels {
+                result: "agreed".to_string(),
+            })
+            .inc();
+
+        let (status, _, body) = reservegrid_common::metrics::render_metrics(&registry);
+        assert_eq!(status, 200);
+
+        for name in [
+            "verifier_verdicts_total",
+            "verifier_templates_evaluated_total",
+            "verifier_policy_reloads_total",
+            "verifier_shield_skipped_total",
+            "verifier_phase2_degraded_total",
+            "verifier_phase2_checks_total",
+        ] {
+            assert!(body.contains(name), "missing exported counter `{name}`");
+            let doubled = format!("{name}_total");
+            assert!(!body.contains(&doubled), "double suffix on `{name}`");
+        }
+
+        // Gauges never take the `_total` suffix.
+        assert!(body.contains("verifier_mempool_view_age_seconds"));
+        assert!(body.contains("verifier_mempool_view_size"));
+        assert!(!body.contains("verifier_mempool_view_size_total"));
+    }
 }
