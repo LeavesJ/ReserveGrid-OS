@@ -92,6 +92,13 @@ services:
       timeout: 3s
       start_period: 10s
       retries: 10
+    # PB-13: gate boot on rg-feed-adapter health so the first mempool
+    # poll succeeds before any verdict is served, preventing boot-window
+    # verifier_phase2_degraded_total inflation. The adapter at
+    # rg-feed-adapter:18444 is the [policy.mempool] rpc_url source.
+    depends_on:
+      rg-feed-adapter:
+        condition: service_healthy
 
   # ── Template Manager (reads from adapter, not bitcoind) ──
   template-manager:

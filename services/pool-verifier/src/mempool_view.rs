@@ -27,12 +27,19 @@ pub enum MempoolState {
     /// against the stale set with a `MempoolViewStale` advisory.
     /// Caller may choose to log the advisory without rejecting.
     Stale,
-    /// View is unusable. Either bitcoind has been unreachable beyond
-    /// the fail-stale window, or no successful refresh has happened
-    /// since startup. Class M check is skipped, templates fall
-    /// through to Phase 1 behavior, `verifier_phase2_degraded_total`
-    /// increments per template.
+    /// A previously primed view aged out past `2 * max_stale_secs`:
+    /// bitcoind has been unreachable beyond the fail-stale window.
+    /// Class M check is skipped, templates fall through to Phase 1
+    /// behavior, and `verifier_phase2_degraded_total` increments per
+    /// template so operators can alert on a steady-state outage.
     Degraded,
+    /// No successful refresh has happened since startup, so the view
+    /// has never been primed. Class M is skipped exactly as for
+    /// `Degraded`, but this is the boot window rather than a runtime
+    /// degradation, so it does NOT increment
+    /// `verifier_phase2_degraded_total`. Keeping the two distinct
+    /// stops boot-time alerts from flapping (PB-13, R-173).
+    Unprimed,
 }
 
 /// Snapshot of the verifier's mempool view at a point in time.
@@ -58,7 +65,7 @@ struct MempoolViewInner {
     last_refresh_unix_ms: Option<u64>,
     max_stale_secs: u64,
     /// `true` once at least one refresh has succeeded since startup.
-    /// Before that, the view is `Degraded` regardless of clock age.
+    /// Before that, the view is `Unprimed` regardless of clock age.
     primed: bool,
 }
 
@@ -95,7 +102,7 @@ impl MempoolView {
                     (MempoolState::Fresh, age_secs)
                 }
             }
-            _ => (MempoolState::Degraded, 0),
+            _ => (MempoolState::Unprimed, 0),
         };
         MempoolSnapshot {
             state,
@@ -207,7 +214,7 @@ pub fn evaluate(
     tolerance_pct: f64,
 ) -> MempoolCheckOutcome {
     match snapshot.state {
-        MempoolState::Degraded => return MempoolCheckOutcome::Skipped,
+        MempoolState::Degraded | MempoolState::Unprimed => return MempoolCheckOutcome::Skipped,
         // Stale falls through to evaluate; caller decides whether to
         // treat as advisory. We still count and surface the age for
         // the per-verdict detail. Fresh is the normal path.

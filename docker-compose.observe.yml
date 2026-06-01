@@ -88,6 +88,12 @@ services:
       timeout: 3s
       start_period: 10s
       retries: 10
+    # PB-13: same boot-ordering guard as the shadow stack. observe mounts
+    # the same [policy.mempool] config, so the verifier polls
+    # rg-feed-adapter:18444 at boot and must wait for it to be healthy.
+    depends_on:
+      rg-feed-adapter:
+        condition: service_healthy
 
   # ── Template Manager (reads from adapter, not bitcoind) ──
   template-manager:

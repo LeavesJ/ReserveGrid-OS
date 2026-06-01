@@ -235,6 +235,54 @@ fn phase2_degraded_view_skips_check_and_agrees() {
     );
 }
 
+/// PB-13: a view that has never been primed by a successful poll
+/// reports `Unprimed`, not `Degraded`, so the boot window stays out
+/// of `verifier_phase2_degraded_total`. `evaluate` skips Class M for
+/// it exactly as for `Degraded`, and the first successful install
+/// moves it to `Fresh`.
+#[tokio::test]
+async fn phase2_unprimed_view_reports_unprimed_and_skips() {
+    let view = MempoolView::new(60);
+
+    let snap = view.snapshot().await;
+    assert_eq!(snap.state, MempoolState::Unprimed);
+    assert_eq!(snap.size, 0);
+
+    let outcome = pool_verifier::mempool_view::evaluate(&snap, &[[7u8; 32]], 4.0);
+    assert_eq!(
+        outcome,
+        pool_verifier::mempool_view::MempoolCheckOutcome::Skipped
+    );
+
+    view.install(HashSet::from([[1u8; 32]])).await;
+    assert_eq!(view.snapshot().await.state, MempoolState::Fresh);
+}
+
+/// PB-13 policy path: an `Unprimed` snapshot must skip Class M and
+/// agree, matching the `Degraded` behavior, so a booting verifier
+/// never rejects a template just because the view has not primed yet.
+#[test]
+fn phase2_unprimed_view_skips_check_and_agrees() {
+    let (template, _txids) = regtest_segwit_template();
+    let snapshot = MempoolSnapshot {
+        state: MempoolState::Unprimed,
+        txids: Arc::new(HashSet::new()),
+        age_secs: 0,
+        size: 0,
+    };
+    let cfg = permissive_policy();
+    let now_ms = 0;
+
+    let result = evaluate_dynamic_phase2(&template, &cfg, Some(&snapshot), Some(100), now_ms);
+
+    assert!(
+        result.reason.is_none(),
+        "Unprimed view must skip Class M and agree, got reason={:?} detail={:?}",
+        result.reason,
+        result.detail
+    );
+}
+
 /// Phase 1 + Phase 2 toggle: passing `mempool_snapshot = None` must
 /// reproduce `evaluate_dynamic` exactly (no Class M attempt).
 #[test]

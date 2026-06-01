@@ -457,8 +457,11 @@ pub(crate) async fn handle_tcp_connection<R, W>(
 
             // ── Phase 2 Class M observability (ADR-003) ──
             // Increments verifier_phase2_checks_total{result} based on
-            // the verdict's reason code. Only fires when the Phase 2
-            // path was taken (mempool_view present in AppState). Mempool
+            // the verdict's reason code and the mempool view state. Only
+            // fires when the Phase 2 path was taken (mempool_view present
+            // in AppState). Degraded, a primed view that aged out,
+            // increments verifier_phase2_degraded_total; Unprimed, the
+            // boot window before the first poll, does not (PB-13). Mempool
             // view gauges are refreshed on each snapshot read so
             // dashboards see freshness without an extra polling loop.
             if let Some(view) = state_clone.mempool_view.as_ref() {
@@ -481,6 +484,13 @@ pub(crate) async fn handle_tcp_connection<R, W>(
                         metrics.phase2_degraded_total.inc();
                         "skipped"
                     }
+                    // PB-13: the boot window before the first successful
+                    // poll is Unprimed, not Degraded. Class M is skipped
+                    // the same way, but it must NOT increment
+                    // phase2_degraded_total or boot-time alerts flap. Its
+                    // own result label keeps the prime window observable
+                    // via phase2_checks_total.
+                    (_, MempoolState::Unprimed) => "unprimed",
                     (_, MempoolState::Stale) => "stale",
                     _ => "agreed",
                 };
