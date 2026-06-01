@@ -274,45 +274,11 @@ dependencies = [
 
 [[package]]
 name = "axum"
-version = "0.7.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "edca88bc138befd0323b20752846e6587272d3b03b0343c8ea28a6f819e6e71f"
-dependencies = [
- "async-trait",
- "axum-core 0.4.5",
- "bytes",
- "futures-util",
- "http",
- "http-body",
- "http-body-util",
- "hyper",
- "hyper-util",
- "itoa",
- "matchit 0.7.3",
- "memchr",
- "mime",
- "percent-encoding",
- "pin-project-lite",
- "rustversion",
- "serde",
- "serde_json",
- "serde_path_to_error",
- "serde_urlencoded",
- "sync_wrapper",
- "tokio",
- "tower",
- "tower-layer",
- "tower-service",
- "tracing",
-]
-
-[[package]]
-name = "axum"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90"
 dependencies = [
- "axum-core 0.5.6",
+ "axum-core",
  "bytes",
  "form_urlencoded",
  "futures-util",
@@ -322,7 +288,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "itoa",
- "matchit 0.8.4",
+ "matchit",
  "memchr",
  "mime",
  "percent-encoding",
@@ -334,27 +300,6 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tower",
- "tower-layer",
- "tower-service",
- "tracing",
-]
-
-[[package]]
-name = "axum-core"
-version = "0.4.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09f2bd6146b97ae3359fa0cc6d6b376d9539582c7b4220f041a33ec24c226199"
-dependencies = [
- "async-trait",
- "bytes",
- "futures-util",
- "http",
- "http-body",
- "http-body-util",
- "mime",
- "pin-project-lite",
- "rustversion",
- "sync_wrapper",
  "tower-layer",
  "tower-service",
  "tracing",
@@ -2922,12 +2867,6 @@ checksum = "2532096657941c2fea9c289d370a250971c689d4f143798ff67113ec042024a5"
 
 [[package]]
 name = "matchit"
-version = "0.7.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
-
-[[package]]
-name = "matchit"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
@@ -3690,7 +3629,7 @@ name = "pool-verifier"
 version = "2.0.0-rc1"
 dependencies = [
  "anyhow",
- "axum 0.7.9",
+ "axum",
  "axum-server",
  "clap",
  "hex",
@@ -3704,11 +3643,11 @@ dependencies = [
  "serde",
  "serde_json",
  "subtle",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
  "toml 0.8.2",
- "tower-http 0.6.8",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
 ]
@@ -4193,7 +4132,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower",
- "tower-http 0.6.8",
+ "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
@@ -4232,7 +4171,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "tower",
- "tower-http 0.6.8",
+ "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
@@ -4261,7 +4200,7 @@ dependencies = [
 name = "reservegrid-gateway"
 version = "2.0.0-rc1"
 dependencies = [
- "axum 0.8.9",
+ "axum",
  "axum-server",
  "clap",
  "hex",
@@ -4278,7 +4217,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tower",
- "tower-http 0.6.8",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -4290,7 +4229,7 @@ version = "2.0.0-rc1"
 dependencies = [
  "anyhow",
  "argon2",
- "axum 0.7.9",
+ "axum",
  "base64 0.22.1",
  "ed25519-dalek",
  "lettre",
@@ -4302,7 +4241,7 @@ dependencies = [
  "sha2",
  "tokio",
  "toml 0.8.2",
- "tower-http 0.5.2",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
 ]
@@ -4318,7 +4257,7 @@ dependencies = [
 name = "rg-dashboard"
 version = "2.0.0-rc1"
 dependencies = [
- "axum 0.8.9",
+ "axum",
  "clap",
  "http",
  "mime_guess",
@@ -4329,7 +4268,7 @@ dependencies = [
  "tokio",
  "toml 0.8.2",
  "tower",
- "tower-http 0.6.8",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
 ]
@@ -4375,7 +4314,7 @@ dependencies = [
 name = "rg-feed-adapter"
 version = "2.0.0-rc1"
 dependencies = [
- "axum 0.7.9",
+ "axum",
  "clap",
  "futures-util",
  "http",
@@ -5272,7 +5211,7 @@ dependencies = [
 name = "sv2-gateway"
 version = "2.0.0-rc1"
 dependencies = [
- "axum 0.8.9",
+ "axum",
  "clap",
  "codec_sv2",
  "common_messages_sv2",
@@ -5299,7 +5238,7 @@ dependencies = [
  "tokio-rustls",
  "toml 0.8.2",
  "tower",
- "tower-http 0.6.8",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -5741,7 +5680,7 @@ version = "2.0.0-rc1"
 dependencies = [
  "anyhow",
  "async-trait",
- "axum 0.7.9",
+ "axum",
  "bitcoincore-rpc",
  "clap",
  "hex",
@@ -5753,10 +5692,9 @@ dependencies = [
  "serde_json",
  "sha2",
  "subtle",
- "thiserror 1.0.69",
  "tokio",
  "toml 0.8.2",
- "tower-http 0.6.8",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
 ]
@@ -6090,22 +6028,6 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
-]
-
-[[package]]
-name = "tower-http"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e9cd434a998747dd2c4276bc96ee2e0c7a2eadf3cae88e52be55a05fa9053f5"
-dependencies = [
- "bitflags 2.11.1",
- "bytes",
- "http",
- "http-body",
- "http-body-util",
- "pin-project-lite",
- "tower-layer",
- "tower-service",
 ]
 
 [[package]]
