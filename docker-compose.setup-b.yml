@@ -1,0 +1,88 @@
+# ReserveGrid OS — Setup B Stack (real mainnet bitcoind)
+#
+# Minimal launch-gate verification pipeline against an operator-controlled
+# mainnet bitcoind running on this host:
+#
+#   bitcoind (host, 127.0.0.1:8332, loopback only)
+#     ├── template-manager   polls getblocktemplate, forwards TemplatePropose
+#     └── pool-verifier      polls getrawmempool ([policy.mempool]), Class M
+#
+# Design notes:
+# - network_mode: host on every service. bitcoind binds loopback only
+#   (correct posture), and containers on the default bridge cannot reach
+#   the host's 127.0.0.1, so the pipeline joins the host network and every
+#   service binds 127.0.0.1 explicitly. Nothing is exposed publicly; ufw
+#   keeps the public interface at SSH (plus optional 8333 for peers).
+# - No rg-demo-feed, rg-feed-adapter, rg-feed-server, or rg-auth here.
+#   template-manager's bitcoind backend talks to the real node directly,
+#   so the synthetic feed chain and the licensed feed product are not part
+#   of the launch-gate pipeline.
+# - Credentials come from the environment file (.env.setup-b), never from
+#   a file in the repo. rpc_pass is read from VELDRA_BITCOIND_RPC_PASS by
+#   both services.
+# - VELDRA_MODE defaults to observe (read-only). Flip to shadow in
+#   .env.setup-b for the soak, then `up -d` again to recreate.
+#
+# Usage (from the repo root on the node):
+#   docker compose -f docker-compose.setup-b.yml --env-file .env.setup-b up -d --build
+
+services:
+  pool-verifier:
+    build:
+      context: .
+      dockerfile: services/pool-verifier/Dockerfile
+    network_mode: host
+    restart: unless-stopped
+    user: "0"
+    environment:
+      VELDRA_LOG_FORMAT: json
+      VELDRA_LOG_FILTER: info
+      VELDRA_VERIFIER_ADDR: "127.0.0.1:9090"
+      VELDRA_HTTP_ADDR: "127.0.0.1:8081"
+      VELDRA_API_SECRET_OPTIONAL: "1"
+      VELDRA_POLICY_FILE: /config/policy-prod.toml
+      VELDRA_VERIFIER_CONFIG: /devconfig/verifier.toml
+      VELDRA_MODE: "${VELDRA_MODE:-observe}"
+      VELDRA_BITCOIND_RPC_PASS: "${VELDRA_BITCOIND_RPC_PASS}"
+    volumes:
+      - ./deploy:/config:rw
+      - ./config:/devconfig:ro
+      # Verdict log lives at /data/verdicts.log inside the container;
+      # mount it so phase2-spot-check.sh and forensics read it from the
+      # host without docker exec.
+      - ./data:/data:rw
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8081/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 10
+
+  template-manager:
+    build:
+      context: .
+      dockerfile: services/template-manager/Dockerfile
+    network_mode: host
+    restart: unless-stopped
+    user: "0"
+    environment:
+      VELDRA_LOG_FORMAT: json
+      VELDRA_LOG_FILTER: info
+      VELDRA_MANAGER_CONFIG: /config/manager-setup-b.toml
+      VELDRA_MANAGER_HTTP_ADDR: "127.0.0.1:8082"
+      VELDRA_VERIFIER_ADDR: "127.0.0.1:9090"
+      VELDRA_API_SECRET_OPTIONAL: "1"
+      VELDRA_SHARE_HMAC_OPTIONAL: "1"
+      VELDRA_BITCOIND_RPC_USER: "${VELDRA_BITCOIND_RPC_USER:-veldra}"
+      VELDRA_BITCOIND_RPC_PASS: "${VELDRA_BITCOIND_RPC_PASS}"
+    volumes:
+      - ./deploy:/config:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8082/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 10
+    depends_on:
+      pool-verifier:
+        condition: service_healthy

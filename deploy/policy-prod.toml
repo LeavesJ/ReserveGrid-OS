@@ -32,3 +32,21 @@ max_template_age_ms = 5000
 enforce_template_age = true
 warn_sigops_ratio = 0.95
 warn_coinbase_sigops_max = 400
+
+# ── ADR-003 Phase 2 Class M (mempool ground truth) ──
+# Production defaults validated by the Setup A shadow soak (25-day
+# cumulative window, 103,389 Class M checks, zero false positives at
+# tolerance_pct = 4.0). Before the Setup B/C launch-gate soak per
+# docs/runbooks/phase2-shadow-soak.md, point rpc_url at your own
+# mainnet bitcoind (not regtest) and set credentials. rpc_pass is read
+# from VELDRA_BITCOIND_RPC_PASS when set, falling back to the value
+# here, so keep the secret in the environment and leave it empty here.
+[policy.mempool]
+enforce = true
+tolerance_pct = 4.0
+poll_interval_secs = 10
+max_stale_secs = 60
+per_tx_detail = false
+rpc_url = "TODO_SET_MAINNET_BITCOIND_RPC_URL"
+rpc_user = "TODO_SET_BITCOIND_RPC_USER"
+rpc_pass = ""

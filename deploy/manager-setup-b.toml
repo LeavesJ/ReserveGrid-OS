@@ -1,0 +1,24 @@
+# Setup B template-manager configuration: real mainnet bitcoind.
+#
+# rpc_user and rpc_pass are intentionally absent. template-manager falls
+# back to VELDRA_BITCOIND_RPC_USER and VELDRA_BITCOIND_RPC_PASS from the
+# environment, so no credential lives in this file.
+
+[manager]
+backend = "bitcoind"
+poll_interval_secs = 5
+
+# Operator mainnet bitcoind on this host. Loopback only; the Setup B
+# compose runs on the host network so this resolves to the node.
+rpc_url = "http://127.0.0.1:8332"
+
+# HTTP API and health endpoint. Loopback; reach it via SSH tunnel.
+http_listen_addr = "127.0.0.1:8082"
+
+# Coinbase construction: OP_TRUE placeholder output. Observe and shadow
+# modes never mine or broadcast, so this is correct for the soak.
+coinbase_output_script_hex = "51"
+extranonce_size = 4
+
+# Verifier TCP ingress on the host network.
+verifier_tcp_addr = "127.0.0.1:9090"
