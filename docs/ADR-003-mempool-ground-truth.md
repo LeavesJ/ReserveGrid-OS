@@ -14,9 +14,9 @@ block templates: T1 internal `raw_block` tampering where the header,
 coinbase, and body bytes are mutually inconsistent, and T2
 `TemplatePropose` declared values disagreeing with what re-derivation
 of the same `raw_block` bytes shows. Phase 1 #4b shipped on 2026-04-29
-with 10 of 18 invariants wired and tested against genesis plus a
+with 11 of 18 invariants wired and tested against genesis plus a
 regtest segwit fixture, closing T1 and T2 to ~95% practical coverage.
-Phase 1.5 will extend coverage with the remaining 8 belt-and-suspenders
+Phase 1.5 will extend coverage with the remaining 7 belt-and-suspenders
 checks after a production observation cycle in shadow mode.
 
 Phase 1 cannot close one specific attacker class:
@@ -476,9 +476,10 @@ test gates and CI green requirements before the next bucket starts.
    correlation diagnosed). T+5 and T+7 spot checks were never
    manually executed; the cumulative metric counters captured a
    stronger 25-day signal than the original 7-day plan called for.
-   **Setup B and Setup C axes remain open** and gate the launch
-   claim. Setup B runs once a mainnet bitcoind subscription opens;
-   Setup C runs once a design partner pool signs on. Acceptance
+   **Setup B is operational** (self-hosted VPS mainnet node, shadow
+   soak T+0 2026-06-08T02:54:22Z, wraps 2026-06-15); **Setup C remains
+   open** (runs once a design partner pool signs on). Both gate the
+   launch claim until a clean week lands. Acceptance
    criteria for both remain: zero false positives at the 4% default
    threshold across the full week. If the bar is not met under
    real-bitcoind flow, tune the default threshold downward toward

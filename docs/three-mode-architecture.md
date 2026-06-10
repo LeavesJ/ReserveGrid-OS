@@ -123,10 +123,12 @@ The shield emits one of three outcomes per template:
   the verdict carries the matching `v2_invariant_*` reason code and a
   human-readable detail string.
 
-### Wired invariants (Phase 1 #4b, 10 of 18)
+### Wired invariants (Phase 1 #4b, 11 of 18)
 
-Phase 1 #4b ships ten invariants split into Tier 1 (critical) and
-Tier 2 (high). Tier 3 belt-and-suspenders checks defer to Phase 1.5.
+Phase 1 #4b wires eleven of the eighteen checks: ten invariants split
+into Tier 1 (critical) and Tier 2 (high), plus the decode-failed
+structural fault path. The seven Tier 3 belt-and-suspenders checks
+defer to Phase 1.5.
 
 **Tier 1 (CRITICAL, direct attack vectors against pool revenue or
 consensus rejection)**
@@ -152,7 +154,7 @@ consensus rejection)**
 Plus structural fault paths: `v2_invariant_decode_failed` on bad hex
 or unparseable bytes, and the `Skipped` path noted above.
 
-### Deferred invariants (Phase 1.5, 8 of 18)
+### Deferred invariants (Phase 1.5, 7 of 18)
 
 The following Tier 3 belt-and-suspenders checks are wired in
 `rg-consensus` and mirrored as `VerdictReason` and `ReasonCode`
