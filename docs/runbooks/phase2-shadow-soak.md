@@ -38,7 +38,7 @@ If the bar is not met, tune `tolerance_pct` downward toward `2.0` and re-soak be
    curl --user "$VELDRA_BITCOIND_RPC_USER:$VELDRA_BITCOIND_RPC_PASS" \
      -d '{"jsonrpc":"1.0","id":"soak","method":"getrawmempool","params":[false]}' \
      -H 'content-type: application/json' \
-     "$VELDRA_BITCOIND_RPC_URL" | jq 'length'
+     "$VELDRA_BITCOIND_RPC_URL" | jq '.result | length'
    ```
    Expect a non-zero integer within a few hundred ms. If the call hangs, fix the bitcoind path before T+0.
 3. Baseline the four Phase 2 counters and gauges. Run:
