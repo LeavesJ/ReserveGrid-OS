@@ -23,7 +23,17 @@ feature-depth = 1
 # and libflate 2.2.1→2.3.0 + rand 0.8.5→0.8.6 bumps cleared their match
 # criteria. If either ID resurfaces on a future dep change, re-add with
 # justification rather than silently ignoring.
-ignore = ["RUSTSEC-2025-0134"]
+#
+# proc-macro-error2 v2.0.1 is unmaintained (RUSTSEC-2026-0173, published
+# 2026-06). Reaches the workspace only via rg-dashboard's rust-embed
+# "compression" feature: rust-embed 8.11.0 → include-flate 0.3.3 →
+# include-flate-codegen 0.3.3 → proc-macro-error2 2.0.1. Build-time
+# proc-macro, no runtime path. The advisory offers no safe upgrade.
+# Structural exit if the ignore overstays: drop the compression feature
+# (assets embed raw, larger binary) or rust-embed sheds include-flate
+# upstream. Remove this ignore the moment the chain no longer pulls
+# proc-macro-error2.
+ignore = ["RUSTSEC-2025-0134", "RUSTSEC-2026-0173"]
 
 [licenses]
 allow = [

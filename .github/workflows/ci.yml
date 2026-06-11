@@ -64,7 +64,11 @@ jobs:
         run: cargo install cargo-audit --locked
 
       - name: Advisory scan
-        run: cargo audit --ignore RUSTSEC-2026-0049
+        # Mirror of deny.toml [advisories] ignore per R-122. RUSTSEC-2026-0173
+        # is unmaintained proc-macro-error2 via rg-dashboard's rust-embed
+        # compression chain. The former RUSTSEC-2026-0049 ignore cleared
+        # 2026-04-21 (rustls 0.22.4 left the lock) and is dropped as stale.
+        run: cargo audit --ignore RUSTSEC-2026-0173
 
   deny:
     runs-on: ubuntu-latest
