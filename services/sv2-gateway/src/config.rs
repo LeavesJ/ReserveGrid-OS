@@ -697,6 +697,23 @@ pub fn validate(config: &GatewayConfig) -> Result<Vec<String>, String> {
         ));
     }
 
+    // PB-15: the verdict-starvation degrade trigger only fires if a pending
+    // template can outlive auto_degrade_after_ms before the SEC-004 sweep
+    // evicts it at max_template_age_ms and releases its dedup entry, which
+    // resets the age clock on re-propose (R-107 ordering dependency).
+    if config.gateway.auto_degrade
+        && config.mode.enforces_verdicts()
+        && config.gateway.auto_degrade_after_ms >= config.gateway.max_template_age_ms
+    {
+        warnings.push(format!(
+            "auto_degrade_after_ms ({}) is not below \
+             max_template_age_ms ({}); the stale-pending sweep will \
+             evict and re-propose a starved template before the \
+             verdict-starvation degrade can fire",
+            config.gateway.auto_degrade_after_ms, config.gateway.max_template_age_ms,
+        ));
+    }
+
     Ok(warnings)
 }
 

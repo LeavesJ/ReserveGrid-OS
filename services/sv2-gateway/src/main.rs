@@ -1242,6 +1242,11 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
     let mut degraded_since: Option<Instant> = None;
     let mut unenforced_jobs: u64 = 0;
     let mut last_verifier_ack = Instant::now();
+    // PB-15 D2: why we degraded decides how we recover. Heartbeat-triggered
+    // degrades recover on the next `HeartbeatAck`; verdict-starvation
+    // degrades recover only when a verdict actually arrives, so a verifier
+    // that heartbeats while never answering proposes cannot flap the mode.
+    let mut degrade_trigger: Option<DegradeTrigger> = None;
     // Check degradation on a sub-threshold cadence so the transition
     // fires promptly after the threshold is crossed.
     let degrade_check_interval =
@@ -1349,6 +1354,46 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                             "verdict received"
                         );
 
+                        // PB-15 D2: a verdict is the recovery signal for a
+                        // starvation-triggered degrade; heartbeats alone are
+                        // not (see the degrade and `HeartbeatAck` arms; keep
+                        // this block in sync with the heartbeat recovery).
+                        if degraded
+                            && degrade_trigger == Some(DegradeTrigger::VerdictStarved)
+                        {
+                            let dur_ms = degraded_since.map_or(0, |s| {
+                                u64::try_from(s.elapsed().as_millis())
+                                    .unwrap_or(u64::MAX)
+                            });
+                            let recover_evt =
+                                sv2_gateway::shares::ModeTransitionEvent {
+                                    event_type: "mode_transition",
+                                    direction: "recovered",
+                                    timestamp_ms:
+                                        sv2_gateway::shares::unix_ms_now(),
+                                    degraded_duration_ms: dur_ms,
+                                    unenforced_jobs,
+                                };
+                            if let Ok(line) = serde_json::to_string(&recover_evt)
+                            {
+                                info!(target: "share_events", "{}", line);
+                            }
+                            degraded = false;
+                            degraded_since = None;
+                            unenforced_jobs = 0;
+                            degrade_trigger = None;
+                            readiness.clear_degraded();
+                            gw_metrics
+                                .mode_transitions_total
+                                .get_or_create(&ModeTransitionLabels {
+                                    direction: "recovered".into(),
+                                })
+                                .inc();
+                            info!(
+                                "verdict service restored; resuming enforcement"
+                            );
+                        }
+
                         if cfg.mode.enforces_verdicts() {
                             if let Some(pending) = pending_templates.remove(&v.id) {
                                 pending_order.retain(|&id| id != v.id);
@@ -1409,7 +1454,12 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                     }
                     Ok(sv2_gateway::verifier_stream::VerifierInbound::HeartbeatAck) => {
                         last_verifier_ack = Instant::now();
-                        if degraded {
+                        // PB-15 D2 flap guard: a heartbeat proves liveness,
+                        // not verdict service. Starvation-triggered degrades
+                        // recover in the Verdict arm instead, so a verifier
+                        // that heartbeats but never answers proposes cannot
+                        // oscillate the mode every threshold tick.
+                        if degraded && heartbeat_recovery_allowed(degrade_trigger) {
                             let dur_ms = degraded_since.map_or(0, |s| {
                                 u64::try_from(s.elapsed().as_millis())
                                     .unwrap_or(u64::MAX)
@@ -1434,6 +1484,7 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                             degraded = false;
                             degraded_since = None;
                             unenforced_jobs = 0;
+                            degrade_trigger = None;
                             readiness.clear_degraded();
                             stale_hold_deadline = None;
                             // Drain any pending templates that accumulated
@@ -1625,27 +1676,16 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                 }
             }
 
-            // SEC-004: periodic sweep of stale pending templates.
+            // SEC-004: periodic sweep of stale pending templates, with H-4
+            // parity on the dedup cache (PB-15 D1; see helper docs).
             _ = pending_sweep_ticker.tick() => {
                 let max_age = Duration::from_millis(cfg.gateway.max_template_age_ms);
-                let before = pending_templates.len();
-                pending_templates.retain(|tid, pt| {
-                    let age = pt.received_at.elapsed();
-                    if age > max_age {
-                        warn!(
-                            template_id = tid,
-                            age_ms = u64::try_from(age.as_millis()).unwrap_or(u64::MAX),
-                            "evicting stale pending template (exceeded max_template_age_ms)"
-                        );
-                        false
-                    } else {
-                        true
-                    }
-                });
-                let evicted = before - pending_templates.len();
-                if evicted > 0 {
-                    pending_order.retain(|id| pending_templates.contains_key(id));
-                }
+                sweep_stale_pending_templates(
+                    &mut pending_templates,
+                    &mut pending_order,
+                    &mut dedup_cache,
+                    max_age,
+                );
             }
 
             // Stale hold timer expiry (inline mode only).
@@ -1696,10 +1736,20 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
 
             // Automatic inline-to-observe degradation check.
             _ = degrade_check_ticker.tick() => {
-                if auto_degrade_enabled
-                    && !degraded
-                    && last_verifier_ack.elapsed() > auto_degrade_threshold
-                {
+                // PB-15 D2: heartbeat staleness catches a dead link; oldest
+                // pending age catches a live link whose verdict service has
+                // stopped (R-173: liveness is not the data invariant).
+                let oldest_pending_age = pending_order
+                    .front()
+                    .and_then(|id| pending_templates.get(id))
+                    .map(|pt| pt.received_at.elapsed());
+                let trigger = degrade_trigger_for(
+                    last_verifier_ack.elapsed(),
+                    oldest_pending_age,
+                    auto_degrade_threshold,
+                );
+                if auto_degrade_enabled && !degraded && trigger.is_some() {
+                    degrade_trigger = trigger;
                     degraded = true;
                     degraded_since = Some(Instant::now());
                     unenforced_jobs = 0;
@@ -1739,15 +1789,19 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                     if let Ok(line) = serde_json::to_string(&degrade_evt) {
                         info!(target: "share_events", "{}", line);
                     }
+                    let oldest_pending_ms = oldest_pending_age
+                        .map(|a| u64::try_from(a.as_millis()).unwrap_or(u64::MAX));
                     error!(
-                        elapsed_ms =
+                        heartbeat_elapsed_ms =
                             u64::try_from(
                                 last_verifier_ack.elapsed().as_millis()
                             )
                             .unwrap_or(u64::MAX),
+                        oldest_pending_ms = ?oldest_pending_ms,
                         threshold_ms =
                             cfg.gateway.auto_degrade_after_ms,
-                        "verifier heartbeat lost; entering degraded \
+                        trigger = degrade_trigger.map_or("none", DegradeTrigger::as_str),
+                        "verifier service degraded; entering degraded \
                          mode (verdict enforcement suspended)"
                     );
                 }
@@ -1775,6 +1829,88 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
 struct PendingTemplate {
     template: TemplateResponse,
     received_at: Instant,
+}
+
+/// PB-15 D2: why the gateway entered degraded mode. The trigger decides the
+/// recovery signal (see `heartbeat_recovery_allowed`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DegradeTrigger {
+    /// No `HeartbeatAck` within the threshold: the verifier link is dead.
+    HeartbeatStale,
+    /// Heartbeats flow but the oldest pending template has waited past the
+    /// threshold without a verdict: the link is alive, the service is not.
+    VerdictStarved,
+}
+
+impl DegradeTrigger {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::HeartbeatStale => "verifier_heartbeat_stale",
+            Self::VerdictStarved => "verifier_verdict_starved",
+        }
+    }
+}
+
+/// Pure decision for the auto-degrade check (PB-15 D2). Heartbeat staleness
+/// takes precedence (dead link subsumes starved service); verdict starvation
+/// catches the heartbeat-alive, verdict-silent upstream that R-173 warns
+/// about: liveness signals are not the data invariant.
+fn degrade_trigger_for(
+    heartbeat_age: Duration,
+    oldest_pending_age: Option<Duration>,
+    threshold: Duration,
+) -> Option<DegradeTrigger> {
+    if heartbeat_age > threshold {
+        return Some(DegradeTrigger::HeartbeatStale);
+    }
+    if oldest_pending_age.is_some_and(|age| age > threshold) {
+        return Some(DegradeTrigger::VerdictStarved);
+    }
+    None
+}
+
+/// PB-15 D2 flap guard: heartbeat-triggered degrades recover on heartbeat;
+/// starvation-triggered degrades require an actual verdict (handled in the
+/// Verdict arm), so a heartbeating-but-unresponsive verifier cannot
+/// oscillate modes every threshold tick.
+fn heartbeat_recovery_allowed(trigger: Option<DegradeTrigger>) -> bool {
+    trigger != Some(DegradeTrigger::VerdictStarved)
+}
+
+/// SEC-004 sweep with H-4 parity (PB-15 D1): evict pending templates older
+/// than `max_age` AND release them from the dedup cache so the next poll can
+/// re-propose an unchanged template. Without the dedup release a quiet chain
+/// starves permanently after a single lost verdict: the swept template never
+/// re-enters `pending_templates`, `latest_job` stays `None`, and miners that
+/// open channels receive no initial job. Returns the eviction count.
+fn sweep_stale_pending_templates(
+    pending_templates: &mut HashMap<u64, PendingTemplate>,
+    pending_order: &mut VecDeque<u64>,
+    dedup_cache: &mut sv2_gateway::jobs::TemplateDedupCache,
+    max_age: Duration,
+) -> usize {
+    let mut swept: Vec<(u64, String)> = Vec::new();
+    pending_templates.retain(|tid, pt| {
+        let age = pt.received_at.elapsed();
+        if age > max_age {
+            warn!(
+                template_id = tid,
+                age_ms = u64::try_from(age.as_millis()).unwrap_or(u64::MAX),
+                "evicting stale pending template (exceeded max_template_age_ms)"
+            );
+            swept.push((*tid, pt.template.source_instance_id.clone()));
+            false
+        } else {
+            true
+        }
+    });
+    if !swept.is_empty() {
+        pending_order.retain(|id| pending_templates.contains_key(id));
+        for (tid, src) in &swept {
+            dedup_cache.remove(src, *tid);
+        }
+    }
+    swept.len()
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -2557,5 +2693,142 @@ mod key_reload_tests {
         let _ = std::fs::remove_file(&path);
         // Suppress unused variable warning.
         let _ = new_pubkey_hex;
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod pb15_tests {
+    use super::*;
+
+    fn mk_template(id: u64, src: &str) -> TemplateResponse {
+        serde_json::from_value(serde_json::json!({
+            "template_id": id,
+            "block_height": 100,
+            "block_version": 0x2000_0000_u32,
+            "prev_hash": "00".repeat(32),
+            "nbits": 0x207f_ffff_u32,
+            "min_ntime": 1,
+            "curtime": 2,
+            "coinbase_value": 5_000_000_000_u64,
+            "coinbase_tx_prefix": "01",
+            "coinbase_tx_suffix": "02",
+            "merkle_path": [],
+            "tx_count": 1,
+            "total_fees": 0,
+            "source_instance_id": src,
+        }))
+        .expect("template fixture deserializes")
+    }
+
+    #[test]
+    fn sweep_releases_dedup_so_template_can_repropose() {
+        let mut dedup = sv2_gateway::jobs::TemplateDedupCache::new(64);
+        // First sighting marks it seen; second is a duplicate.
+        assert!(!dedup.is_duplicate("src-a", 7));
+        assert!(dedup.is_duplicate("src-a", 7));
+
+        let mut pending: HashMap<u64, PendingTemplate> = HashMap::new();
+        let mut order: VecDeque<u64> = VecDeque::new();
+        pending.insert(
+            7,
+            PendingTemplate {
+                template: mk_template(7, "src-a"),
+                // Backdate: Instant::elapsed() is only guaranteed
+                // non-decreasing, so a just-created Instant could read
+                // exactly zero on coarse-tick platforms.
+                received_at: Instant::now()
+                    .checked_sub(Duration::from_millis(5))
+                    .unwrap_or_else(Instant::now),
+            },
+        );
+        order.push_back(7);
+
+        // max_age zero: any positive elapsed time is stale.
+        let evicted = sweep_stale_pending_templates(
+            &mut pending,
+            &mut order,
+            &mut dedup,
+            Duration::ZERO,
+        );
+        assert_eq!(evicted, 1);
+        assert!(pending.is_empty());
+        assert!(order.is_empty());
+        // PB-15 D1: the poll path can now re-propose the same template.
+        assert!(!dedup.is_duplicate("src-a", 7));
+    }
+
+    #[test]
+    fn sweep_keeps_fresh_pendings_and_their_dedup_entries() {
+        let mut dedup = sv2_gateway::jobs::TemplateDedupCache::new(64);
+        assert!(!dedup.is_duplicate("src-a", 9));
+
+        let mut pending: HashMap<u64, PendingTemplate> = HashMap::new();
+        let mut order: VecDeque<u64> = VecDeque::new();
+        pending.insert(
+            9,
+            PendingTemplate {
+                template: mk_template(9, "src-a"),
+                received_at: Instant::now(),
+            },
+        );
+        order.push_back(9);
+
+        let evicted = sweep_stale_pending_templates(
+            &mut pending,
+            &mut order,
+            &mut dedup,
+            Duration::from_secs(3600),
+        );
+        assert_eq!(evicted, 0);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(order.len(), 1);
+        // Still deduped: the template remains pending, not re-proposable.
+        assert!(dedup.is_duplicate("src-a", 9));
+    }
+
+    #[test]
+    fn degrade_trigger_prefers_heartbeat_then_catches_starvation() {
+        let t = Duration::from_secs(10);
+        assert_eq!(
+            degrade_trigger_for(Duration::from_secs(11), None, t),
+            Some(DegradeTrigger::HeartbeatStale)
+        );
+        assert_eq!(
+            degrade_trigger_for(
+                Duration::from_secs(11),
+                Some(Duration::from_secs(99)),
+                t
+            ),
+            Some(DegradeTrigger::HeartbeatStale)
+        );
+        assert_eq!(
+            degrade_trigger_for(
+                Duration::from_secs(1),
+                Some(Duration::from_secs(11)),
+                t
+            ),
+            Some(DegradeTrigger::VerdictStarved)
+        );
+        assert_eq!(
+            degrade_trigger_for(
+                Duration::from_secs(1),
+                Some(Duration::from_secs(2)),
+                t
+            ),
+            None
+        );
+        assert_eq!(degrade_trigger_for(Duration::from_secs(1), None, t), None);
+    }
+
+    #[test]
+    fn heartbeat_recovery_blocked_while_verdict_starved() {
+        assert!(heartbeat_recovery_allowed(None));
+        assert!(heartbeat_recovery_allowed(Some(
+            DegradeTrigger::HeartbeatStale
+        )));
+        assert!(!heartbeat_recovery_allowed(Some(
+            DegradeTrigger::VerdictStarved
+        )));
     }
 }

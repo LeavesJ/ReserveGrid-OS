@@ -224,6 +224,10 @@ if [[ "$MINER_EXIT" == "0" ]]; then
   pass "T13: Test miner completed (exit 0, 5 shares submitted)"
 else
   fail "T13: Test miner exited with code ${MINER_EXIT}"
+  # PB-15 forensics: a starved miner is a gateway-side story (pending
+  # templates, dedup, degrade transitions), invisible from miner logs alone.
+  info "T13: dumping gateway/verifier/template-manager logs for forensics"
+  docker compose logs --no-color --tail=120 sv2-gateway pool-verifier template-manager 2>/dev/null || true
 fi
 
 # ── T14: Verify stats updated after test miner ──────────────────────────────
