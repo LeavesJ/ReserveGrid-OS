@@ -7,8 +7,11 @@
 # integration-only issues). Any failure prints the gate name and stops.
 #
 # Usage:
-#   ./scripts/superscan.sh          # full scan
-#   ./scripts/superscan.sh --quick  # skip audit/deny/vet (faster)
+#   ./scripts/superscan.sh             # full scan (CI mirror)
+#   ./scripts/superscan.sh --quick     # skip audit/deny/vet (faster)
+#   ./scripts/superscan.sh --deep      # CI mirror + static category gates
+#   ./scripts/superscan.sh --deep-only # static category gates only (no cargo;
+#                                      # runs in any sandbox with the repo)
 # ─────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -25,9 +28,13 @@ FAILURES=()
 QUICK=false
 START_TIME=$(date +%s)
 
+DEEP=false
+DEEP_ONLY=false
 for arg in "$@"; do
   case "$arg" in
     --quick) QUICK=true ;;
+    --deep) DEEP=true ;;
+    --deep-only) DEEP=true; DEEP_ONLY=true ;;
   esac
 done
 
@@ -36,7 +43,12 @@ gate() {
   shift
   printf "${CYAN}[SCAN]${NC} %-50s" "$name"
   if "$@" > /tmp/superscan_out.txt 2>&1; then
-    printf "${GREEN}PASS${NC}\n"
+    if grep -q "WARN" /tmp/superscan_out.txt 2>/dev/null; then
+      printf "${YELLOW}PASS*${NC}\n"
+      grep "WARN\|:" /tmp/superscan_out.txt | head -8 | sed 's/^/  > /'
+    else
+      printf "${GREEN}PASS${NC}\n"
+    fi
     PASS_COUNT=$((PASS_COUNT + 1))
   else
     printf "${RED}FAIL${NC}\n"
@@ -60,6 +72,8 @@ echo "════════════════════════�
 echo "  ReserveGrid OS — superscan (local CI mirror)"
 echo "════════════════════════════════════════════════════════════════"
 echo ""
+
+if ! $DEEP_ONLY; then
 
 # ── 1. Format ──────────────────────────────────────────────────────
 gate "cargo fmt --all --check" \
@@ -234,6 +248,184 @@ gate "no large files (>5MB) staged" \
       exit 1
     fi
   '
+
+fi  # end !DEEP_ONLY
+
+# ═══════════════════════════════════════════════════════════════════
+# DEEP SECTION (--deep / --deep-only). Static category gates from the
+# 2026-06-11 deep-scan rework. Pure bash and grep, no cargo, no
+# network; runs anywhere the repo is checked out. Categories mapped
+# from the infra checklist; N/A categories (Kubernetes, AWS, Kafka,
+# FTP, ML, LB/proxy, sharding) are recorded in the deep-scan report,
+# not here.
+# ═══════════════════════════════════════════════════════════════════
+if $DEEP; then
+
+# ── D1. Containerization: pinned bases, restart policies ─────────
+gate "deep: Dockerfile bases pinned (no :latest)" \
+  bash -c '
+    HITS=$(grep -rn "^FROM .*:latest" services/*/Dockerfile* Dockerfile* 2>/dev/null || true)
+    if [ -n "$HITS" ]; then echo "ERROR: unpinned base images:"; echo "$HITS"; exit 1; fi
+  '
+gate "deep: compose services carry restart policy (warn)" \
+  bash -c '
+    for f in docker-compose*.yml; do
+      [ -f "$f" ] || continue
+      SVCS=$(grep -cE "^  [a-z0-9-]+:" "$f" || true)
+      RST=$(grep -c "restart:" "$f" || true)
+      if [ "$RST" -lt "$SVCS" ]; then
+        echo "WARN: $f has $SVCS services, $RST restart policies"
+      fi
+    done
+    exit 0
+  '
+
+# ── D2. Firewall/bind posture: loopback defaults (R-93/R-134) ────
+gate "deep: no 0.0.0.0 binds in non-test Rust" \
+  bash -c '
+    HITS=$(grep -rn "0\.0\.0\.0" services/ --include="*.rs" 2>/dev/null \
+      | grep -vE "tests?\.rs|/tests/" \
+      | grep -vE ":[0-9]+:\s*//" || true)
+    PRUNED=""
+    while IFS= read -r line; do
+      [ -z "$line" ] && continue
+      FILE=$(echo "$line" | cut -d: -f1)
+      LNO=$(echo "$line" | cut -d: -f2)
+      START=$((LNO > 40 ? LNO - 40 : 1))
+      if ! sed -n "${START},${LNO}p" "$FILE" | grep -qE "cfg\(test\)|mod tests|#\[test\]"; then
+        PRUNED="$PRUNED$line\n"
+      fi
+    done <<< "$HITS"
+    if [ -n "$PRUNED" ]; then printf "ERROR: non-loopback binds outside tests:\n$PRUNED"; exit 1; fi
+  '
+
+# ── D3. WebSockets: size limits on every config (R-157/R-95) ─────
+gate "deep: WebSocketConfig sets message+frame limits" \
+  bash -c '
+    FILES=$(grep -rln "WebSocketConfig" services/ --include="*.rs" 2>/dev/null || true)
+    BAD=""
+    for f in $FILES; do
+      grep -q "max_message_size" "$f" || BAD="$BAD $f(no max_message_size)"
+      grep -q "max_frame_size" "$f" || BAD="$BAD $f(no max_frame_size)"
+    done
+    if [ -n "$BAD" ]; then echo "ERROR: unbounded websocket configs:$BAD"; exit 1; fi
+  '
+
+# ── D4. Embedded DB: SQLite opens carry timeout/pragma (warn) ────
+gate "deep: SQLite opens near busy_timeout/pragma (warn)" \
+  bash -c '
+    FILES=$(grep -rln "Connection::open" services/ --include="*.rs" 2>/dev/null || true)
+    for f in $FILES; do
+      if ! grep -qiE "busy_timeout|pragma" "$f"; then
+        echo "WARN: $f opens SQLite without visible busy_timeout/pragma"
+      fi
+    done
+    exit 0
+  '
+
+# ── D5. Rate limiting coverage (R-84) (warn) ─────────────────────
+gate "deep: HTTP services reference the rate limiter (warn)" \
+  bash -c '
+    for f in $(grep -rln "axum::serve\|Router::new" services/ --include="*.rs" 2>/dev/null | cut -d/ -f1-2 | sort -u); do
+      SVC=$f
+      if ! grep -rq "RateLimiter\|rate_limit" "$SVC/src" 2>/dev/null; then
+        echo "WARN: $SVC serves HTTP without visible rate limiting"
+      fi
+    done
+    exit 0
+  '
+
+# ── D6. Error logging: silent result drops (informational) ──────
+gate "deep: let _ = count (informational)" \
+  bash -c '
+    COUNT=$(grep -rn "let _ =" services/ --include="*.rs" 2>/dev/null | grep -vE "/tests/|tests?\.rs" | wc -l | tr -d " ")
+    echo "let _ = occurrences outside test files: $COUNT (April 2026 baseline: 7)"
+    exit 0
+  '
+
+# ── D7. RPC hygiene: credentials never logged ────────────────────
+gate "deep: no RPC password in tracing macros" \
+  bash -c '
+    # Flag only interpolation of secret-bearing variables into log macros
+    # (%var, ?var, var = binds), not prose messages that mention passwords.
+    HITS=$(grep -rnE "(error|warn|info|debug|trace)!\(.*([%?](rpc_)?pass(word)?\b|pass(word)?\s*=\s*[%?]|rpc_pass|RPC_PASS|BITCOIND_RPC_PASS)" services/ --include="*.rs" 2>/dev/null \
+      | grep -vE "redact|\\*\\*\\*|len\(\)|\"[^\"]*pass[^\"]*\"\s*\)" || true)
+    if [ -n "$HITS" ]; then echo "ERROR: possible credential logging:"; echo "$HITS"; exit 1; fi
+  '
+
+# ── D8. Caching: mempool state machine integrity ─────────────────
+gate "deep: MempoolState carries all four states" \
+  bash -c '
+    F=services/pool-verifier/src/mempool_view.rs
+    for v in Fresh Stale Degraded Unprimed; do
+      grep -q "$v" "$F" || { echo "ERROR: MempoolState missing $v"; exit 1; }
+    done
+  '
+
+# ── D9. CI/CD + config parity: compose env vars wired (R-164) ───
+gate "deep: every compose VELDRA_ var is read in code" \
+  bash -c '
+    # Allowlist: vars consumed by third-party container images, not our code.
+    ALLOW="VELDRA_GRAFANA_ADMIN_PASSWORD"
+    VARS=$(grep -hoE "VELDRA_[A-Z_]+" docker-compose*.yml 2>/dev/null | sort -u)
+    MISSING=""
+    for v in $VARS; do
+      echo "$ALLOW" | grep -qw "$v" && continue
+      grep -rq "$v" services/ --include="*.rs" 2>/dev/null || MISSING="$MISSING $v"
+    done
+    if [ -n "$MISSING" ]; then echo "ERROR: compose vars never read in code:$MISSING"; exit 1; fi
+  '
+
+# ── D10. Git hygiene: private docs never tracked (TP-3) ──────────
+gate "deep: no private docs tracked" \
+  bash -c '
+    HITS=$(git ls-files | grep -iE "pitch|founder|linkedin|meeting|bizlog|execlog|testlog|devlog|lesson|blocker|deep_scan|outreach|handoff|gtm|credibility" || true)
+    if [ -n "$HITS" ]; then echo "ERROR: private docs tracked:"; echo "$HITS"; exit 1; fi
+  '
+
+# ── D11. Deployments: Fly suspend trap (R-176) (warn) ────────────
+gate "deep: fly.toml keeps a machine warm (warn)" \
+  bash -c '
+    for f in $(find . -maxdepth 3 -name "fly.toml" -not -path "./.git/*" 2>/dev/null); do
+      if grep -q "min_machines_running = 0" "$f"; then
+        echo "WARN: $f has min_machines_running = 0 (R-176 suspend trap)"
+      fi
+    done
+    exit 0
+  '
+
+# ── D12. Canonical counts: reason-code stability (R-13/R-155) ───
+gate "deep: reason-code count assertions present" \
+  bash -c '
+    grep -q "37" services/rg-protocol/src/lib.rs || { echo "ERROR: VerdictReason count assertion missing"; exit 1; }
+    grep -qE "59|95" services/reservegrid-common/src/reason.rs || { echo "ERROR: reason count assertions missing"; exit 1; }
+    C=$(grep -rhoE "v2_invariant_[a-z0-9_]+" services/rg-protocol/src | sort -u | wc -l | tr -d " ")
+    [ "$C" = "22" ] || { echo "ERROR: rg-protocol v2_invariant_* count drifted: $C (expect 22)"; exit 1; }
+  '
+
+# ── D13. Observability: metric names single-suffix (R-177) ──────
+gate "deep: no _total in register() names" \
+  bash -c '
+    HITS=$(grep -rEA1 "register\(" services/ --include="*.rs" 2>/dev/null | grep -E "\"[a-z_]+_total\"" || true)
+    if [ -n "$HITS" ]; then echo "ERROR: counter registered with _total suffix:"; echo "$HITS"; exit 1; fi
+  '
+
+# ── D14. Polling: timeout literals outside config (warn) ────────
+gate "deep: hardcoded sleep literals (informational)" \
+  bash -c '
+    COUNT=$(grep -rnE "sleep\(Duration::from_(secs|millis)\([0-9]+\)" services/ --include="*.rs" 2>/dev/null | grep -vE "/tests/|tests?\.rs|backoff|jitter" | wc -l | tr -d " ")
+    echo "hardcoded sleep literals outside tests: $COUNT (R-116: prefer config fields)"
+    exit 0
+  '
+
+# ── D15. Encryption posture: no key material in tracked tree ────
+gate "deep: no key files tracked" \
+  bash -c '
+    HITS=$(git ls-files | grep -E "\.(pem|der|key|p12)$|id_(rsa|ed25519)" | grep -v "\.keep" || true)
+    if [ -n "$HITS" ]; then echo "ERROR: key material tracked:"; echo "$HITS"; exit 1; fi
+  '
+
+fi  # end DEEP
 
 # ── Summary ───────────────────────────────────────────────────────
 END_TIME=$(date +%s)
