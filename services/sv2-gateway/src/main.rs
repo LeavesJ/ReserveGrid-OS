@@ -2745,12 +2745,8 @@ mod pb15_tests {
         order.push_back(7);
 
         // max_age zero: any positive elapsed time is stale.
-        let evicted = sweep_stale_pending_templates(
-            &mut pending,
-            &mut order,
-            &mut dedup,
-            Duration::ZERO,
-        );
+        let evicted =
+            sweep_stale_pending_templates(&mut pending, &mut order, &mut dedup, Duration::ZERO);
         assert_eq!(evicted, 1);
         assert!(pending.is_empty());
         assert!(order.is_empty());
@@ -2795,27 +2791,15 @@ mod pb15_tests {
             Some(DegradeTrigger::HeartbeatStale)
         );
         assert_eq!(
-            degrade_trigger_for(
-                Duration::from_secs(11),
-                Some(Duration::from_secs(99)),
-                t
-            ),
+            degrade_trigger_for(Duration::from_secs(11), Some(Duration::from_secs(99)), t),
             Some(DegradeTrigger::HeartbeatStale)
         );
         assert_eq!(
-            degrade_trigger_for(
-                Duration::from_secs(1),
-                Some(Duration::from_secs(11)),
-                t
-            ),
+            degrade_trigger_for(Duration::from_secs(1), Some(Duration::from_secs(11)), t),
             Some(DegradeTrigger::VerdictStarved)
         );
         assert_eq!(
-            degrade_trigger_for(
-                Duration::from_secs(1),
-                Some(Duration::from_secs(2)),
-                t
-            ),
+            degrade_trigger_for(Duration::from_secs(1), Some(Duration::from_secs(2)), t),
             None
         );
         assert_eq!(degrade_trigger_for(Duration::from_secs(1), None, t), None);
