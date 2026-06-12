@@ -114,7 +114,12 @@ if $QUICK; then
   skip "cargo audit (--quick)"
 else
   if has_cmd cargo-audit; then
-    gate "cargo audit" cargo audit
+    # Ignore list mirrors .github/workflows/ci.yml (R-122). Scope note:
+    # this audits the FULL workspace lockfile including rg-desktop's
+    # tauri tree, which CI seds out; the extra strictness is deliberate
+    # (it caught RUSTSEC-2026-0104/0141 that CI's stale advisory cache
+    # missed on 2026-06-11).
+    gate "cargo audit" cargo audit --ignore RUSTSEC-2026-0173
   else
     skip "cargo audit (not installed)"
   fi
@@ -219,17 +224,14 @@ gate "no secrets in staged files" \
   '
 
 # ── 14. Cargo.lock in sync ────────────────────────────────────────
-gate "Cargo.lock in sync with Cargo.toml" \
-  bash -c '
-    cp Cargo.lock Cargo.lock.bak
-    cargo generate-lockfile 2>&1
-    if ! diff -q Cargo.lock Cargo.lock.bak >/dev/null 2>&1; then
-      echo "Cargo.lock was out of sync (regenerated). Stage and commit it."
-      mv Cargo.lock.bak Cargo.lock.bak.old
-      exit 1
-    fi
-    rm -f Cargo.lock.bak
-  '
+# Non-mutating sync check: --locked fails iff the committed lockfile does
+# not satisfy the manifests, and touches nothing. The previous
+# generate-lockfile approach REWROTE Cargo.lock in place and failed
+# whenever upstream published any newer compatible version, which is
+# drift availability, not desync (bit on 2026-06-11: mass-bumped the
+# working lockfile and left Cargo.lock.bak.old cruft).
+gate "Cargo.lock in sync (cargo metadata --locked)" \
+  bash -c 'cargo metadata --locked --format-version 1 > /dev/null'
 
 # ── 15. No large binary blobs staged ─────────────────────────────
 gate "no large files (>5MB) staged" \
