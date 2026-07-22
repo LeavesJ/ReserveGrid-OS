@@ -357,7 +357,7 @@ Mempool is empty or blocks are mined too aggressively. Regtest requires delibera
 
 ## License
 
-VELDRA SOURCE AVAILABLE LICENSE (see `LICENSE`)
+RESERVEGRID OS SOURCE AVAILABLE LICENSE (see `LICENSE`)
 
 ---
 
