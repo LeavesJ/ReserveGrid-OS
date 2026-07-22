@@ -1,4 +1,4 @@
-# Veldra — ReserveGrid OS
+ReserveGrid OS
 
 **ReserveGrid OS** is a policy driven verification, mining gateway, and observability stack for Bitcoin mining pools. It sits between the template source and miners, inspecting candidate block templates against operator defined policy and routing Stratum V2 work to connected workers. Operators get a full dashboard with live metrics, structured logs, and Prometheus instrumentation out of the box.
 
