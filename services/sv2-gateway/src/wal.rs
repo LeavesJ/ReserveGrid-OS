@@ -330,21 +330,37 @@ impl ShareWal {
 mod tests {
     use super::*;
 
+    /// Scratch WAL path inside a directory this test alone owns.
+    ///
+    /// `$TMPDIR` is shared across every worktree and every concurrent cargo
+    /// run, so a fixed directory name lets one run's teardown delete a file
+    /// another run is mid write in. pid plus nanoseconds is the same shape
+    /// as `ScratchDir` in the integration tests. The directory is fresh, so
+    /// callers do not pre-clean it.
     fn temp_wal_path(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join("rg_wal_tests");
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("rg-wal-{name}-{pid}-{nanos}"));
         let _ = std::fs::create_dir_all(&dir);
         dir.join(format!("{name}.ndjson"))
     }
 
+    /// Tear down the directory `temp_wal_path` handed out. It belongs to one
+    /// test in one process, so removing the tree whole cannot touch another
+    /// run's state, and it covers the `.wal.tmp` compaction file without
+    /// naming it.
     fn cleanup(path: &Path) {
-        let _ = std::fs::remove_file(path);
-        let _ = std::fs::remove_file(path.with_extension("wal.tmp"));
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     #[test]
     fn empty_wal_opens_clean() {
         let path = temp_wal_path("empty_open");
-        cleanup(&path);
         let wal = ShareWal::open(&path, 100).unwrap();
         assert_eq!(wal.pending_count(), 0);
         cleanup(&path);
@@ -353,7 +369,6 @@ mod tests {
     #[test]
     fn mark_pending_then_completed() {
         let path = temp_wal_path("pending_completed");
-        cleanup(&path);
         let mut wal = ShareWal::open(&path, 100).unwrap();
         wal.mark_pending("aaa", "bbb").unwrap();
         assert_eq!(wal.pending_count(), 1);
@@ -365,7 +380,6 @@ mod tests {
     #[test]
     fn recovery_emits_synthetic_events() {
         let path = temp_wal_path("recovery");
-        cleanup(&path);
 
         // Phase 1: write pending entries and drop (simulate crash).
         {
@@ -398,7 +412,6 @@ mod tests {
     #[test]
     fn compaction_rewrites_only_pending() {
         let path = temp_wal_path("compaction");
-        cleanup(&path);
 
         let mut wal = ShareWal::open(&path, 2).unwrap(); // threshold = 2
         wal.mark_pending("s1", "e1").unwrap();
@@ -420,7 +433,6 @@ mod tests {
     #[test]
     fn duplicate_completion_is_harmless() {
         let path = temp_wal_path("dup_complete");
-        cleanup(&path);
         let mut wal = ShareWal::open(&path, 100).unwrap();
         wal.mark_pending("s1", "e1").unwrap();
         wal.mark_completed("s1", "e1").unwrap();
@@ -433,7 +445,6 @@ mod tests {
     #[test]
     fn malformed_lines_skipped() {
         let path = temp_wal_path("malformed");
-        cleanup(&path);
 
         // Write a valid pending entry followed by garbage.
         {
@@ -458,7 +469,6 @@ mod tests {
     #[test]
     fn recovery_with_no_orphans_is_noop() {
         let path = temp_wal_path("no_orphans");
-        cleanup(&path);
 
         {
             let mut wal = ShareWal::open(&path, 100).unwrap();
@@ -476,7 +486,6 @@ mod tests {
     #[test]
     fn multiple_crash_cycles() {
         let path = temp_wal_path("multi_crash");
-        cleanup(&path);
 
         // Crash 1: leave s1 pending.
         {
@@ -535,7 +544,6 @@ mod tests {
         // writer replaced by /dev/full. open() itself can't fail here because
         // the path is writable; we only substitute the append handle.
         let path = temp_wal_path("dev_full");
-        cleanup(&path);
         let mut wal = ShareWal {
             path: path.clone(),
             pending: HashMap::new(),

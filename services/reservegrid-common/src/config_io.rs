@@ -119,8 +119,18 @@ mod tests {
 
     #[test]
     fn round_trip_write_read() {
-        let dir = std::env::temp_dir().join("rg_config_io_test");
-        let _ = fs::create_dir_all(&dir);
+        // `$TMPDIR` is shared across every worktree and every concurrent
+        // cargo run, so a fixed directory name lets one run's teardown
+        // delete the tree another run is mid write in. pid plus nanoseconds
+        // is the same shape as `ScratchDir` in the integration tests.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("rg-config-io-{pid}-{nanos}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create scratch dir");
         let path = dir.join("test.toml");
 
         let cfg = TestConfig {
