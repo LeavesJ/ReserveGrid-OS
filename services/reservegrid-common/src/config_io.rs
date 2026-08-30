@@ -117,20 +117,46 @@ mod tests {
         value: u32,
     }
 
+    /// Scratch directory this test alone owns, torn down on `Drop`.
+    ///
+    /// `$TMPDIR` is shared across every worktree and every concurrent cargo
+    /// run, so a fixed directory name lets one run's teardown delete the tree
+    /// another run is mid write in. pid plus nanoseconds is the same shape as
+    /// `ScratchDir` in the integration tests. Teardown belongs in `Drop`
+    /// rather than a trailing statement because a panicking test unwinds past
+    /// the statement, and with unique names that leaks a fresh directory on
+    /// every failing run instead of reusing one.
+    struct ScratchDir {
+        path: PathBuf,
+    }
+
+    impl ScratchDir {
+        fn new(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let pid = std::process::id();
+            let path = std::env::temp_dir().join(format!("rg-{tag}-{pid}-{nanos}"));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).expect("create scratch dir");
+            Self { path }
+        }
+
+        fn join(&self, leaf: &str) -> PathBuf {
+            self.path.join(leaf)
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
     #[test]
     fn round_trip_write_read() {
-        // `$TMPDIR` is shared across every worktree and every concurrent
-        // cargo run, so a fixed directory name lets one run's teardown
-        // delete the tree another run is mid write in. pid plus nanoseconds
-        // is the same shape as `ScratchDir` in the integration tests.
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let pid = std::process::id();
-        let dir = std::env::temp_dir().join(format!("rg-config-io-{pid}-{nanos}"));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("create scratch dir");
+        let dir = ScratchDir::new("config-io");
         let path = dir.join("test.toml");
 
         let cfg = TestConfig {
@@ -150,9 +176,6 @@ mod tests {
             bak_path.exists(),
             "backup file should exist after second write"
         );
-
-        // Cleanup
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

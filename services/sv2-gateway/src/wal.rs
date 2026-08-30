@@ -330,56 +330,66 @@ impl ShareWal {
 mod tests {
     use super::*;
 
-    /// Scratch WAL path inside a directory this test alone owns.
+    /// Scratch WAL file inside a directory this test alone owns, torn down
+    /// on `Drop`.
     ///
     /// `$TMPDIR` is shared across every worktree and every concurrent cargo
     /// run, so a fixed directory name lets one run's teardown delete a file
     /// another run is mid write in. pid plus nanoseconds is the same shape
-    /// as `ScratchDir` in the integration tests. The directory is fresh, so
-    /// callers do not pre-clean it.
-    fn temp_wal_path(name: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let pid = std::process::id();
-        let dir = std::env::temp_dir().join(format!("rg-wal-{name}-{pid}-{nanos}"));
-        let _ = std::fs::create_dir_all(&dir);
-        dir.join(format!("{name}.ndjson"))
+    /// as `ScratchDir` in the integration tests, and the directory is fresh,
+    /// so callers do not pre-clean it. Teardown belongs in `Drop` rather than
+    /// a trailing statement because a panicking test unwinds past the
+    /// statement, and with unique names that leaks a fresh directory on every
+    /// failing run instead of reusing one. `Drop` also covers the `.wal.tmp`
+    /// compaction file without naming it.
+    struct WalScratch {
+        dir: PathBuf,
+        path: PathBuf,
     }
 
-    /// Tear down the directory `temp_wal_path` handed out. It belongs to one
-    /// test in one process, so removing the tree whole cannot touch another
-    /// run's state, and it covers the `.wal.tmp` compaction file without
-    /// naming it.
-    fn cleanup(path: &Path) {
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::remove_dir_all(dir);
+    impl WalScratch {
+        fn new(name: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let pid = std::process::id();
+            let dir = std::env::temp_dir().join(format!("rg-wal-{name}-{pid}-{nanos}"));
+            std::fs::create_dir_all(&dir).expect("create scratch dir");
+            let path = dir.join(format!("{name}.ndjson"));
+            Self { dir, path }
+        }
+    }
+
+    impl Drop for WalScratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
 
     #[test]
     fn empty_wal_opens_clean() {
-        let path = temp_wal_path("empty_open");
+        let scratch = WalScratch::new("empty_open");
+        let path = scratch.path.clone();
         let wal = ShareWal::open(&path, 100).unwrap();
         assert_eq!(wal.pending_count(), 0);
-        cleanup(&path);
     }
 
     #[test]
     fn mark_pending_then_completed() {
-        let path = temp_wal_path("pending_completed");
+        let scratch = WalScratch::new("pending_completed");
+        let path = scratch.path.clone();
         let mut wal = ShareWal::open(&path, 100).unwrap();
         wal.mark_pending("aaa", "bbb").unwrap();
         assert_eq!(wal.pending_count(), 1);
         wal.mark_completed("aaa", "bbb").unwrap();
         assert_eq!(wal.pending_count(), 0);
-        cleanup(&path);
     }
 
     #[test]
     fn recovery_emits_synthetic_events() {
-        let path = temp_wal_path("recovery");
+        let scratch = WalScratch::new("recovery");
+        let path = scratch.path.clone();
 
         // Phase 1: write pending entries and drop (simulate crash).
         {
@@ -406,12 +416,12 @@ mod tests {
 
         // After recovery, pending is empty.
         assert_eq!(wal.pending_count(), 0);
-        cleanup(&path);
     }
 
     #[test]
     fn compaction_rewrites_only_pending() {
-        let path = temp_wal_path("compaction");
+        let scratch = WalScratch::new("compaction");
+        let path = scratch.path.clone();
 
         let mut wal = ShareWal::open(&path, 2).unwrap(); // threshold = 2
         wal.mark_pending("s1", "e1").unwrap();
@@ -427,24 +437,24 @@ mod tests {
         drop(wal);
         let wal2 = ShareWal::open(&path, 100).unwrap();
         assert_eq!(wal2.pending_count(), 1);
-        cleanup(&path);
     }
 
     #[test]
     fn duplicate_completion_is_harmless() {
-        let path = temp_wal_path("dup_complete");
+        let scratch = WalScratch::new("dup_complete");
+        let path = scratch.path.clone();
         let mut wal = ShareWal::open(&path, 100).unwrap();
         wal.mark_pending("s1", "e1").unwrap();
         wal.mark_completed("s1", "e1").unwrap();
         // Second completion should be a no-op.
         wal.mark_completed("s1", "e1").unwrap();
         assert_eq!(wal.pending_count(), 0);
-        cleanup(&path);
     }
 
     #[test]
     fn malformed_lines_skipped() {
-        let path = temp_wal_path("malformed");
+        let scratch = WalScratch::new("malformed");
+        let path = scratch.path.clone();
 
         // Write a valid pending entry followed by garbage.
         {
@@ -463,12 +473,12 @@ mod tests {
 
         let wal = ShareWal::open(&path, 100).unwrap();
         assert_eq!(wal.pending_count(), 1);
-        cleanup(&path);
     }
 
     #[test]
     fn recovery_with_no_orphans_is_noop() {
-        let path = temp_wal_path("no_orphans");
+        let scratch = WalScratch::new("no_orphans");
+        let path = scratch.path.clone();
 
         {
             let mut wal = ShareWal::open(&path, 100).unwrap();
@@ -480,12 +490,12 @@ mod tests {
         assert_eq!(wal.pending_count(), 0);
         let recovery = wal.recover();
         assert!(recovery.synthetic_events.is_empty());
-        cleanup(&path);
     }
 
     #[test]
     fn multiple_crash_cycles() {
-        let path = temp_wal_path("multi_crash");
+        let scratch = WalScratch::new("multi_crash");
+        let path = scratch.path.clone();
 
         // Crash 1: leave s1 pending.
         {
@@ -514,8 +524,6 @@ mod tests {
             assert_eq!(r.synthetic_events.len(), 1);
             assert_eq!(r.synthetic_events[0].share_id_hex, "s2");
         }
-
-        cleanup(&path);
     }
 
     /// When the underlying writer returns an I/O error, `mark_pending` and
@@ -543,7 +551,8 @@ mod tests {
         // Hand-construct a WAL pointed at a throwaway tmp path but with the
         // writer replaced by /dev/full. open() itself can't fail here because
         // the path is writable; we only substitute the append handle.
-        let path = temp_wal_path("dev_full");
+        let scratch = WalScratch::new("dev_full");
+        let path = scratch.path.clone();
         let mut wal = ShareWal {
             path: path.clone(),
             pending: HashMap::new(),
@@ -570,7 +579,6 @@ mod tests {
         );
         // In-memory pending must NOT have been updated on failure.
         assert_eq!(wal.pending_count(), 0);
-        cleanup(&path);
     }
 
     /// ENOSPC on Linux. Hardcoded rather than pulling in libc for one constant.
