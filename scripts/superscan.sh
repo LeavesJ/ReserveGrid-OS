@@ -325,16 +325,46 @@ gate "deep: SQLite opens near busy_timeout/pragma (warn)" \
     exit 0
   '
 
-# ── D5. Rate limiting coverage (R-84) (warn) ─────────────────────
-gate "deep: HTTP services reference the rate limiter (warn)" \
+# ── D5. Rate limiting coverage (R-84) ────────────────────────────
+# Enforcing since 2026-09-03. This check spent its life printing WARN and
+# then `exit 0`, so gate() took the success path, PASS_COUNT rose, and the
+# run ended with "All gates passed. Safe to push." on the same screen that
+# named services serving HTTP unprotected. A finding the summary line
+# contradicts is not a check.
+#
+# Making it fail honestly meant fixing what it detects, because two of the
+# four services it used to name were wrong. It grepped RateLimiter|rate_limit,
+# which is not what this codebase writes: pool-verifier and template-manager
+# both gate mutations through check_write_throttle(), and the old pattern
+# could not see it. Flipping exit 0 to exit 1 without this would have gone
+# red naming two services that are in fact limited — and the next person to
+# read it would have been right to distrust the check.
+#
+# The enumeration is also scoped to services/*/src now. That changes no
+# service today, but the old form read tests/ too, so a Router built only in
+# a test file could nominate its service for a limiter it never needed.
+#
+# If you exempt a service, put it in EXEMPT with the reason. Do not return
+# this check to exit 0 — that is the defect this commit removes.
+gate "deep: HTTP services enforce a rate limit" \
   bash -c '
-    for f in $(grep -rln "axum::serve\|Router::new" services/ --include="*.rs" 2>/dev/null | cut -d/ -f1-2 | sort -u); do
-      SVC=$f
-      if ! grep -rq "RateLimiter\|rate_limit" "$SVC/src" 2>/dev/null; then
-        echo "WARN: $SVC serves HTTP without visible rate limiting"
+    # Services deliberately shipped without a limiter. Format: name:reason.
+    EXEMPT=""
+    UNPROTECTED=""
+    for SVC in $(grep -rln "axum::serve\|Router::new" services/*/src --include="*.rs" 2>/dev/null | cut -d/ -f1-2 | sort -u); do
+      NAME=$(basename "$SVC")
+      case ":$EXEMPT:" in *":$NAME:"*) continue ;; esac
+      if ! grep -rqiE "RateLimiter|rate_limit|RateLimitLayer|throttle|governor|ConcurrencyLimit" "$SVC/src" 2>/dev/null; then
+        UNPROTECTED="$UNPROTECTED  $SVC
+"
       fi
     done
-    exit 0
+    if [ -n "$UNPROTECTED" ]; then
+      echo "ERROR: services serve HTTP with no visible rate limiting (R-84):"
+      printf "%s" "$UNPROTECTED"
+      echo "Arm a limiter, or add the service to EXEMPT in D5 with its reason."
+      exit 1
+    fi
   '
 
 # ── D6. Error logging: silent result drops (informational) ──────
