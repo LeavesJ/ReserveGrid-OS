@@ -389,12 +389,16 @@ async fn main() -> anyhow::Result<()> {
 
     std::fs::create_dir_all("data")?;
 
-    let policy_holder = crate::state::safe_initial_policy(&policy_path);
+    // PB-36: a policy that will not load is fatal unless the operator has
+    // explicitly acknowledged the risk, mirroring VELDRA_API_SECRET_OPTIONAL.
+    let allow_permissive_degrade =
+        std::env::var("VELDRA_ALLOW_PERMISSIVE_DEGRADE").as_deref() == Ok("1");
+    let (policy_holder, policy_degraded) =
+        crate::state::safe_initial_policy(&policy_path, allow_permissive_degrade)?;
 
-    // Track whether policy loaded from file (vs degraded built-in default).
-    let policy_ok = policy_holder.toml_text.starts_with("[policy]")
-        || policy_holder.toml_text.contains("[policy]");
-    POLICY_LOADED_OK.store(policy_ok, std::sync::atomic::Ordering::Relaxed);
+    // Whether the policy came from the file, reported as a fact by the loader
+    // rather than inferred by sniffing toml_text for a "[policy]" substring.
+    POLICY_LOADED_OK.store(!policy_degraded, std::sync::atomic::Ordering::Relaxed);
 
     // Phase 2 mempool view spawn-on-startup. Wired only when
     // `[policy.mempool] enforce = true` and the bitcoind RPC creds

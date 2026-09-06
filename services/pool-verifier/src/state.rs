@@ -78,14 +78,69 @@ pub fn load_initial_policy(path: &str) -> anyhow::Result<PolicyHolder> {
     })
 }
 
-pub fn safe_initial_policy(path: &str) -> PolicyHolder {
+/// Load the initial policy, refusing to boot on failure unless the operator
+/// has explicitly opted in to permissive degraded operation.
+///
+/// PB-36. This used to swallow ANY load, parse, validation or protocol
+/// failure and continue with a built-in policy that sets `min_total_fees = 0`,
+/// `max_tx_count = u32::MAX` and `reject_empty_templates = false`. A
+/// malformed, missing or rejected policy file did not stop the verifier; it
+/// converted it into one that accepts everything. Invariant 3 forbids exactly
+/// that shape: "no silent fallback". A loud ERROR line followed by a green
+/// process is a silent fallback with extra steps.
+///
+/// **Why refusing to boot is not worse than accepting everything.** Both end
+/// with unverified templates reaching miners. The difference is that a dead
+/// verifier is visible: the gateway loses the heartbeat, auto-degrades, and
+/// increments `svtwo_mode_transitions_total` (PB-15/16/17). An
+/// accept-everything verifier is invisible: every template returns Agreed and
+/// the process looks healthy. The failure is the same and only the
+/// observability differs, so the fix is to make it observable.
+///
+/// **Refusing everything was considered and rejected.** A verifier that
+/// rejects every template stops the pool mining entirely AND keeps answering
+/// verdicts, so the gateway's auto-degrade never fires and miners get no jobs
+/// with no signal. That is worse than exiting.
+///
+/// The escape hatch mirrors `VELDRA_API_SECRET_OPTIONAL`
+/// (`sv2-gateway/src/main.rs:74`), which the codebase already uses to let an
+/// operator acknowledge a specific risk rather than discover it. The flag is
+/// read from the environment by `main.rs` and passed in, so this stays
+/// testable without racing other tests over a process-global env var.
+///
+/// Returns the holder and whether it is the degraded built-in, so callers do
+/// not have to infer that by sniffing `toml_text` for a `[policy]` substring.
+pub fn safe_initial_policy(
+    path: &str,
+    allow_permissive_degrade: bool,
+) -> anyhow::Result<(PolicyHolder, bool)> {
     match load_initial_policy(path) {
-        Ok(h) => h,
+        Ok(h) => Ok((h, false)),
+        Err(e) if !allow_permissive_degrade => {
+            let missing = !std::path::Path::new(path).exists();
+            let remedy = if missing {
+                "The file does not exist. Supply one: config/README.md \
+                 documents copying a tracked policy as a starting point, \
+                 e.g. `cp config/policy-strict.toml config/policy.toml`."
+            } else {
+                "The file exists but could not be parsed or validated; the \
+                 cause is in the error chain above."
+            };
+            Err(e.context(format!(
+                "policy load failed for {path}, and the verifier will not \
+                 start. {remedy} A verifier that cannot load its policy \
+                 cannot verify, and the previous behaviour was to continue \
+                 with a built-in policy accepting every template without fee \
+                 enforcement while reporting healthy. To take that risk \
+                 deliberately, set VELDRA_ALLOW_PERMISSIVE_DEGRADE=1."
+            )))
+        }
         Err(e) => {
             error!(error = ?e, "policy load failed");
             error!(
-                "entering degraded mode with built-in default policy — \
-                 all templates will be accepted without fee enforcement"
+                "VELDRA_ALLOW_PERMISSIVE_DEGRADE=1 is set: entering degraded \
+                 mode with built-in default policy, all templates will be \
+                 accepted without fee enforcement"
             );
 
             // Use the repo-provided constructor (PolicyConfig is not Default).
@@ -120,10 +175,134 @@ pub fn safe_initial_policy(path: &str) -> PolicyHolder {
                 }
             }
 
-            PolicyHolder {
-                config: cfg,
-                toml_text: "# policy load failed; running with built-in defaults\n".to_string(),
-            }
+            Ok((
+                PolicyHolder {
+                    config: cfg,
+                    toml_text: "# policy load failed; running with built-in defaults\n".to_string(),
+                },
+                true,
+            ))
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    // PB-36: this function had NO tests at all, and state.rs had no test
+    // module, while it decided whether a verifier that cannot load its policy
+    // keeps running and accepts every template. The flag is a parameter rather
+    // than an env read precisely so these can run in parallel without racing
+    // a process-global.
+
+    fn write_temp(name: &str, contents: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join("rg_pb36_tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(name);
+        std::fs::write(&p, contents).unwrap();
+        p
+    }
+
+    /// A policy file that actually loads, so the happy path is not asserted
+    /// against a fixture that would fail for its own reasons.
+    fn valid_policy_toml() -> String {
+        let repo_policy =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/policy-prod.toml");
+        std::fs::read_to_string(repo_policy).expect("deploy/policy-prod.toml must exist")
+    }
+
+    #[test]
+    fn a_valid_policy_loads_and_is_not_degraded() {
+        let p = write_temp("pb36_valid.toml", &valid_policy_toml());
+        let (holder, degraded) = safe_initial_policy(p.to_str().unwrap(), false)
+            .expect("the repo's own production policy must load");
+        assert!(!degraded, "a policy that loaded must not report degraded");
+        assert!(
+            holder.toml_text.contains("[policy]"),
+            "the holder must carry the real file text"
+        );
+    }
+
+    #[test]
+    fn malformed_policy_refuses_to_boot_by_default() {
+        let p = write_temp("pb36_malformed.toml", "this is not TOML {{{");
+        let err = safe_initial_policy(p.to_str().unwrap(), false)
+            .expect_err("a malformed policy must NOT yield a running verifier");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("VELDRA_ALLOW_PERMISSIVE_DEGRADE"),
+            "the refusal must name the flag that would override it, or an \
+             operator cannot act on it. Got: {msg}"
+        );
+        assert!(
+            msg.contains("could not be parsed"),
+            "a file that EXISTS but is malformed must not be described as \
+             missing, or the operator is sent to create a file they have. \
+             Got: {msg}"
+        );
+    }
+
+    /// The most common way to meet this error is a fresh clone: the main
+    /// compose stack binds `/config/policy.toml`, which is gitignored and
+    /// operator-supplied, so `docker compose up` on a clean checkout used to
+    /// boot a verifier that accepted every template. The message must point
+    /// at the remedy rather than only at the override.
+    #[test]
+    fn a_missing_file_is_reported_as_missing_with_the_remedy() {
+        let p = std::env::temp_dir().join("rg_pb36_tests/absent_for_message.toml");
+        let _ = std::fs::remove_file(&p);
+        let err = safe_initial_policy(p.to_str().unwrap(), false).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("does not exist") && msg.contains("config/README.md"),
+            "a missing policy file must say it is missing and where the \
+             instructions are. Got: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_missing_policy_file_refuses_to_boot_by_default() {
+        let p = std::env::temp_dir().join("rg_pb36_tests/definitely_absent.toml");
+        let _ = std::fs::remove_file(&p);
+        assert!(
+            safe_initial_policy(p.to_str().unwrap(), false).is_err(),
+            "a missing policy file must not silently become accept-everything"
+        );
+    }
+
+    #[test]
+    fn a_policy_missing_the_policy_table_refuses_to_boot() {
+        // Parses as TOML but has no [policy] table: the shape an operator
+        // produces by editing the wrong file.
+        let p = write_temp("pb36_no_table.toml", "[server]\nport = 8081\n");
+        assert!(
+            safe_initial_policy(p.to_str().unwrap(), false).is_err(),
+            "valid TOML without a [policy] table must not boot permissively"
+        );
+    }
+
+    /// The escape hatch still works, and still reports what it did. If this
+    /// ever fails, an operator who deliberately accepted the risk is instead
+    /// looking at a verifier that will not start.
+    #[test]
+    fn the_opt_in_still_yields_the_permissive_policy_and_says_so() {
+        let p = write_temp("pb36_optin.toml", "this is not TOML {{{");
+        let (holder, degraded) = safe_initial_policy(p.to_str().unwrap(), true)
+            .expect("the explicit opt-in must still boot");
+        assert!(degraded, "the opt-in path must report itself as degraded");
+        assert_eq!(
+            holder.config.min_total_fees, 0,
+            "the degraded policy is the permissive one, unchanged by PB-36"
+        );
+        assert!(
+            !holder.toml_text.contains("[policy]"),
+            "the degraded holder must not masquerade as a loaded file"
+        );
     }
 }
