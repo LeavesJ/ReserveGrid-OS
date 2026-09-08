@@ -10,6 +10,8 @@ name = "rg-demo-feed"
 path = "src/main.rs"
 
 [dependencies]
+# PB-29: the shared per-IP tracker (carries no rustls).
+reservegrid-common = { path = "../reservegrid-common" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync", "signal"] }
 tokio-tungstenite = "0.26"
 futures-util = "0.3"
