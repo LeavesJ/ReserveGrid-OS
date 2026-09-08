@@ -26,9 +26,13 @@ The `status` field is either `"pending"` or `"completed"`. Both map to the `WalS
 
 ## Write Guarantees
 
-Each record is serialized to JSON with a trailing newline appended in a single buffer before `write_all`, followed by `flush`. This prevents partial (newline-less) lines on crash. The gateway does not call `fsync`; durability depends on the OS buffer flush behavior. On Linux ext4 with default mount options, a process crash (not a power loss) will preserve flushed data.
+Each record is serialized to JSON with a trailing newline appended in a single buffer before `write_all`, followed by `flush`. This prevents partial (newline-less) lines on crash. **As of PB-39 the flush is followed by `sync_data` (fdatasync)**, so a returned `Ok` means the record reached stable storage, not merely the kernel page cache. Before PB-39 this section read "The gateway does not call `fsync`", which was true of the code and contradicted `wal.rs`'s own module doc and two of its function docs, which promised an fsync that was never performed.
 
-**Guarantee level:** process crash safe. Not power loss safe without `O_SYNC` or explicit `fsync`. This is an acceptable tradeoff for a share relay because shares can be re-submitted by miners after a full host crash, and the WAL exists to preserve the accounting join invariant, not to guarantee share delivery.
+**Guarantee level (PB-39):** power loss safe for appends and for compaction. Appends `sync_data`; compaction `sync_all`s the replacement before the rename and syncs the parent directory after it, so the rename is durable too.
+
+**The tradeoff this section used to record, and why it changed.** It previously read: "process crash safe. Not power loss safe... This is an acceptable tradeoff for a share relay because shares can be re-submitted by miners after a full host crash, and the WAL exists to preserve the accounting join invariant, not to guarantee share delivery." That reasoning was coherent, and it lost to two facts. First, `wal.rs` itself claimed the stronger guarantee in three places, so an operator reading the module got a promise the code did not keep, and the two documents disagreed with each other as well as with the code. Second, the compaction path could lose EVERY pending record at once on power loss, not just recent ones, which the resubmit argument does not cover: a miner cannot resubmit a share whose accounting record vanished after the ACK.
+
+**What it costs, measured rather than assumed.** On the node's ext4 root, 2000 appends of a 221-byte record: 174,361/s with flush alone, 2,340/s with fdatasync. One accepted share costs TWO syncs (`mark_pending` then `mark_completed`) serialized on the same main select loop, so the practical ceiling is roughly 1,170 accepted shares/s. Past it, `share_event_tx` (bounded 4096) drops accounting events with only a warn, which re-opens the join hole this WAL exists to close. **PB-44 tracks moving the syncs off the select loop or batching them, which is the fix that removes the ceiling rather than documenting it.**
 
 ## Lifecycle
 
@@ -63,7 +67,7 @@ The WAL does not implement time or size based rotation. Compaction is the sole m
 
 ## Flush Semantics
 
-Each `append_record` call ends with `BufWriter::flush()`. This pushes data from userspace buffers to the kernel page cache. The kernel will write to disk asynchronously. For process crash safety this is sufficient because the kernel page cache survives process death.
+Each `append_record` call flushes the `BufWriter` and then calls `sync_data` on the underlying file (PB-39). The flush pushes data from userspace to the kernel page cache, which alone survives process death but not power loss; `sync_data` is the fdatasync that pushes it to stable storage, including the file length an append needs to be retrievable. Compaction additionally `sync_all`s the replacement file before `rename(2)` and syncs the parent directory afterwards, because a rename is directory metadata and is not durable until the directory is.
 
 ## Test Coverage
 
