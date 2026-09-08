@@ -201,8 +201,14 @@ mod tests {
     // than an env read precisely so these can run in parallel without racing
     // a process-global.
 
+    /// Per-process scratch. A fixed path raced two concurrent runs of this
+    /// crate's tests, which a T2 reviewer reproduced at the stated concurrency.
+    fn scratch() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("rg_pb36_{}", std::process::id()))
+    }
+
     fn write_temp(name: &str, contents: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join("rg_pb36_tests");
+        let dir = scratch();
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join(name);
         std::fs::write(&p, contents).unwrap();
@@ -215,6 +221,72 @@ mod tests {
         let repo_policy =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/policy-prod.toml");
         std::fs::read_to_string(repo_policy).expect("deploy/policy-prod.toml must exist")
+    }
+
+    /// The blocking finding from the PB-36 T2 review, turned into a test.
+    ///
+    /// Three dev/CI stacks named `/config/policy.toml`, which `.gitignore:45`
+    /// excludes, so a fresh clone and every CI checkout booted the verifier
+    /// with no policy at all. That was survivable only while a load failure
+    /// degraded silently to accept-everything. Making it fatal without fixing
+    /// the file the stacks name would have red-failed every PR: three CI jobs
+    /// boot those stacks, four services gate on `pool-verifier` being healthy,
+    /// and `docker-images` needs all three jobs.
+    ///
+    /// This walks every `docker-compose*.yml`, extracts the policy path each
+    /// one hands the verifier, maps it back through that service's bind mount
+    /// to a repo path, and loads it with the REAL loader. A stack that names a
+    /// file which is absent, gitignored, or does not parse fails here instead
+    /// of in CI.
+    #[test]
+    fn every_policy_the_shipped_stacks_reference_actually_loads() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&repo).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let is_compose = name.starts_with("docker-compose")
+                && path
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("yml"));
+            if !is_compose {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            for line in text.lines() {
+                let Some(rest) = line.trim().strip_prefix("VELDRA_POLICY_FILE:") else {
+                    continue;
+                };
+                let in_container = rest.trim();
+                let file = in_container.rsplit('/').next().unwrap();
+                // /config is bind-mounted from ./config in the dev stacks and
+                // from ./deploy in setup-b; try both rather than encode which.
+                let candidates = [
+                    repo.join("config").join(file),
+                    repo.join("deploy").join(file),
+                ];
+                let found = candidates.iter().find(|c| c.exists()).unwrap_or_else(|| {
+                    panic!(
+                        "{name} sets VELDRA_POLICY_FILE={in_container}, but {file} \
+                         exists in neither config/ nor deploy/. A stack that names a \
+                         policy file the repo does not carry boots a verifier with no \
+                         policy, and since PB-36 that is fatal."
+                    )
+                });
+                safe_initial_policy(found.to_str().unwrap(), false).unwrap_or_else(|e| {
+                    panic!(
+                        "{name} names {}, which does not load: {e:#}",
+                        found.display()
+                    )
+                });
+                checked += 1;
+            }
+        }
+        assert!(
+            checked >= 4,
+            "expected to check at least the four shipped stacks, checked {checked}. \
+             A parser that silently matches nothing is not a passing test."
+        );
     }
 
     #[test]
@@ -255,7 +327,7 @@ mod tests {
     /// at the remedy rather than only at the override.
     #[test]
     fn a_missing_file_is_reported_as_missing_with_the_remedy() {
-        let p = std::env::temp_dir().join("rg_pb36_tests/absent_for_message.toml");
+        let p = scratch().join("absent_for_message.toml");
         let _ = std::fs::remove_file(&p);
         let err = safe_initial_policy(p.to_str().unwrap(), false).unwrap_err();
         let msg = format!("{err:#}");
@@ -268,7 +340,7 @@ mod tests {
 
     #[test]
     fn a_missing_policy_file_refuses_to_boot_by_default() {
-        let p = std::env::temp_dir().join("rg_pb36_tests/definitely_absent.toml");
+        let p = scratch().join("definitely_absent.toml");
         let _ = std::fs::remove_file(&p);
         assert!(
             safe_initial_policy(p.to_str().unwrap(), false).is_err(),

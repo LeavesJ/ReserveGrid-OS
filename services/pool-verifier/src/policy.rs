@@ -264,13 +264,18 @@ impl PolicyMempool {
     /// half here and half at the call site.
     ///
     /// This is deliberately **not** part of [`PolicyConfig::validate`].
-    /// `state::safe_initial_policy` swallows a validation failure and
-    /// continues on a permissive built-in policy that accepts every
-    /// template, so routing this through `validate` would turn a
-    /// shipped placeholder from "checks nothing" into "accepts
-    /// everything" — a worse silent degradation, not a loud failure.
-    /// The gate belongs on the boot path, where the only outcome is a
-    /// non-zero exit.
+    /// When this was written, `state::safe_initial_policy` swallowed a
+    /// validation failure and continued on a permissive built-in policy,
+    /// so routing this through `validate` would have turned a shipped
+    /// placeholder from "checks nothing" into "accepts everything".
+    ///
+    /// PB-36 has since made that swallow fatal by default, so half of the
+    /// original reasoning no longer holds. The conclusion does. Under
+    /// `VELDRA_ALLOW_PERMISSIVE_DEGRADE=1` the permissive path is still
+    /// reachable, and an operator who set that flag to work around one
+    /// problem would silently acquire accept-everything on a placeholder
+    /// credential too. A boot-path gate is also the clearer failure: it
+    /// names the credential, where a validation error names a policy file.
     pub fn require_usable_credentials(&self, resolved_rpc_pass: &str) -> Result<(), String> {
         if is_placeholder_value(&self.rpc_url) {
             return Err(format!(

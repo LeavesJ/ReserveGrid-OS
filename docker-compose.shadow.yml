@@ -71,7 +71,17 @@ services:
       VELDRA_VERIFIER_ADDR: "0.0.0.0:9090"
       VELDRA_HTTP_ADDR: "0.0.0.0:8081"
       VELDRA_API_SECRET_OPTIONAL: "1"
-      VELDRA_POLICY_FILE: /config/policy.toml
+      # PB-36: this MUST name a TRACKED file. It used to be
+      # /config/policy.toml, which .gitignore:45 excludes, so a fresh clone
+      # and every CI checkout booted the verifier with no policy at all. That
+      # was survivable only because a policy load failure silently degraded to
+      # accept-everything; now it is fatal, so the stack has to carry its own
+      # policy. demo-open is the permissive one, which is what this dev/CI
+      # stack was already doing by accident: the change is that it now says so.
+      # Production is docker-compose.setup-b.yml, which reads the tracked
+      # deploy/policy-prod.toml. Guarded by
+      # every_policy_the_shipped_stacks_reference_actually_loads.
+      VELDRA_POLICY_FILE: /config/demo-open-policy.toml
       VELDRA_VERIFIER_CONFIG: /config/verifier.toml
       VELDRA_MODE: shadow
       # PB-26 ingress connection cap, pinned at the shipped default.
