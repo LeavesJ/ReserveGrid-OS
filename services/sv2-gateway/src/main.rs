@@ -606,6 +606,10 @@ struct GatewayMetrics {
     share_forward_total: Family<ForwardLabels, Counter>,
     mode_transitions_total: Family<ModeTransitionLabels, Counter>,
     vardiff_retargets_total: Family<VardiffLabels, Counter>,
+    /// PB-44. Accounting events dropped because `share_event_tx` was full.
+    /// Unlabelled on purpose: there is one channel and one reason, and a
+    /// label with a single value is a false promise of dimensionality.
+    share_events_dropped_total: Counter,
 }
 
 impl GatewayMetrics {
@@ -620,6 +624,7 @@ impl GatewayMetrics {
             share_forward_total: Family::default(),
             mode_transitions_total: Family::default(),
             vardiff_retargets_total: Family::default(),
+            share_events_dropped_total: Counter::default(),
         };
         registry.register(
             "svtwo_shares",
@@ -630,6 +635,11 @@ impl GatewayMetrics {
             "svtwo_connections",
             "Total TCP connections accepted",
             m.connections_total.clone(),
+        );
+        registry.register(
+            "svtwo_share_events_dropped",
+            "Accounting events dropped because the share event queue was full (PB-44). Every increment is an accepted, ACKed, relayed share with no WAL pending record, which is the join invariant the WAL exists to protect",
+            m.share_events_dropped_total.clone(),
         );
         registry.register(
             "svtwo_connections_active",
@@ -2371,6 +2381,7 @@ async fn accept_loop(
                                 channel_registry: conn_channel_registry,
                                 vardiff_retarget_up: retarget_up,
                                 vardiff_retarget_down: retarget_down,
+                                share_events_dropped: conn_metrics.share_events_dropped_total.clone(),
                             };
 
                             let exit = sv2_gateway::handler::run_connection(ctx).await;

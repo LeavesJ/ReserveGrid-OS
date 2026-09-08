@@ -188,6 +188,8 @@ pub struct ConnectionContext {
     pub channel_registry: SharedChannelRegistry,
     pub vardiff_retarget_up: Counter,
     pub vardiff_retarget_down: Counter,
+    /// PB-44: incremented whenever an accounting event is dropped.
+    pub share_events_dropped: Counter,
 }
 
 /// Run the full SV2 session lifecycle for one connection.
@@ -212,6 +214,7 @@ pub async fn run_connection(ctx: ConnectionContext) -> HandlerExit {
         channel_registry,
         vardiff_retarget_up,
         vardiff_retarget_down,
+        share_events_dropped,
     } = ctx;
     let peer_state = PeerState::new(peer);
     let mut share_dedup = ShareDedupSet::new(config.share_dedup_window_size);
@@ -233,6 +236,7 @@ pub async fn run_connection(ctx: ConnectionContext) -> HandlerExit {
         &channel_registry,
         &vardiff_retarget_up,
         &vardiff_retarget_down,
+        &share_events_dropped,
     )
     .await;
 
@@ -272,6 +276,7 @@ async fn run_connection_inner(
     channel_registry: &SharedChannelRegistry,
     vardiff_retarget_up: &Counter,
     vardiff_retarget_down: &Counter,
+    share_events_dropped: &Counter,
 ) -> (HandlerExit, Vec<u32>) {
     let mut opened_ids: Vec<u32> = Vec::new();
 
@@ -354,6 +359,7 @@ async fn run_connection_inner(
                             &mut opened_ids,
                             vardiff_retarget_up,
                             vardiff_retarget_down,
+                    share_events_dropped,
                         ).await;
                         match action {
                             FrameAction::Continue => {}
@@ -1138,6 +1144,7 @@ async fn handle_miner_frame(
     opened_ids: &mut Vec<u32>,
     vardiff_retarget_up: &Counter,
     vardiff_retarget_down: &Counter,
+    share_events_dropped: &Counter,
 ) -> FrameAction {
     // Reject non-base-protocol extension types.
     if header.extension_type & 0x7FFF != 0 {
@@ -1166,6 +1173,7 @@ async fn handle_miner_frame(
                 payload,
                 vardiff_retarget_up,
                 vardiff_retarget_down,
+                share_events_dropped,
             )
             .await
             {
@@ -1186,6 +1194,7 @@ async fn handle_miner_frame(
                 payload,
                 vardiff_retarget_up,
                 vardiff_retarget_down,
+                share_events_dropped,
             )
             .await
             {
@@ -1272,6 +1281,7 @@ async fn handle_submit_shares(
     payload: &[u8],
     vardiff_retarget_up: &Counter,
     vardiff_retarget_down: &Counter,
+    share_events_dropped: &Counter,
 ) -> Result<(), HandlerExit> {
     let share = match sv2_codec::SubmitSharesStandard::decode(payload) {
         Ok(s) => s,
@@ -1305,7 +1315,15 @@ async fn handle_submit_shares(
             share.job_id,
         );
         if let Err(e) = share_event_tx.try_send(evt) {
-            warn!(error = %e, "share_event_tx full; share event dropped");
+            share_events_dropped.inc();
+            warn!(
+                error = %e,
+                reason_code = GatewayReason::ShareDroppedQueueFull.as_str(),
+                "share_event_tx full; accounting event dropped. The share was \
+                 accepted, ACKed and relayed, but has NO pending WAL record, \
+                 so a crash before its forward result loses it silently \
+                 (PB-44)"
+            );
         }
         return send_share_error(
             transport,
@@ -1334,7 +1352,15 @@ async fn handle_submit_shares(
             share.job_id,
         );
         if let Err(e) = share_event_tx.try_send(evt) {
-            warn!(error = %e, "share_event_tx full; share event dropped");
+            share_events_dropped.inc();
+            warn!(
+                error = %e,
+                reason_code = GatewayReason::ShareDroppedQueueFull.as_str(),
+                "share_event_tx full; accounting event dropped. The share was \
+                 accepted, ACKed and relayed, but has NO pending WAL record, \
+                 so a crash before its forward result loses it silently \
+                 (PB-44)"
+            );
         }
         return send_share_error(
             transport,
@@ -1378,7 +1404,15 @@ async fn handle_submit_shares(
             share.job_id,
         );
         if let Err(e) = share_event_tx.try_send(evt) {
-            warn!(error = %e, "share_event_tx full; share event dropped");
+            share_events_dropped.inc();
+            warn!(
+                error = %e,
+                reason_code = GatewayReason::ShareDroppedQueueFull.as_str(),
+                "share_event_tx full; accounting event dropped. The share was \
+                 accepted, ACKed and relayed, but has NO pending WAL record, \
+                 so a crash before its forward result loses it silently \
+                 (PB-44)"
+            );
         }
         return send_share_error(
             transport,
@@ -1418,7 +1452,15 @@ async fn handle_submit_shares(
             share.job_id,
         );
         if let Err(e) = share_event_tx.try_send(evt) {
-            warn!(error = %e, "share_event_tx full; share event dropped");
+            share_events_dropped.inc();
+            warn!(
+                error = %e,
+                reason_code = GatewayReason::ShareDroppedQueueFull.as_str(),
+                "share_event_tx full; accounting event dropped. The share was \
+                 accepted, ACKed and relayed, but has NO pending WAL record, \
+                 so a crash before its forward result loses it silently \
+                 (PB-44)"
+            );
         }
         return send_share_error(
             transport,
@@ -1457,7 +1499,15 @@ async fn handle_submit_shares(
             share.job_id,
         );
         if let Err(e) = share_event_tx.try_send(evt) {
-            warn!(error = %e, "share_event_tx full; share event dropped");
+            share_events_dropped.inc();
+            warn!(
+                error = %e,
+                reason_code = GatewayReason::ShareDroppedQueueFull.as_str(),
+                "share_event_tx full; accounting event dropped. The share was \
+                 accepted, ACKed and relayed, but has NO pending WAL record, \
+                 so a crash before its forward result loses it silently \
+                 (PB-44)"
+            );
         }
         return send_share_error(
             transport,
@@ -1514,7 +1564,15 @@ async fn handle_submit_shares(
             difficulty_u64: 0,
         };
         if let Err(e) = share_event_tx.try_send(evt) {
-            warn!(error = %e, "share_event_tx full; share event dropped");
+            share_events_dropped.inc();
+            warn!(
+                error = %e,
+                reason_code = GatewayReason::ShareDroppedQueueFull.as_str(),
+                "share_event_tx full; accounting event dropped. The share was \
+                 accepted, ACKed and relayed, but has NO pending WAL record, \
+                 so a crash before its forward result loses it silently \
+                 (PB-44)"
+            );
         }
         return send_share_error(
             transport,
@@ -1551,7 +1609,15 @@ async fn handle_submit_shares(
             difficulty_u64: 0,
         };
         if let Err(e) = share_event_tx.try_send(evt) {
-            warn!(error = %e, "share_event_tx full; share event dropped");
+            share_events_dropped.inc();
+            warn!(
+                error = %e,
+                reason_code = GatewayReason::ShareDroppedQueueFull.as_str(),
+                "share_event_tx full; accounting event dropped. The share was \
+                 accepted, ACKed and relayed, but has NO pending WAL record, \
+                 so a crash before its forward result loses it silently \
+                 (PB-44)"
+            );
         }
         return send_share_error(
             transport,
@@ -1658,7 +1724,15 @@ async fn handle_submit_shares(
             difficulty_u64: 0,
         };
         if let Err(e) = share_event_tx.try_send(evt) {
-            warn!(error = %e, "share_event_tx full; share event dropped");
+            share_events_dropped.inc();
+            warn!(
+                error = %e,
+                reason_code = GatewayReason::ShareDroppedQueueFull.as_str(),
+                "share_event_tx full; accounting event dropped. The share was \
+                 accepted, ACKed and relayed, but has NO pending WAL record, \
+                 so a crash before its forward result loses it silently \
+                 (PB-44)"
+            );
         }
         return send_share_error(
             transport,
@@ -1686,7 +1760,14 @@ async fn handle_submit_shares(
         difficulty_u64: difficulty,
     };
     if let Err(e) = share_event_tx.try_send(evt) {
-        warn!(error = %e, "share_event_tx full; share event dropped");
+        share_events_dropped.inc();
+        warn!(
+            error = %e,
+            reason_code = GatewayReason::ShareDroppedQueueFull.as_str(),
+            "share_event_tx full; accounting event dropped. The share was \
+             accepted, ACKed and relayed, but has NO pending WAL record, so a \
+             crash before its forward result loses it silently (PB-44)"
+        );
     }
 
     let success = sv2_codec::SubmitSharesSuccess {
@@ -1755,6 +1836,7 @@ async fn handle_submit_shares_extended(
     payload: &[u8],
     vardiff_retarget_up: &Counter,
     vardiff_retarget_down: &Counter,
+    share_events_dropped: &Counter,
 ) -> Result<(), HandlerExit> {
     let share = match sv2_codec::SubmitSharesExtended::decode(payload) {
         Ok(s) => s,
@@ -1789,7 +1871,15 @@ async fn handle_submit_shares_extended(
             share.job_id,
         );
         if let Err(e) = share_event_tx.try_send(evt) {
-            warn!(error = %e, "share_event_tx full; share event dropped");
+            share_events_dropped.inc();
+            warn!(
+                error = %e,
+                reason_code = GatewayReason::ShareDroppedQueueFull.as_str(),
+                "share_event_tx full; accounting event dropped. The share was \
+                 accepted, ACKed and relayed, but has NO pending WAL record, \
+                 so a crash before its forward result loses it silently \
+                 (PB-44)"
+            );
         }
         return send_share_error(
             transport,
@@ -1816,7 +1906,15 @@ async fn handle_submit_shares_extended(
             share.job_id,
         );
         if let Err(e) = share_event_tx.try_send(evt) {
-            warn!(error = %e, "share_event_tx full; share event dropped");
+            share_events_dropped.inc();
+            warn!(
+                error = %e,
+                reason_code = GatewayReason::ShareDroppedQueueFull.as_str(),
+                "share_event_tx full; accounting event dropped. The share was \
+                 accepted, ACKed and relayed, but has NO pending WAL record, \
+                 so a crash before its forward result loses it silently \
+                 (PB-44)"
+            );
         }
         return send_share_error(
             transport,
@@ -1897,7 +1995,15 @@ async fn handle_submit_shares_extended(
             share.job_id,
         );
         if let Err(e) = share_event_tx.try_send(evt) {
-            warn!(error = %e, "share_event_tx full; share event dropped");
+            share_events_dropped.inc();
+            warn!(
+                error = %e,
+                reason_code = GatewayReason::ShareDroppedQueueFull.as_str(),
+                "share_event_tx full; accounting event dropped. The share was \
+                 accepted, ACKed and relayed, but has NO pending WAL record, \
+                 so a crash before its forward result loses it silently \
+                 (PB-44)"
+            );
         }
         return send_share_error(
             transport,
@@ -1936,7 +2042,15 @@ async fn handle_submit_shares_extended(
             share.job_id,
         );
         if let Err(e) = share_event_tx.try_send(evt) {
-            warn!(error = %e, "share_event_tx full; share event dropped");
+            share_events_dropped.inc();
+            warn!(
+                error = %e,
+                reason_code = GatewayReason::ShareDroppedQueueFull.as_str(),
+                "share_event_tx full; accounting event dropped. The share was \
+                 accepted, ACKed and relayed, but has NO pending WAL record, \
+                 so a crash before its forward result loses it silently \
+                 (PB-44)"
+            );
         }
         return send_share_error(
             transport,
@@ -1973,7 +2087,15 @@ async fn handle_submit_shares_extended(
             share.job_id,
         );
         if let Err(e) = share_event_tx.try_send(evt) {
-            warn!(error = %e, "share_event_tx full; share event dropped");
+            share_events_dropped.inc();
+            warn!(
+                error = %e,
+                reason_code = GatewayReason::ShareDroppedQueueFull.as_str(),
+                "share_event_tx full; accounting event dropped. The share was \
+                 accepted, ACKed and relayed, but has NO pending WAL record, \
+                 so a crash before its forward result loses it silently \
+                 (PB-44)"
+            );
         }
         return send_share_error(
             transport,
@@ -2031,7 +2153,15 @@ async fn handle_submit_shares_extended(
             difficulty_u64: 0,
         };
         if let Err(e) = share_event_tx.try_send(evt) {
-            warn!(error = %e, "share_event_tx full; share event dropped");
+            share_events_dropped.inc();
+            warn!(
+                error = %e,
+                reason_code = GatewayReason::ShareDroppedQueueFull.as_str(),
+                "share_event_tx full; accounting event dropped. The share was \
+                 accepted, ACKed and relayed, but has NO pending WAL record, \
+                 so a crash before its forward result loses it silently \
+                 (PB-44)"
+            );
         }
         return send_share_error(
             transport,
@@ -2068,7 +2198,15 @@ async fn handle_submit_shares_extended(
             difficulty_u64: 0,
         };
         if let Err(e) = share_event_tx.try_send(evt) {
-            warn!(error = %e, "share_event_tx full; share event dropped");
+            share_events_dropped.inc();
+            warn!(
+                error = %e,
+                reason_code = GatewayReason::ShareDroppedQueueFull.as_str(),
+                "share_event_tx full; accounting event dropped. The share was \
+                 accepted, ACKed and relayed, but has NO pending WAL record, \
+                 so a crash before its forward result loses it silently \
+                 (PB-44)"
+            );
         }
         return send_share_error(
             transport,
@@ -2170,7 +2308,15 @@ async fn handle_submit_shares_extended(
             difficulty_u64: 0,
         };
         if let Err(e) = share_event_tx.try_send(evt) {
-            warn!(error = %e, "share_event_tx full; share event dropped");
+            share_events_dropped.inc();
+            warn!(
+                error = %e,
+                reason_code = GatewayReason::ShareDroppedQueueFull.as_str(),
+                "share_event_tx full; accounting event dropped. The share was \
+                 accepted, ACKed and relayed, but has NO pending WAL record, \
+                 so a crash before its forward result loses it silently \
+                 (PB-44)"
+            );
         }
         return send_share_error(
             transport,
@@ -2198,7 +2344,14 @@ async fn handle_submit_shares_extended(
         difficulty_u64: difficulty,
     };
     if let Err(e) = share_event_tx.try_send(evt) {
-        warn!(error = %e, "share_event_tx full; share event dropped");
+        share_events_dropped.inc();
+        warn!(
+            error = %e,
+            reason_code = GatewayReason::ShareDroppedQueueFull.as_str(),
+            "share_event_tx full; accounting event dropped. The share was \
+             accepted, ACKed and relayed, but has NO pending WAL record, so a \
+             crash before its forward result loses it silently (PB-44)"
+        );
     }
 
     let success = sv2_codec::SubmitSharesSuccess {
@@ -2413,6 +2566,11 @@ mod tests {
     }
 
     /// A throwaway submission used only to occupy the relay queue.
+    /// A throwaway accounting event used only to occupy the queue.
+    fn pb38_filler_event() -> ShareAcceptedEvent {
+        ShareAcceptedEvent::sentinel(&GatewayReason::ShareDroppedQueueFull, 1, 0, 1)
+    }
+
     fn pb38_filler_submission() -> ShareSubmission {
         ShareSubmission {
             share_id_hex: "00".repeat(32),
@@ -2466,9 +2624,63 @@ mod tests {
     /// with a genuinely saturated relay queue, and return the SV2 `msg_type`
     /// the miner actually receives. `extended` selects which of the two
     /// handlers is exercised; PB-38 notes the defect repeats in both.
+    /// Build the two queues with exactly one of them saturated.
+    ///
+    /// Extracted because both PB-38 (forward queue) and PB-44 (accounting
+    /// queue) need it, and because inlining both branches pushed the harness
+    /// past the 100-line lint. Each branch asserts its own saturation, so a
+    /// queue that silently had room fails here rather than passing vacuously.
+    #[allow(clippy::type_complexity)]
+    fn pb38_saturated_queues(
+        saturate_events: bool,
+    ) -> (
+        mpsc::Sender<ShareSubmission>,
+        mpsc::Receiver<ShareSubmission>,
+        mpsc::Sender<ShareAcceptedEvent>,
+        mpsc::Receiver<ShareAcceptedEvent>,
+    ) {
+        let fwd_cap = if saturate_events { 64 } else { 1 };
+        let (fwd_tx, fwd_rx) = mpsc::channel::<ShareSubmission>(fwd_cap);
+        if !saturate_events {
+            fwd_tx
+                .try_send(pb38_filler_submission())
+                .expect("first send fills the queue");
+            assert!(
+                fwd_tx.try_send(pb38_filler_submission()).is_err(),
+                "forward queue must be saturated or this test proves nothing"
+            );
+        }
+
+        // PB-44: capacity one, filled, receiver held so it cannot drain.
+        let evt_cap = if saturate_events { 1 } else { 64 };
+        let (evt_tx, evt_rx) = mpsc::channel::<ShareAcceptedEvent>(evt_cap);
+        if saturate_events {
+            evt_tx
+                .try_send(pb38_filler_event())
+                .expect("first send fills the accounting queue");
+            assert!(
+                evt_tx.try_send(pb38_filler_event()).is_err(),
+                "accounting queue must be saturated or this test proves nothing"
+            );
+        }
+        (fwd_tx, fwd_rx, evt_tx, evt_rx)
+    }
+
+    /// Drives one real share through the real handler over a real
+    /// Noise-handshaked transport, with one of the two queues saturated.
+    ///
+    /// `saturate_events` picks which. The forward queue is PB-38 (the miner
+    /// must be told the share was rejected). The accounting queue is PB-44
+    /// (the share is accepted and relayed, but its WAL pending record is
+    /// lost, and until PB-44 that loss was a bare `warn!` with no
+    /// `reason_code` and no counter, so it was invisible in metrics).
+    ///
+    /// Returns the reply `msg_type`, its error code, the accounting events
+    /// that survived, and the value of the dropped-event counter.
     async fn pb38_reply_msg_type_on_full_queue(
         extended: bool,
-    ) -> (u8, String, Vec<(String, Option<String>)>) {
+        saturate_events: bool,
+    ) -> (u8, String, Vec<(String, Option<String>)>, u64) {
         use crate::transport::perform_handshake;
         use secp256k1::Keypair;
         use tokio::net::TcpListener;
@@ -2482,15 +2694,11 @@ mod tests {
 
         // Saturate the relay queue: capacity one, already occupied. The
         // receiver is held so the queue cannot drain.
-        let (share_forward_tx, _share_forward_rx) = mpsc::channel::<ShareSubmission>(1);
-        share_forward_tx
-            .try_send(pb38_filler_submission())
-            .expect("first send fills the queue");
-        assert!(
-            share_forward_tx.try_send(pb38_filler_submission()).is_err(),
-            "queue must be saturated or this test proves nothing"
-        );
-        let (share_event_tx, mut share_event_rx) = mpsc::channel::<ShareAcceptedEvent>(64);
+        let (share_forward_tx, _share_forward_rx, share_event_tx, mut share_event_rx) =
+            pb38_saturated_queues(saturate_events);
+
+        let dropped = Counter::default();
+        let dropped_in_task = dropped.clone();
 
         #[allow(clippy::cast_possible_truncation)]
         let ntime = (unix_ms_now() / 1000) as u32;
@@ -2546,6 +2754,7 @@ mod tests {
                     &payload,
                     &up,
                     &down,
+                    &dropped_in_task,
                 )
                 .await
             } else {
@@ -2561,6 +2770,7 @@ mod tests {
                     &payload,
                     &up,
                     &down,
+                    &dropped_in_task,
                 )
                 .await
             }
@@ -2578,7 +2788,7 @@ mod tests {
         while let Ok(evt) = share_event_rx.try_recv() {
             events.push((evt.sv2_response.to_string(), evt.reason_code.clone()));
         }
-        (msg_type, error_code, events)
+        (msg_type, error_code, events, dropped.get())
     }
 
     /// The miner half of the PB-38 harness: complete the Noise handshake,
@@ -2705,15 +2915,46 @@ mod tests {
         );
     }
 
+    /// PB-44. A full accounting queue drops the record for a share that WAS
+    /// accepted, `ACKed` and relayed, so the share exists on the wire and
+    /// upstream with no pending WAL record. Before this, the loss was a bare
+    /// `warn!` with no `reason_code` and no counter, so `shares_total` (which
+    /// increments downstream of the `recv`) showed nothing and the drop was
+    /// invisible in metrics. The constitution forbids that twice over:
+    /// Invariant 3 "no swallowed channel send", and Delivery's requirement
+    /// that every rejection carry a `reason_code` metrics key off.
+    ///
+    /// This asserts the counter, not the log line, because a counter is what
+    /// an operator can alert on.
+    #[tokio::test]
+    async fn a_full_accounting_queue_increments_the_dropped_counter() {
+        let (_msg_type, _error_code, _events, dropped) =
+            pb38_reply_msg_type_on_full_queue(false, true).await;
+        assert!(
+            dropped > 0,
+            "the accounting queue was saturated and the share still went \
+             through, so at least one event must have been dropped AND \
+             counted. A zero here means the drop is still invisible, which is \
+             the worse half of PB-44."
+        );
+    }
+
     #[tokio::test]
     async fn full_forward_queue_rejects_a_standard_share_to_the_miner() {
-        let (msg_type, error_code, events) = pb38_reply_msg_type_on_full_queue(false).await;
+        let (msg_type, error_code, events, dropped) =
+            pb38_reply_msg_type_on_full_queue(false, false).await;
         pb38_assert_rejected(msg_type, &error_code, &events, "standard share");
+        assert_eq!(
+            dropped, 0,
+            "the accounting queue was healthy here; a drop would mean the \
+             PB-44 counter fires on the wrong condition"
+        );
     }
 
     #[tokio::test]
     async fn full_forward_queue_rejects_an_extended_share_to_the_miner() {
-        let (msg_type, error_code, events) = pb38_reply_msg_type_on_full_queue(true).await;
+        let (msg_type, error_code, events, _dropped) =
+            pb38_reply_msg_type_on_full_queue(true, false).await;
         pb38_assert_rejected(msg_type, &error_code, &events, "extended share");
     }
 
