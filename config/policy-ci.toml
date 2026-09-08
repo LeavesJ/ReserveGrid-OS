@@ -1,0 +1,46 @@
+# CI and local dev policy. NOT a production policy.
+#
+# PB-36. Until 2026-09-06 the dev and CI stacks named /config/policy.toml,
+# which .gitignore excludes, so a fresh checkout had no policy file and the
+# verifier silently degraded to a built-in accept-everything policy. Making
+# that degradation fatal exposed the dependency, and pointing the stacks at
+# demo-open-policy.toml did not fix it: demo-open sets
+# reject_empty_templates = true and non-zero fee floors, so on regtest, where
+# the mempool is empty, the inline stack rejected every template and
+# sv2-gateway could not produce a job.
+#
+# This file reproduces exactly what CI was already getting, so its behaviour is
+# unchanged and now explicit and tracked. The values are the built-in degraded
+# policy from state::safe_initial_policy, field for field.
+#
+# Do NOT copy this to a pool. It enforces nothing. Production is
+# deploy/policy-prod.toml, which docker-compose.setup-b.yml reads.
+# Guarded by every_policy_the_shipped_stacks_reference_actually_loads.
+
+[policy]
+protocol_version = 2
+required_prevhash_len = 64
+
+# Nothing to reject on: this stack exists to exercise the plumbing, and
+# regtest templates are empty and fee-free by construction.
+min_total_fees = 0
+max_tx_count = 4294967295
+min_avg_fee = 0
+low_mempool_tx = 0
+high_mempool_tx = 0
+tx_count_mid_threshold = 0
+tx_count_hi_threshold = 0
+min_avg_fee_lo = 0
+min_avg_fee_mid = 0
+min_avg_fee_hi = 0
+
+# The two that broke the inline stack under demo-open.
+reject_empty_templates = false
+reject_coinbase_zero = false
+
+unknown_mempool_as_high = true
+
+[policy.safety]
+max_weight_ratio = 0.999
+enforce_weight_ratio = false
+enforce_template_age = false

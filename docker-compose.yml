@@ -92,12 +92,14 @@ services:
       # and every CI checkout booted the verifier with no policy at all. That
       # was survivable only because a policy load failure silently degraded to
       # accept-everything; now it is fatal, so the stack has to carry its own
-      # policy. demo-open is the permissive one, which is what this dev/CI
-      # stack was already doing by accident: the change is that it now says so.
+      # policy. policy-ci.toml reproduces the built-in degraded policy field
+      # for field, so CI behaviour is unchanged and now explicit. demo-open was
+      # tried first and broke the inline stack: it sets reject_empty_templates
+      # = true, and regtest templates are empty.
       # Production is docker-compose.setup-b.yml, which reads the tracked
       # deploy/policy-prod.toml. Guarded by
       # every_policy_the_shipped_stacks_reference_actually_loads.
-      VELDRA_POLICY_FILE: /config/demo-open-policy.toml
+      VELDRA_POLICY_FILE: /config/policy-ci.toml
       VELDRA_VERIFIER_CONFIG: /config/verifier.toml
       # PB-26 ingress connection cap. Raised well above the shipped
       # default of 32 because this is the stack scripts/benchmark-release.sh
