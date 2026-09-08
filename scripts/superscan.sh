@@ -396,6 +396,51 @@ gate "deep: fly.toml keeps a machine warm (warn)" \
     exit 0
   '
 
+# ── D13. rustls provider resolution per shipped binary (PB-34) ──
+#
+# rustls 0.23 picks its provider from enabled crate features, and ZERO
+# candidates and TWO candidates fail IDENTICALLY at runtime with "Could not
+# automatically determine the process-level CryptoProvider". That ambiguity
+# produced PB-28, PB-30 and PB-32 across four call sites, each found only
+# after the panic was reachable in a shipped configuration.
+#
+# The rule PB-34 proposed was "exactly one provider". MEASURED AGAINST THIS
+# TREE, that rule is wrong and would fail on the current main: pool-verifier
+# and sv2-gateway each resolve TWO and are safe, because they call
+# reservegrid_common::crypto_provider::install_default() and stop relying on
+# automatic resolution. The rule that actually holds:
+#
+#   rustls absent from the graph  -> nothing to check
+#   exactly one provider          -> safe, resolves automatically
+#   zero providers, rustls present-> UNSAFE, this was PB-32
+#   two or more providers         -> safe ONLY with an explicit install
+#
+# --no-dev is load bearing. `cargo tree -e features` includes dev-dependencies,
+# and template-manager gained a dev-dependency on sv2-gateway in PB-37 which
+# drags in two providers it does not ship. Without no-dev this gate reports a
+# false positive on a crate whose released binary contains no rustls at all.
+gate "deep: exactly one rustls provider, or an explicit install (PB-34)" \
+  bash -c '
+    fail=0
+    for c in pool-verifier sv2-gateway rg-feed-adapter rg-auth rg-dashboard \
+             rg-feed-server rg-demo-feed template-manager; do
+      tree=$(cargo tree -e features,no-dev -p "$c" 2>/dev/null) || continue
+      echo "$tree" | grep -qE "rustls v" || continue   # rustls absent: nothing to check
+      n=$(echo "$tree" | grep -oE "\"(ring|aws[_-]lc[_-]rs)\"" | tr -d "\"" \
+            | sed "s/aws_lc_rs/aws-lc-rs/" | sort -u | wc -l | tr -d " ")
+      if [ "$n" = "1" ]; then continue; fi
+      # 0 or >=2: only an explicit install makes this safe.
+      if grep -rqs "crypto_provider::install_default" "services/$c/src/"; then
+        continue
+      fi
+      echo "ERROR: $c resolves $n rustls providers and never calls install_default()."
+      echo "       Zero and two fail identically at runtime. Either pin exactly one"
+      echo "       provider feature, or call reservegrid_common::crypto_provider::install_default()."
+      fail=1
+    done
+    exit $fail
+  '
+
 # ── D12. Canonical counts: reason-code stability (R-13/R-155) ───
 gate "deep: reason-code count assertions present" \
   bash -c '
