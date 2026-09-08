@@ -11,6 +11,9 @@ name = "rg-feed-server"
 path = "src/main.rs"
 
 [dependencies]
+# PB-29: the shared per-IP tracker. Carries no rustls, so this adds no
+# TLS provider surface to a binary that has none.
+reservegrid-common = { path = "../reservegrid-common" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync", "signal"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"

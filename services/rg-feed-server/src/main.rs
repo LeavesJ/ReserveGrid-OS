@@ -8,8 +8,7 @@
 //! Wire format is identical to `rg-demo-feed` so `rg-feed-adapter` works
 //! with either feed without configuration changes beyond the URL.
 
-use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -182,8 +181,14 @@ async fn run_accept_loop(
     let max_conns = cfg.feed.max_connections;
     let max_conns_per_ip: usize = cfg.feed.max_connections_per_ip;
     let active_conns = Arc::new(AtomicUsize::new(0));
-    let per_ip_conns: Arc<tokio::sync::Mutex<HashMap<IpAddr, usize>>> =
-        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    // PB-29: the shared tracker, replacing a third hand-rolled copy of this
+    // map. Its permit decrements on Drop, so an entry cannot survive a panic
+    // in the connection task; the previous decrement sat after `.await` in a
+    // spawned task and was skipped entirely if that task unwound.
+    #[allow(clippy::cast_possible_truncation)]
+    let ip_tracker = reservegrid_common::per_ip::PerIpConnectionTracker::new(
+        max_conns_per_ip.min(u32::MAX as usize) as u32,
+    );
 
     info!(
         %addr,
@@ -216,21 +221,15 @@ async fn run_accept_loop(
         }
 
         let peer_ip = peer.ip();
-        if max_conns_per_ip > 0 {
-            let mut ip_map = per_ip_conns.lock().await;
-            let count = ip_map.entry(peer_ip).or_insert(0);
-            if *count >= max_conns_per_ip {
-                warn!(
-                    %peer,
-                    ip_count = *count,
-                    max = max_conns_per_ip,
-                    "connection rejected: per-IP limit reached"
-                );
-                drop(stream);
-                continue;
-            }
-            *count += 1;
-        }
+        let Some(ip_permit) = ip_tracker.try_accept(peer_ip) else {
+            warn!(
+                %peer,
+                max = max_conns_per_ip,
+                "connection rejected: per-IP limit reached"
+            );
+            drop(stream);
+            continue;
+        };
 
         active_conns.fetch_add(1, Ordering::Relaxed);
 
@@ -238,18 +237,12 @@ async fn run_accept_loop(
         let val = validator.clone();
         let state = feed_state.clone();
         let conns = active_conns.clone();
-        let ip_conns = per_ip_conns.clone();
-
         tokio::spawn(async move {
+            // `ip_permit` is moved in and released on Drop, including on an
+            // unwind, which the manual decrement this replaced could not do.
+            let _ip_permit = ip_permit;
             handle_connection(stream, rx, peer, val, state).await;
             conns.fetch_sub(1, Ordering::Relaxed);
-            let mut ip_map = ip_conns.lock().await;
-            if let Some(count) = ip_map.get_mut(&peer_ip) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    ip_map.remove(&peer_ip);
-                }
-            }
         });
     }
 }
