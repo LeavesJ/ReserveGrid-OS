@@ -40,6 +40,14 @@ prometheus-client = { workspace = true }
 # test can run both sides against each other rather than one side against itself.
 [dev-dependencies]
 sv2-gateway = { path = "../sv2-gateway" }
+# PB-42: the share-relay HMAC is exercised by no stack and no container, which
+# is why PB-37's signer/verifier disagreement survived a month with CI green.
+# `share_relay_wire` spawns this binary and POSTs a real signed share over a
+# real socket, so it needs an HTTP client. reqwest is already resolved in this
+# crate's dev graph via sv2-gateway; naming it here makes the dependency
+# explicit rather than inherited.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "process"] }
 
 [lints]
 workspace = true
