@@ -114,3 +114,121 @@ fn shipped_prod_policy_with_placeholder_rpc_url_fails_boot() {
         "the boot failure must name the offending key; stderr was:\n{stderr}"
     );
 }
+
+// ── PB-45: readiness must be usable as a healthcheck ────────────────
+
+/// Boot the real verifier and poll `/ready` until it answers or the deadline
+/// passes. Returns the HTTP status and decoded body.
+fn ready_outcome(policy_path: &Path, tcp_port: u16, http_port: u16) -> (u16, serde_json::Value) {
+    let scratch = ScratchDir::new("pb45ready");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pool-verifier"))
+        .current_dir(&scratch.path)
+        .env("VELDRA_POLICY_FILE", policy_path)
+        .env("VELDRA_VERIFIER_ADDR", format!("127.0.0.1:{tcp_port}"))
+        .env("VELDRA_HTTP_ADDR", format!("127.0.0.1:{http_port}"))
+        .env("VELDRA_API_SECRET_OPTIONAL", "1")
+        .env("VELDRA_VERIFIER_CONFIG", scratch.path.join("verifier.toml"))
+        .env("VELDRA_LOG_FILTER", "warn")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn pool-verifier");
+
+    let url = format!("http://127.0.0.1:{http_port}/ready");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut last = (0u16, serde_json::Value::Null);
+    while Instant::now() < deadline {
+        if let Ok(out) = Command::new("curl")
+            .args([
+                "-s",
+                "-o",
+                "-",
+                "-w",
+                "\n%{http_code}",
+                "--max-time",
+                "2",
+                &url,
+            ])
+            .output()
+            && out.status.success()
+        {
+            let text = String::from_utf8_lossy(&out.stdout).into_owned();
+            if let Some((body, code)) = text.rsplit_once('\n')
+                && let Ok(code) = code.trim().parse::<u16>()
+                && code != 0
+            {
+                let v = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+                last = (code, v);
+                if code == 200 {
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    last
+}
+
+/// PB-45. A Phase 1 verifier (`[policy.mempool] enforce = false`, the shipped
+/// default) must become READY.
+///
+/// Before this, `mempool_reachable` was pure freshness of
+/// `LAST_MEMPOOL_OK_UNIX`, which a Phase 1 deployment never sets, so `/ready`
+/// answered 503 forever. That is why all four compose stacks probed `/health`
+/// instead, and `/health` is a hardcoded "ok" that cannot fail. The one signal
+/// that would have surfaced PB-36 at deploy time was consumed by nothing.
+#[test]
+fn phase_one_verifier_becomes_ready() {
+    let scratch = ScratchDir::new("pb45policy");
+    let policy = scratch.path.join("phase1.toml");
+    std::fs::write(
+        &policy,
+        "[policy]\n\
+         protocol_version = 2\n\
+         required_prevhash_len = 64\n\
+         min_total_fees = 0\n\
+         max_tx_count = 4294967295\n\
+         min_avg_fee = 0\n\
+         low_mempool_tx = 0\n\
+         high_mempool_tx = 0\n\
+         tx_count_mid_threshold = 0\n\
+         tx_count_hi_threshold = 0\n\
+         min_avg_fee_lo = 0\n\
+         min_avg_fee_mid = 0\n\
+         min_avg_fee_hi = 0\n\
+         reject_empty_templates = false\n\
+         reject_coinbase_zero = false\n\
+         unknown_mempool_as_high = true\n\
+         \n\
+         [policy.safety]\n\
+         max_weight_ratio = 0.999\n\
+         enforce_weight_ratio = false\n\
+         enforce_template_age = false\n",
+    )
+    .expect("write phase 1 policy");
+
+    let (code, body) = ready_outcome(&policy, 39_241, 39_242);
+    assert_eq!(
+        code, 200,
+        "a Phase 1 verifier must answer /ready with 200 so the endpoint is \
+         usable as a container healthcheck. Body: {body}"
+    );
+    assert_eq!(
+        body["ready"],
+        serde_json::json!(true),
+        "ready must be true with enforcement off. Body: {body}"
+    );
+    assert_eq!(
+        body["mempool_enforced"],
+        serde_json::json!(false),
+        "the response must say enforcement is OFF, so a vacuously satisfied \
+         mempool_reachable is never mistaken for a live poller. Body: {body}"
+    );
+    assert_eq!(
+        body["policy_loaded"],
+        serde_json::json!(true),
+        "the policy loaded, so readiness must say so. Body: {body}"
+    );
+}

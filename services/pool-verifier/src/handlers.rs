@@ -67,7 +67,7 @@ use reservegrid_common::DeployMode;
 use rg_protocol::TemplatePropose;
 
 use crate::state::AppState;
-use crate::types::{LogReloadHandle, POLICY_LOADED_OK};
+use crate::types::{LogReloadHandle, MEMPOOL_ENFORCED, POLICY_LOADED_OK};
 use crate::verdicts::{DEPLOY_MODE, LOG_WRITE_ERRORS, LoggedVerdict, StatsResponse, VerdictLog};
 
 // ── Query structs ────────────────────────────────────
@@ -203,13 +203,26 @@ pub(crate) async fn readiness_check() -> impl IntoResponse {
     } else {
         u64::MAX
     };
-    let mempool_ok = mempool_age_secs < 30;
+    let mempool_fresh = mempool_age_secs < 30;
+
+    // PB-45. A Phase 1 deployment never sets LAST_MEMPOOL_OK_UNIX, so freshness
+    // alone reported `ready: false` forever and this endpoint was unusable as a
+    // healthcheck. Both compose stacks therefore probed `/health`, which is a
+    // hardcoded "ok" and cannot fail, and the signal that would have surfaced
+    // PB-36 at deploy time was consumed by nothing.
+    //
+    // Enforcement off means there is no view to be unreachable, so the
+    // condition is vacuously satisfied. `mempool_enforced` is reported
+    // alongside it so a vacuous true is never mistaken for a live poller.
+    let enforced = MEMPOOL_ENFORCED.load(Ordering::Relaxed);
+    let mempool_ok = !enforced || mempool_fresh;
 
     let ready = policy_ok && mempool_ok;
 
     let body = json!({
         "ready": ready,
         "policy_loaded": policy_ok,
+        "mempool_enforced": enforced,
         "mempool_reachable": mempool_ok,
         "mempool_last_ok_age_secs": if last_mempool > 0 { Some(mempool_age_secs) } else { None::<u64> },
     });
