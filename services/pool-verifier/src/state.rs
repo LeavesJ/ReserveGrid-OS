@@ -47,6 +47,47 @@ fn enforce_protocol(cfg: &PolicyConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Collect dotted paths present in `raw` that the parsed config does not carry.
+///
+/// PB-46. `PolicyConfig` has 28 `#[serde(default)]` attributes and no
+/// `deny_unknown_fields`, so a key an operator MISSPELLS is ignored in silence
+/// and the real field takes its default. A policy that reads strict on screen
+/// can enforce nothing of the kind, and the verifier reports healthy either
+/// way. That is PB-36's family one level up: PB-36 made an UNLOADABLE policy
+/// fatal, this is a policy that loads and is quietly weaker than its author
+/// wrote.
+///
+/// The known set is derived by serializing the parsed config back to TOML
+/// rather than from a hardcoded field list, so it cannot drift: a field added
+/// to `PolicyConfig` joins the known set automatically. That works only because
+/// the struct carries no `skip_serializing_if`, which would make a real field
+/// look unknown; a test pins that.
+fn unknown_policy_keys(
+    raw: &toml::Value,
+    known: &toml::Value,
+    prefix: &str,
+    out: &mut Vec<String>,
+) {
+    let (Some(raw_t), Some(known_t)) = (raw.as_table(), known.as_table()) else {
+        return;
+    };
+    for (key, raw_child) in raw_t {
+        let path = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        match known_t.get(key) {
+            None => out.push(path),
+            Some(known_child) => {
+                if raw_child.is_table() && known_child.is_table() {
+                    unknown_policy_keys(raw_child, known_child, &path, out);
+                }
+            }
+        }
+    }
+}
+
 fn parse_policy_from_policy_table(contents: &str) -> anyhow::Result<PolicyConfig> {
     let v: toml::Value = toml::from_str(contents).context("parse TOML as value")?;
 
@@ -56,8 +97,28 @@ fn parse_policy_from_policy_table(contents: &str) -> anyhow::Result<PolicyConfig
         .ok_or_else(|| anyhow!("missing [policy] table at top level"))?;
 
     let cfg: PolicyConfig = policy_v
+        .clone()
         .try_into()
         .context("deserialize PolicyConfig from [policy] table")?;
+
+    // PB-46: warn rather than reject. `deny_unknown_fields` would fail every
+    // policy carrying an extra key, including one an operator deliberately
+    // extended, and turning a silent weakening into a refused boot is a worse
+    // trade than making it audible.
+    if let Ok(known) = toml::Value::try_from(&cfg) {
+        let mut unknown = Vec::new();
+        unknown_policy_keys(&policy_v, &known, "policy", &mut unknown);
+        unknown.sort();
+        for key in &unknown {
+            warn!(
+                key = %key,
+                "policy key is not recognised and was IGNORED. If this is a \
+                 misspelling, the field it was meant to set is silently at its \
+                 default and this policy enforces less than it appears to \
+                 (PB-46)"
+            );
+        }
+    }
 
     Ok(cfg)
 }
@@ -221,6 +282,139 @@ mod tests {
         let repo_policy =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/policy-prod.toml");
         std::fs::read_to_string(repo_policy).expect("deploy/policy-prod.toml must exist")
+    }
+
+    // ── PB-46: a policy that parses can still enforce less than it says ──
+
+    /// Collect the unknown-key paths the loader would warn about.
+    fn unknown_keys_for(toml_text: &str) -> Vec<String> {
+        let v: toml::Value = toml::from_str(toml_text).expect("fixture parses");
+        let policy_v = v.get("policy").cloned().expect("[policy] table");
+        let cfg: PolicyConfig = policy_v.clone().try_into().expect("fixture deserializes");
+        let known = toml::Value::try_from(&cfg).expect("config round-trips to TOML");
+        let mut out = Vec::new();
+        unknown_policy_keys(&policy_v, &known, "policy", &mut out);
+        out.sort();
+        out
+    }
+
+    /// The load-bearing assumption behind deriving the known set by
+    /// round-tripping: a real field must never look unknown. A
+    /// `skip_serializing_if` anywhere in `PolicyConfig` would break that
+    /// silently and turn every load into a wall of false warnings.
+    #[test]
+    fn a_correct_policy_reports_no_unknown_keys() {
+        let text = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/policy-prod.toml"),
+        )
+        .expect("deploy/policy-prod.toml must exist");
+        assert_eq!(
+            unknown_keys_for(&text),
+            Vec::<String>::new(),
+            "the shipped production policy must produce no unknown-key warnings. \
+             A non-empty list here usually means a field gained a \
+             skip_serializing_if, which makes the round-trip an unreliable \
+             source for the known set."
+        );
+    }
+
+    /// The defect PB-46 names: a MISSPELLED key is ignored and the real field
+    /// silently takes its default.
+    #[test]
+    fn a_misspelled_key_is_reported() {
+        // `min_total_fee`, singular: the real field is `min_total_fees`. It
+        // carries a bare `#[serde(default)]`, so the default is 0 and the
+        // misspelling turns a fee FLOOR into no floor at all. An operator who
+        // typed 1000 gets 0 and is told nothing.
+        let text = "[policy]\nprotocol_version = 2\nmin_total_fee = 1000\n";
+        let unknown = unknown_keys_for(text);
+        assert_eq!(
+            unknown,
+            vec!["policy.min_total_fee".to_string()],
+            "a misspelled key must be reported by its dotted path"
+        );
+
+        // And the point of reporting it: the field the operator MEANT is at its
+        // default, so the policy enforces something other than what it reads.
+        let cfg: PolicyConfig = toml::from_str::<toml::Value>(text)
+            .unwrap()
+            .get("policy")
+            .cloned()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(
+            cfg.min_total_fees, 0,
+            "the misspelling left min_total_fees at its default of 0, so a \
+             policy that reads as a 1000 sat floor enforces no floor. That is \
+             exactly the silent weakening this warning exists to surface"
+        );
+    }
+
+    /// Nested tables must be walked, not just the top level. `[policy.safety]`
+    /// and `[policy.mempool]` are where the enforcement switches live.
+    #[test]
+    fn a_misspelled_nested_key_is_reported_with_its_path() {
+        let text = "[policy]\n\
+                    protocol_version = 2\n\
+                    \n\
+                    [policy.safety]\n\
+                    enforce_weight_ration = true\n";
+        assert_eq!(
+            unknown_keys_for(text),
+            vec!["policy.safety.enforce_weight_ration".to_string()],
+            "a misspelling inside a nested table must be caught and reported \
+             with its full path, or an operator cannot find it"
+        );
+    }
+
+    /// The other half PB-46 asks for: a strict-looking fixture must actually
+    /// produce strict thresholds. A policy can read strict and enforce nothing
+    /// if every key silently missed its field.
+    #[test]
+    fn a_strict_fixture_actually_produces_strict_thresholds() {
+        let text = "[policy]\n\
+                    protocol_version = 2\n\
+                    required_prevhash_len = 64\n\
+                    min_total_fees = 1000\n\
+                    max_tx_count = 5000\n\
+                    reject_empty_templates = true\n\
+                    reject_coinbase_zero = true\n\
+                    \n\
+                    [policy.safety]\n\
+                    enforce_weight_ratio = true\n\
+                    enforce_template_age = true\n";
+        assert_eq!(
+            unknown_keys_for(text),
+            Vec::<String>::new(),
+            "the strict fixture itself must be free of typos, or this test \
+             proves nothing about the values below"
+        );
+        let cfg: PolicyConfig = toml::from_str::<toml::Value>(text)
+            .unwrap()
+            .get("policy")
+            .cloned()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(cfg.min_total_fees, 1000, "min_total_fees did not take");
+        assert_eq!(cfg.max_tx_count, 5000, "max_tx_count did not take");
+        assert!(
+            cfg.reject_empty_templates,
+            "reject_empty_templates did not take"
+        );
+        assert!(
+            cfg.reject_coinbase_zero,
+            "reject_coinbase_zero did not take"
+        );
+        assert!(
+            cfg.safety.enforce_weight_ratio,
+            "enforce_weight_ratio did not take"
+        );
+        assert!(
+            cfg.safety.enforce_template_age,
+            "enforce_template_age did not take"
+        );
     }
 
     /// The blocking finding from the PB-36 T2 review, turned into a test.
