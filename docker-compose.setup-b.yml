@@ -20,8 +20,9 @@
 # - Credentials come from the environment file (.env.setup-b), never from
 #   a file in the repo. rpc_pass is read from VELDRA_BITCOIND_RPC_PASS by
 #   both services.
-# - VELDRA_MODE defaults to observe (read-only). Flip to shadow in
-#   .env.setup-b for the soak, then `up -d` again to recreate.
+# - VELDRA_MODE defaults to observe (log-only, verdicts persisted), and
+#   the soak runs in observe. Do not flip to shadow: shadow persists no
+#   verdicts (DeployMode::persist_verdicts), so the soak would record nothing.
 #
 # Usage (from the repo root on the node):
 #   docker compose -f docker-compose.setup-b.yml --env-file .env.setup-b up -d --build
