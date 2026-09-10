@@ -11,7 +11,7 @@ The share lifecycle emits two NDJSON events per accepted share:
 1. `ShareAcceptedEvent` (Event 1): share validated, SV2 ACK sent to miner.
 2. `ShareForwardResultEvent` (Event 2): upstream relay outcome.
 
-A crash between Event 1 and Event 2 creates orphaned accepted events that permanently violate the 1:1 join invariant. The WAL prevents this by persisting `(share_id_hex, event_id_hex)` pairs as pending before enqueuing for forward, and marking them completed after the relay result arrives.
+A crash between Event 1 and Event 2 creates orphaned accepted events that permanently violate the 1:1 join invariant. The WAL prevents this by persisting `(share_id_hex, event_id_hex)` pairs as pending when the gateway's main loop receives the share's accepted event, and marking them completed after the relay result arrives. The handler queues the share for forward before it emits that event, and ACKs the miner without waiting for the pending write. An earlier revision of this sentence said the pending record was written before the forward enqueue, which the code has not done.
 
 ## Record Format
 
@@ -32,14 +32,14 @@ Each record is serialized to JSON with a trailing newline appended in a single b
 
 **The tradeoff this section used to record, and why it changed.** It previously read: "process crash safe. Not power loss safe... This is an acceptable tradeoff for a share relay because shares can be re-submitted by miners after a full host crash, and the WAL exists to preserve the accounting join invariant, not to guarantee share delivery." That reasoning was coherent, and it lost to two facts. First, `wal.rs` itself claimed the stronger guarantee in three places, so an operator reading the module got a promise the code did not keep, and the two documents disagreed with each other as well as with the code. Second, the compaction path could lose EVERY pending record at once on power loss, not just recent ones, which the resubmit argument does not cover: a miner cannot resubmit a share whose accounting record vanished after the ACK.
 
-**What it costs, measured rather than assumed.** On the node's ext4 root, 2000 appends of a 221-byte record: 174,361/s with flush alone, 2,340/s with fdatasync. One accepted share costs TWO syncs (`mark_pending` then `mark_completed`) serialized on the same main select loop, so the practical ceiling is roughly 1,170 accepted shares/s. Past it, `share_event_tx` (bounded 4096) drops accounting events with only a warn, which re-opens the join hole this WAL exists to close. **PB-44 tracks moving the syncs off the select loop or batching them, which is the fix that removes the ceiling rather than documenting it.**
+**What it costs, measured rather than assumed.** On the node's ext4 root, 2000 appends of a 221-byte record: 174,361/s with flush alone, 2,340/s with fdatasync. Before PB-44 one accepted share cost TWO syncs (`mark_pending` then `mark_completed`), serialized on the same main select loop, which put the practical ceiling near 1,170 accepted shares/s; past it `share_event_tx` (bounded 4096) dropped accounting events, which re-opens the join hole this WAL exists to close. **PB-44 batches the syncs.** Each select arm takes every record already queued behind the one that woke it, up to `WAL_BATCH_MAX` (1024), and pays one sync for all of them. Nothing waits to fill a batch, so no record's sync is delayed; under load the batch grows and the sync cost per share falls instead of capping throughput. Measured on the same ext4 root, 2000 records of 221 bytes: 2,234/s at one sync per record, 100,819/s at 64 per sync, 885,650/s at 1024 per sync. Under load on a developer Mac (APFS, about 6.5ms a sync), a producer offering 3,000 events/s for 4s into an mpsc(4096) with `try_send`, as the handler does: a consumer paying one sync per event drained 399 and dropped 7,507; the batched consumer drained 11,958 and dropped 0. That harness is `offered_load_drops_with_and_without_batching` in `wal.rs`, ignored by default because it measures a filesystem; it models the select arm with the real channel, WAL and `take_queued`, and does not run `main.rs`.
 
 ## Lifecycle
 
-1. **`mark_pending(share_id, event_id)`**: append a `"pending"` record, insert into in-memory HashMap.
-2. **Forward the share to upstream.**
-3. **`mark_completed(share_id, event_id)`**: append a `"completed"` record, remove from in-memory HashMap.
-4. Completed records tolerate out-of-order arrival (completion before pending) to handle `select!` scheduling races.
+1. **`mark_pending(&[(share_id, event_id), ...])`**: append one `"pending"` record per share in a single write and a single sync, then insert them into the in-memory HashMap. The main loop passes every accepted event already queued, up to `WAL_BATCH_MAX` (PB-44).
+2. **Forward the share to upstream.** This runs concurrently with step 1: the handler queued the share for forward before emitting the event that leads to it.
+3. **`mark_completed(&[(share_id, event_id), ...])`**: append one `"completed"` record per share in a single write and a single sync, then remove them from the in-memory HashMap.
+4. A completion can reach the WAL before its pending record, because the two arrive on different arms of one unbiased `select!`. The completed record is still written, but it does NOT neutralise a pending record written after it: replay runs in file order, and the late pending record is inserted and survives compaction. That is PB-47, open. An earlier revision of this line claimed completed records tolerate out-of-order arrival.
 
 ## Recovery
 
@@ -67,8 +67,8 @@ The WAL does not implement time or size based rotation. Compaction is the sole m
 
 ## Flush Semantics
 
-Each `append_record` call flushes the `BufWriter` and then calls `sync_data` on the underlying file (PB-39). The flush pushes data from userspace to the kernel page cache, which alone survives process death but not power loss; `sync_data` is the fdatasync that pushes it to stable storage, including the file length an append needs to be retrievable. Compaction additionally `sync_all`s the replacement file before `rename(2)` and syncs the parent directory afterwards, because a rename is directory metadata and is not durable until the directory is.
+Each `append_records` call, one per batch since PB-44, flushes the `BufWriter` once and then calls `sync_data` once on the underlying file (PB-39). The flush pushes data from userspace to the kernel page cache, which alone survives process death but not power loss; `sync_data` is the fdatasync that pushes it to stable storage, including the file length an append needs to be retrievable. Compaction additionally `sync_all`s the replacement file before `rename(2)` and syncs the parent directory afterwards, because a rename is directory metadata and is not durable until the directory is.
 
 ## Test Coverage
 
-8 tests in `wal.rs` covering: open and append, recovery of orphaned entries, compaction, malformed line tolerance, concurrent pending and completed ordering, empty WAL, and threshold-based auto-compaction.
+16 tests in `wal.rs`, 2 of them ignored measurements and 1 Linux-only, covering: open and append, recovery of orphaned entries, compaction, malformed line tolerance, empty WAL, threshold-based auto-compaction, that `mark_pending` and compaction are on disk before they return (PB-39), that a batch costs one sync and is fully on disk before it returns, and that `take_queued` stops at its bound (PB-44). The earlier count of 8 had drifted. Out-of-order completion is NOT covered, because it is not handled: see PB-47.
