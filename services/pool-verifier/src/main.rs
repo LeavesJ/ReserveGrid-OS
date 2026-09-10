@@ -413,6 +413,10 @@ async fn main() -> anyhow::Result<()> {
         Some((view, lookup)) => (Some(view), Some(lookup)),
         None => (None, None),
     };
+    // PB-45: readiness reports mempool_reachable as vacuously true when there
+    // is no view to be unreachable. Taken from the built value rather than from
+    // the policy flag, so it cannot drift from what was actually wired.
+    types::MEMPOOL_ENFORCED.store(mempool_view.is_some(), std::sync::atomic::Ordering::Relaxed);
 
     let app_state = AppState {
         policy: Arc::new(RwLock::new(policy_holder)),
