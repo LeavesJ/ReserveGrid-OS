@@ -28,7 +28,7 @@
 //! The WAL is optional. When `wal_path` is empty the gateway operates without
 //! persistence (suitable for regtest and development).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write as IoWrite};
 use std::path::{Path, PathBuf};
 
@@ -76,6 +76,13 @@ pub struct ShareWal {
     /// Compaction threshold: compact when `completed_since_compaction` exceeds
     /// this value. 0 disables auto-compaction.
     compaction_threshold: usize,
+    /// Completions that arrived before their pending record (PB-47), keyed
+    /// like `pending` and valued by when the completion was written. A
+    /// pending record for one of these is neither written nor indexed.
+    completed_early: HashMap<(String, String), u64>,
+    /// When `completed_early` was last pruned of entries past
+    /// `EARLY_COMPLETION_TTL_MS`.
+    early_pruned_at_ms: u64,
     /// Syncs issued by `append_records`. Test-only instrumentation and this
     /// file's one structural override: fsync is not observable in-process,
     /// and PB-44's claim is that a batch costs one sync, so this counter is
@@ -111,6 +118,18 @@ fn unix_ms_now() -> u64 {
 /// thousandfold at the load where per-record syncing used to overflow the
 /// accounting queue.
 pub const WAL_BATCH_MAX: usize = 1024;
+
+/// How long a completion that arrived before its pending record is remembered
+/// (PB-47).
+///
+/// A completion reaches the WAL first only while the share's accounting event
+/// is still queued in `share_event_rx`, or while its handler is preempted
+/// between the forward enqueue and the event send. Both resolve in
+/// milliseconds at any load the loop can sustain; a minute is thousands of
+/// times that. An entry older than this belongs to an accounting event that
+/// was dropped at the queue (`svtwo_share_events_dropped`), whose pending
+/// record never comes, so keeping it only costs memory.
+const EARLY_COMPLETION_TTL_MS: u64 = 60_000;
 
 /// `first`, plus whatever is already queued behind it, up to
 /// [`WAL_BATCH_MAX`] items. Never waits: it takes only what is there.
@@ -162,6 +181,8 @@ impl ShareWal {
             writer,
             completed_since_compaction: 0,
             compaction_threshold,
+            completed_early: HashMap::new(),
+            early_pruned_at_ms: 0,
             #[cfg(test)]
             syncs: 0,
         })
@@ -172,6 +193,11 @@ impl ShareWal {
         let file = std::fs::File::open(path)?;
         let reader = std::io::BufReader::new(file);
         let mut pending: HashMap<(String, String), u64> = HashMap::new();
+        // PB-47: a share completed anywhere in the file is not pending, even
+        // when its completed record precedes its pending record. Replay used
+        // to run in file order, so that order resurrected the share as a
+        // crash orphan and recovery emitted a second forward result for it.
+        let mut completed: HashSet<(String, String)> = HashSet::new();
 
         for (lineno, line) in reader.lines().enumerate() {
             let line = match line {
@@ -194,10 +220,13 @@ impl ShareWal {
             let key = (record.share_id_hex, record.event_id_hex);
             match record.status {
                 WalStatus::Pending => {
-                    pending.insert(key, record.timestamp_ms);
+                    if !completed.contains(&key) {
+                        pending.insert(key, record.timestamp_ms);
+                    }
                 }
                 WalStatus::Completed => {
                     pending.remove(&key);
+                    completed.insert(key);
                 }
             }
         }
@@ -252,6 +281,7 @@ impl ShareWal {
     /// The gateway's main loop calls this when it receives the shares'
     /// accepted events. The handler queues each share for forward before it
     /// emits that event, and ACKs the miner without waiting for this write.
+    /// A share whose completion is already recorded is skipped (PB-47).
     ///
     /// Returns `Err` if the append or fsync fails; the in-memory pending
     /// index is **not** updated for any share in the batch in that case.
@@ -264,16 +294,32 @@ impl ShareWal {
         shares: &[(S, E)],
     ) -> std::io::Result<()> {
         let now = unix_ms_now();
-        let records: Vec<WalRecord> = shares
-            .iter()
-            .map(|(share_id_hex, event_id_hex)| WalRecord {
+        let mut records = Vec::with_capacity(shares.len());
+        let mut already_completed = Vec::new();
+        for (share_id_hex, event_id_hex) in shares {
+            let key = (
+                share_id_hex.as_ref().to_string(),
+                event_id_hex.as_ref().to_string(),
+            );
+            // PB-47: its forward result reached the WAL first, so the share is
+            // done and there is nothing to write or index. The early entry is
+            // dropped only once this batch is durable, so a failed write
+            // leaves the in-memory state exactly as it was.
+            if self.completed_early.contains_key(&key) {
+                already_completed.push(key);
+                continue;
+            }
+            records.push(WalRecord {
                 status: WalStatus::Pending,
-                share_id_hex: share_id_hex.as_ref().to_string(),
-                event_id_hex: event_id_hex.as_ref().to_string(),
+                share_id_hex: key.0,
+                event_id_hex: key.1,
                 timestamp_ms: now,
-            })
-            .collect();
+            });
+        }
         self.append_records(&records)?;
+        for key in already_completed {
+            self.completed_early.remove(&key);
+        }
         for record in records {
             self.pending.insert(
                 (record.share_id_hex, record.event_id_hex),
@@ -287,7 +333,8 @@ impl ShareWal {
     /// sync for the whole batch (PB-44).
     ///
     /// Removes the entries from the pending index and triggers compaction if
-    /// the threshold is reached.
+    /// the threshold is reached. A completion with no pending entry is
+    /// remembered, so its late pending record is dropped (PB-47).
     ///
     /// Returns `Err` if the append, fsync, or (when threshold reached)
     /// compaction fails. The in-memory pending entries are removed up front
@@ -304,13 +351,15 @@ impl ShareWal {
                 share_id_hex.as_ref().to_string(),
                 event_id_hex.as_ref().to_string(),
             );
-            // Always write the completed record even if the pending entry is
-            // missing: the select! loop can deliver a forward result before
-            // the share's accounting event. That record does NOT neutralise a
-            // pending line written after it. Replay runs in file order and the
-            // late mark_pending re-inserts the entry. That is PB-47, open; an
-            // earlier version of this comment claimed the opposite.
-            let _ = self.pending.remove(&key);
+            // Always write the completed record, even with no pending entry:
+            // the select! loop can deliver a forward result before the share's
+            // accounting event. When it does, remember the completion so the
+            // late pending record is dropped rather than indexed (PB-47). An
+            // indexed one would survive compaction and come back on restart as
+            // a crash orphan with a second forward result.
+            if self.pending.remove(&key).is_none() {
+                self.completed_early.insert(key.clone(), now);
+            }
             records.push(WalRecord {
                 status: WalStatus::Completed,
                 share_id_hex: key.0,
@@ -318,6 +367,7 @@ impl ShareWal {
                 timestamp_ms: now,
             });
         }
+        self.prune_completed_early(now);
         self.append_records(&records)?;
         self.completed_since_compaction += records.len();
         if self.compaction_threshold > 0
@@ -331,6 +381,20 @@ impl ShareWal {
     /// Number of entries currently pending (not yet completed).
     pub fn pending_count(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Forget early completions older than `EARLY_COMPLETION_TTL_MS`, at most
+    /// once per TTL, so an entry lives between one and two TTLs. Past that age
+    /// its pending record cannot still be on its way (see the constant).
+    fn prune_completed_early(&mut self, now: u64) {
+        if self.completed_early.is_empty()
+            || now.saturating_sub(self.early_pruned_at_ms) < EARLY_COMPLETION_TTL_MS
+        {
+            return;
+        }
+        self.completed_early
+            .retain(|_, completed_at| now.saturating_sub(*completed_at) < EARLY_COMPLETION_TTL_MS);
+        self.early_pruned_at_ms = now;
     }
 
     /// Append a batch of NDJSON records with one flush and one sync.
@@ -826,6 +890,8 @@ mod tests {
             writer,
             completed_since_compaction: 0,
             compaction_threshold: 0,
+            completed_early: HashMap::new(),
+            early_pruned_at_ms: 0,
             syncs: 0,
         };
 
@@ -1030,5 +1096,95 @@ mod tests {
             cleanup(&path);
             (offered, dropped, drained.load(Ordering::Relaxed))
         })
+    }
+
+    #[test]
+    fn a_completion_that_arrives_first_leaves_nothing_pending() {
+        let path = temp_wal_path("pb47_reversed");
+        cleanup(&path);
+        {
+            let mut wal = ShareWal::open(&path, 1000).unwrap();
+            wal.mark_completed(&[("aa", "bb")]).unwrap();
+            wal.mark_pending(&[("aa", "bb")]).unwrap();
+            assert_eq!(
+                wal.pending_count(),
+                0,
+                "PB-47: a pending record that arrives after its completion must not be indexed"
+            );
+            assert!(
+                wal.completed_early.is_empty(),
+                "the early completion is consumed by its pending record"
+            );
+        }
+        let mut reopened = ShareWal::open(&path, 1000).unwrap();
+        assert_eq!(
+            reopened.recover().synthetic_events.len(),
+            0,
+            "PB-47: no crash orphan, so no second forward result on restart"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_completion_that_arrives_first_stays_neutralised_across_compaction() {
+        let path = temp_wal_path("pb47_compacted");
+        cleanup(&path);
+        {
+            let mut wal = ShareWal::open(&path, 2).unwrap();
+            wal.mark_completed(&[("aa", "bb")]).unwrap();
+            wal.mark_pending(&[("aa", "bb")]).unwrap();
+            wal.mark_pending(&[("cc", "dd")]).unwrap();
+            // The second completion trips the threshold and compacts.
+            wal.mark_completed(&[("cc", "dd")]).unwrap();
+            let contents = read_wal_file_independently(&path);
+            assert!(
+                !contents.contains("\"aa\""),
+                "PB-47: compaction rewrote a share that already completed: {contents:?}"
+            );
+        }
+        let mut reopened = ShareWal::open(&path, 1000).unwrap();
+        assert_eq!(reopened.recover().synthetic_events.len(), 0);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn replay_ignores_a_pending_record_whose_completion_came_first() {
+        // A WAL written before PB-47 can hold the two records in this order.
+        let path = temp_wal_path("pb47_legacy_order");
+        cleanup(&path);
+        let completed =
+            r#"{"status":"completed","share_id_hex":"aa","event_id_hex":"bb","timestamp_ms":1}"#;
+        let pending =
+            r#"{"status":"pending","share_id_hex":"aa","event_id_hex":"bb","timestamp_ms":2}"#;
+        std::fs::write(&path, format!("{completed}\n{pending}\n")).unwrap();
+        let wal = ShareWal::open(&path, 1000).unwrap();
+        assert_eq!(
+            wal.pending_count(),
+            0,
+            "PB-47: replay must not depend on which record comes first"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn an_early_completion_is_forgotten_once_its_pending_cannot_be_coming() {
+        let path = temp_wal_path("pb47_ttl");
+        cleanup(&path);
+        let mut wal = ShareWal::open(&path, 1000).unwrap();
+        wal.mark_completed(&[("aa", "bb")]).unwrap();
+        assert_eq!(
+            wal.completed_early.len(),
+            1,
+            "a completion with no pending is remembered"
+        );
+        let completed_at = unix_ms_now();
+        wal.prune_completed_early(completed_at + EARLY_COMPLETION_TTL_MS / 2);
+        assert_eq!(wal.completed_early.len(), 1, "inside the TTL it is kept");
+        wal.prune_completed_early(completed_at + EARLY_COMPLETION_TTL_MS + 1);
+        assert!(
+            wal.completed_early.is_empty(),
+            "past the TTL it is forgotten"
+        );
+        cleanup(&path);
     }
 }
