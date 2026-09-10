@@ -437,38 +437,6 @@ pub struct ShareForwardResultEvent {
 }
 
 impl ShareForwardResultEvent {
-    /// Synthetic event for shares evicted from the forward queue.
-    pub fn evicted(share_id_hex: &str, event_id_hex: &str) -> Self {
-        let reason = GatewayReason::ShareEvictedFromQueue.as_str().to_string();
-        Self {
-            event_type: "share_forward_result",
-            share_id_hex: share_id_hex.to_string(),
-            event_id_hex: event_id_hex.to_string(),
-            forwarded: false,
-            upstream_accepted: None,
-            upstream_http_status: None,
-            upstream_error: Some(reason.clone()),
-            reason_code: Some(reason),
-            timestamp_ms: unix_ms_now(),
-        }
-    }
-
-    /// Synthetic event for shares dropped because the forward queue was full.
-    pub fn queue_full(share_id_hex: &str, event_id_hex: &str) -> Self {
-        let reason = GatewayReason::ShareDroppedQueueFull.as_str().to_string();
-        Self {
-            event_type: "share_forward_result",
-            share_id_hex: share_id_hex.to_string(),
-            event_id_hex: event_id_hex.to_string(),
-            forwarded: false,
-            upstream_accepted: None,
-            upstream_http_status: None,
-            upstream_error: Some(reason.clone()),
-            reason_code: Some(reason),
-            timestamp_ms: unix_ms_now(),
-        }
-    }
-
     /// Build from an upstream relay result.
     pub fn from_relay(
         share_id_hex: &str,
@@ -1068,28 +1036,6 @@ mod tests {
     }
 
     #[test]
-    fn share_forward_result_evicted_has_correct_reason() {
-        let event = ShareForwardResultEvent::evicted("deadbeef", "cafebabe");
-        assert_eq!(event.event_type, "share_forward_result");
-        assert!(!event.forwarded);
-        assert_eq!(
-            event.reason_code.as_deref(),
-            Some("share_evicted_from_queue")
-        );
-    }
-
-    #[test]
-    fn share_forward_result_queue_full_has_correct_reason() {
-        let event = ShareForwardResultEvent::queue_full("deadbeef", "cafebabe");
-        assert_eq!(event.event_type, "share_forward_result");
-        assert!(!event.forwarded);
-        assert_eq!(
-            event.reason_code.as_deref(),
-            Some("share_dropped_queue_full")
-        );
-    }
-
-    #[test]
     fn share_forward_result_from_relay_round_trip() {
         let event = ShareForwardResultEvent::from_relay(
             "aabb",
@@ -1194,7 +1140,18 @@ mod tests {
 
     #[test]
     fn share_forward_result_event_json_keys_stable() {
-        let evt = ShareForwardResultEvent::evicted("abc", "def");
+        // PB-43: was `evicted("abc","def")`, a constructor with no production
+        // caller. `from_relay` is the one the forward worker actually calls
+        // (main.rs), so this pins the wire shape of an event that ships.
+        let evt = ShareForwardResultEvent::from_relay(
+            "abc",
+            "def",
+            false,
+            None,
+            None,
+            None,
+            Some(GatewayReason::ShareDroppedQueueFull.as_str().to_string()),
+        );
         let json = serde_json::to_value(&evt).unwrap();
         let obj = json.as_object().unwrap();
 
@@ -1233,24 +1190,8 @@ mod tests {
 
     #[test]
     fn share_forward_result_event_type_discriminator() {
-        let evt = ShareForwardResultEvent::queue_full("a", "b");
+        let evt = ShareForwardResultEvent::from_relay("a", "b", false, None, None, None, None);
         assert_eq!(evt.event_type, "share_forward_result");
-    }
-
-    #[test]
-    fn share_forward_result_reason_codes_are_canonical() {
-        // Verify factory methods use canonical enum strings, not raw literals.
-        let evicted = ShareForwardResultEvent::evicted("a", "b");
-        assert_eq!(
-            evicted.reason_code.as_deref(),
-            Some(GatewayReason::ShareEvictedFromQueue.as_str())
-        );
-
-        let full = ShareForwardResultEvent::queue_full("a", "b");
-        assert_eq!(
-            full.reason_code.as_deref(),
-            Some(GatewayReason::ShareDroppedQueueFull.as_str())
-        );
     }
 
     // ── difficulty_to_target tests ──

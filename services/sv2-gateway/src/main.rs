@@ -2382,6 +2382,16 @@ async fn accept_loop(
                                 vardiff_retarget_up: retarget_up,
                                 vardiff_retarget_down: retarget_down,
                                 share_events_dropped: conn_metrics.share_events_dropped_total.clone(),
+                                // PB-43: queue-full drops were visible only in
+                                // logs, never on a dashboard. Same family the
+                                // forward worker already writes to, so the
+                                // outcome reads in one place.
+                                share_forward_queue_full: conn_metrics
+                                    .share_forward_total
+                                    .get_or_create(&ForwardLabels {
+                                        result: "queue_full".to_string(),
+                                    })
+                                    .clone(),
                             };
 
                             let exit = sv2_gateway::handler::run_connection(ctx).await;

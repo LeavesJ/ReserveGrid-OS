@@ -794,7 +794,7 @@ Run through this checklist before exposing any service to the internet.
 - [ ] No default credentials remain (`reservegrid`, `admin@localhost`, etc.)
 - [ ] `VELDRA_LOG_FORMAT=json` (structured logs for production)
 - [ ] `VELDRA_ALLOW_INSECURE_VERIFIER=0` (unless single-host deployment)
-- [ ] `VELDRA_ALLOW_DROP_OLD_INLINE=0`
+- [ ] `VELDRA_ALLOW_DROP_OLD_INLINE` is gone (PB-43): `drop_old` was never implemented, so the override enabled nothing. Setting `forward_queue_drop_policy = "drop_old"` now fails the boot in every mode.
 - [ ] `VELDRA_ALLOW_REMOTE_VERIFIER=0` (unless verifier is on a separate host with mTLS)
 - [ ] Noise keypair is unique to this gateway instance
 - [ ] Noise key file permissions are 0400

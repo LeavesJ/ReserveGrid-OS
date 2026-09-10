@@ -190,6 +190,9 @@ pub struct ConnectionContext {
     pub vardiff_retarget_down: Counter,
     /// PB-44: incremented whenever an accounting event is dropped.
     pub share_events_dropped: Counter,
+    /// PB-43: `share_forward_total{result="queue_full"}`, so a queue-full drop
+    /// reaches a dashboard and not only the log stream.
+    pub share_forward_queue_full: Counter,
 }
 
 /// Run the full SV2 session lifecycle for one connection.
@@ -215,6 +218,7 @@ pub async fn run_connection(ctx: ConnectionContext) -> HandlerExit {
         vardiff_retarget_up,
         vardiff_retarget_down,
         share_events_dropped,
+        share_forward_queue_full,
     } = ctx;
     let peer_state = PeerState::new(peer);
     let mut share_dedup = ShareDedupSet::new(config.share_dedup_window_size);
@@ -237,6 +241,7 @@ pub async fn run_connection(ctx: ConnectionContext) -> HandlerExit {
         &vardiff_retarget_up,
         &vardiff_retarget_down,
         &share_events_dropped,
+        &share_forward_queue_full,
     )
     .await;
 
@@ -277,6 +282,7 @@ async fn run_connection_inner(
     vardiff_retarget_up: &Counter,
     vardiff_retarget_down: &Counter,
     share_events_dropped: &Counter,
+    share_forward_queue_full: &Counter,
 ) -> (HandlerExit, Vec<u32>) {
     let mut opened_ids: Vec<u32> = Vec::new();
 
@@ -360,6 +366,7 @@ async fn run_connection_inner(
                             vardiff_retarget_up,
                             vardiff_retarget_down,
                     share_events_dropped,
+                    share_forward_queue_full,
                         ).await;
                         match action {
                             FrameAction::Continue => {}
@@ -1145,6 +1152,7 @@ async fn handle_miner_frame(
     vardiff_retarget_up: &Counter,
     vardiff_retarget_down: &Counter,
     share_events_dropped: &Counter,
+    share_forward_queue_full: &Counter,
 ) -> FrameAction {
     // Reject non-base-protocol extension types.
     if header.extension_type & 0x7FFF != 0 {
@@ -1174,6 +1182,7 @@ async fn handle_miner_frame(
                 vardiff_retarget_up,
                 vardiff_retarget_down,
                 share_events_dropped,
+                share_forward_queue_full,
             )
             .await
             {
@@ -1195,6 +1204,7 @@ async fn handle_miner_frame(
                 vardiff_retarget_up,
                 vardiff_retarget_down,
                 share_events_dropped,
+                share_forward_queue_full,
             )
             .await
             {
@@ -1282,6 +1292,7 @@ async fn handle_submit_shares(
     vardiff_retarget_up: &Counter,
     vardiff_retarget_down: &Counter,
     share_events_dropped: &Counter,
+    share_forward_queue_full: &Counter,
 ) -> Result<(), HandlerExit> {
     let share = match sv2_codec::SubmitSharesStandard::decode(payload) {
         Ok(s) => s,
@@ -1695,6 +1706,7 @@ async fn handle_submit_shares(
     // because enqueue failure happens BEFORE the ACK and the miner can still
     // be told the truth. Eviction, which happens after, cannot be.
     if let Err(e) = share_forward_tx.try_send(submission) {
+        share_forward_queue_full.inc();
         warn!(
             error = %e,
             reason_code = GatewayReason::ShareDroppedQueueFull.as_str(),
@@ -1837,6 +1849,7 @@ async fn handle_submit_shares_extended(
     vardiff_retarget_up: &Counter,
     vardiff_retarget_down: &Counter,
     share_events_dropped: &Counter,
+    share_forward_queue_full: &Counter,
 ) -> Result<(), HandlerExit> {
     let share = match sv2_codec::SubmitSharesExtended::decode(payload) {
         Ok(s) => s,
@@ -2279,6 +2292,7 @@ async fn handle_submit_shares_extended(
     }
     // PB-38: identical to the standard path. See the comment there.
     if let Err(e) = share_forward_tx.try_send(submission) {
+        share_forward_queue_full.inc();
         warn!(
             error = %e,
             reason_code = GatewayReason::ShareDroppedQueueFull.as_str(),
@@ -2680,7 +2694,7 @@ mod tests {
     async fn pb38_reply_msg_type_on_full_queue(
         extended: bool,
         saturate_events: bool,
-    ) -> (u8, String, Vec<(String, Option<String>)>, u64) {
+    ) -> (u8, String, Vec<(String, Option<String>)>, u64, u64) {
         use crate::transport::perform_handshake;
         use secp256k1::Keypair;
         use tokio::net::TcpListener;
@@ -2699,6 +2713,11 @@ mod tests {
 
         let dropped = Counter::default();
         let dropped_in_task = dropped.clone();
+        // PB-43: the harness asserts this stays at zero on the PB-44 path and
+        // rises on the PB-38 path, so a counter wired to the wrong drop site
+        // reddens rather than passing.
+        let qfull = Counter::default();
+        let qfull_in_task = qfull.clone();
 
         #[allow(clippy::cast_possible_truncation)]
         let ntime = (unix_ms_now() / 1000) as u32;
@@ -2755,6 +2774,7 @@ mod tests {
                     &up,
                     &down,
                     &dropped_in_task,
+                    &qfull_in_task,
                 )
                 .await
             } else {
@@ -2771,6 +2791,7 @@ mod tests {
                     &up,
                     &down,
                     &dropped_in_task,
+                    &qfull_in_task,
                 )
                 .await
             }
@@ -2788,7 +2809,7 @@ mod tests {
         while let Ok(evt) = share_event_rx.try_recv() {
             events.push((evt.sv2_response.to_string(), evt.reason_code.clone()));
         }
-        (msg_type, error_code, events, dropped.get())
+        (msg_type, error_code, events, dropped.get(), qfull.get())
     }
 
     /// The miner half of the PB-38 harness: complete the Noise handshake,
@@ -2928,8 +2949,13 @@ mod tests {
     /// an operator can alert on.
     #[tokio::test]
     async fn a_full_accounting_queue_increments_the_dropped_counter() {
-        let (_msg_type, _error_code, _events, dropped) =
+        let (_msg_type, _error_code, _events, dropped, qfull) =
             pb38_reply_msg_type_on_full_queue(false, true).await;
+        assert_eq!(
+            qfull, 0,
+            "the FORWARD queue was healthy here; a nonzero queue_full means the \
+             PB-43 counter is wired to the wrong drop site"
+        );
         assert!(
             dropped > 0,
             "the accounting queue was saturated and the share still went \
@@ -2941,8 +2967,13 @@ mod tests {
 
     #[tokio::test]
     async fn full_forward_queue_rejects_a_standard_share_to_the_miner() {
-        let (msg_type, error_code, events, dropped) =
+        let (msg_type, error_code, events, dropped, qfull) =
             pb38_reply_msg_type_on_full_queue(false, false).await;
+        assert_eq!(
+            qfull, 1,
+            "the forward queue was saturated, so the PB-43 queue_full metric \
+             must have risen exactly once"
+        );
         pb38_assert_rejected(msg_type, &error_code, &events, "standard share");
         assert_eq!(
             dropped, 0,
@@ -2953,8 +2984,9 @@ mod tests {
 
     #[tokio::test]
     async fn full_forward_queue_rejects_an_extended_share_to_the_miner() {
-        let (msg_type, error_code, events, _dropped) =
+        let (msg_type, error_code, events, _dropped, qfull) =
             pb38_reply_msg_type_on_full_queue(true, false).await;
+        assert_eq!(qfull, 1, "extended path must count the drop too");
         pb38_assert_rejected(msg_type, &error_code, &events, "extended share");
     }
 

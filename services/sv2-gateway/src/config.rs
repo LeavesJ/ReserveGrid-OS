@@ -633,33 +633,31 @@ pub fn validate(config: &GatewayConfig) -> Result<Vec<String>, String> {
         ));
     }
 
-    // drop_old is rejected in inline mode (without escape hatch)
-    if config.mode == GatewayMode::Inline
-        && let Some(ref upstream) = config.share_upstream
+    // PB-43: drop_old is NOT IMPLEMENTED, in any mode, and the config said
+    // otherwise. The enqueue at the send site is an unconditional `try_send`,
+    // which is drop-new; nothing reads this key. An operator who set it got the
+    // opposite of what they asked for, silently.
+    //
+    // It is refused rather than implemented, for the reason this file's own
+    // previous message already gave: it violates ACK integrity. Under PB-38 a
+    // successful enqueue is what causes SubmitShares.Success to be written, so
+    // evicting an already-queued share would credit a miner for work that never
+    // reaches upstream, which is exactly the defect PB-38 exists to prevent.
+    //
+    // The VELDRA_ALLOW_DROP_OLD_INLINE override is gone with it. An override
+    // that enables an unimplemented behaviour is a promise nothing keeps.
+    if let Some(ref upstream) = config.share_upstream
         && upstream.forward_queue_drop_policy == QueueDropPolicy::DropOld
     {
-        let allow = std::env::var("VELDRA_ALLOW_DROP_OLD_INLINE")
-            .map(|v| v == "1")
-            .unwrap_or(false);
-        if !allow {
-            return Err(
-                "drop_old is not permitted in inline mode (violates ACK integrity); \
-                 set VELDRA_ALLOW_DROP_OLD_INLINE=1 to override for development"
-                    .to_string(),
-            );
-        }
-        warnings.push(
-            "VELDRA_ALLOW_DROP_OLD_INLINE=1 active; drop_old enabled in inline mode".to_string(),
-        );
-    }
-
-    // drop_old in observe mode gets a warning
-    if config.mode == GatewayMode::Observe
-        && let Some(ref upstream) = config.share_upstream
-        && upstream.forward_queue_drop_policy == QueueDropPolicy::DropOld
-    {
-        warnings.push(
-            "drop_old enabled in observe mode; evicted shares lose telemetry value".to_string(),
+        return Err(
+            "forward_queue_drop_policy = \"drop_old\" is not implemented. The share \
+             forward enqueue is unconditionally drop-new, so this key had no reader \
+             and setting it silently did the opposite of what it says. It is refused \
+             rather than implemented because it violates ACK integrity: under PB-38 a \
+             successful enqueue is what ACKs the share to the miner, so evicting a \
+             queued share would credit a miner for work upstream never receives. \
+             Remove the key or set it to \"drop_new\"."
+                .to_string(),
         );
     }
 
@@ -845,30 +843,41 @@ mod tests {
         );
     }
 
+    /// PB-43: `drop_old` is refused in EVERY mode, not just inline.
+    ///
+    /// This replaces `validate_drop_old_inline_rejected_without_escape` and
+    /// `validate_drop_old_observe_warns`. The second of those asserted that
+    /// observe mode merely WARNS, which encoded the defect as the
+    /// specification: nothing reads `forward_queue_drop_policy` at the send
+    /// site, so an operator who set it in observe got drop-new with a warning
+    /// that implied otherwise.
+    ///
+    /// It is refused rather than implemented for the reason the old inline
+    /// message already gave, ACK integrity: under PB-38 a successful enqueue
+    /// is what writes SubmitShares.Success, so evicting a queued share would
+    /// credit a miner for work upstream never receives.
+    ///
+    /// The `VELDRA_ALLOW_DROP_OLD_INLINE` override went with it. There is no
+    /// test that sets that variable, deliberately: the branch reading it is
+    /// deleted, so a test setting it would assert against code that does not
+    /// exist. Inline being refused unconditionally here IS that proof, since
+    /// the old exemption lived on the inline path.
     #[test]
-    fn validate_drop_old_inline_rejected_without_escape() {
-        let mut config = minimal_config(GatewayMode::Inline);
-        if let Some(ref mut upstream) = config.share_upstream {
-            upstream.forward_queue_drop_policy = QueueDropPolicy::DropOld;
+    fn drop_old_is_refused_in_every_mode() {
+        for mode in [GatewayMode::Inline, GatewayMode::Observe] {
+            let mut config = minimal_config(mode);
+            if let Some(ref mut upstream) = config.share_upstream {
+                upstream.forward_queue_drop_policy = QueueDropPolicy::DropOld;
+            }
+            let err = validate(&config)
+                .expect_err("drop_old must fail the boot in every mode, including observe");
+            assert!(
+                err.contains("not implemented"),
+                "the refusal must say the key is UNIMPLEMENTED, not merely \
+                 disallowed, or an operator will go looking for the override \
+                 that used to exist. Got: {err}"
+            );
         }
-        let result = validate(&config);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("drop_old"));
-    }
-
-    #[test]
-    fn validate_drop_old_observe_warns() {
-        let mut config = minimal_config(GatewayMode::Observe);
-        if let Some(ref mut upstream) = config.share_upstream {
-            upstream.forward_queue_drop_policy = QueueDropPolicy::DropOld;
-        }
-        let result = validate(&config);
-        assert!(result.is_ok());
-        let warnings = result.unwrap();
-        assert!(
-            warnings.iter().any(|w| w.contains("drop_old")),
-            "expected drop_old warning, got: {warnings:?}",
-        );
     }
 
     #[test]
