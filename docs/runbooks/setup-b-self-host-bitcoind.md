@@ -161,15 +161,15 @@ The launch-gate pipeline is bitcoind to template-manager to pool-verifier. templ
 2. **Template source.** template-manager polls the same node directly via `deploy/manager-setup-b.toml` (`rpc_url = "http://127.0.0.1:8332"`). Its credentials fall back to `VELDRA_BITCOIND_RPC_USER` and `VELDRA_BITCOIND_RPC_PASS` from the environment, so no secret lives in the file.
 3. **Deploy and start.** Install Docker on the node (`sudo apt-get install -y docker.io docker-compose-v2 && sudo usermod -aG docker ubuntu`, then log out and back in). From the workstation, copy the repo: `rsync -av --exclude target --exclude node_modules --exclude .git --exclude 'Veldra Site' --exclude data --exclude '.env*' ~/Veldra/ veldra-node:~/veldra/`. On the node in `~/veldra`: fill the two `deploy/policy-prod.toml` placeholders (`rpc_url` to `http://127.0.0.1:8332`, `rpc_user` to `veldra`), create `.env.setup-b` from `deploy/env.setup-b.example` and paste the RPC password, then `docker compose -f docker-compose.setup-b.yml --env-file .env.setup-b up -d --build`.
 
-## Part 8: Observe, then shadow, then soak
+## Part 8: Observe, then soak, still in observe
 
-1. Start the stack with the verifier in `VELDRA_MODE=observe`. Observe is read-only and lighter than shadow. Confirm clean wiring on the verifier `/metrics` (`:8081`):
+1. Start the stack with the verifier in `VELDRA_MODE=observe`. Observe reports verdicts without enforcing and persists them to `data/verdicts.log`, the record the soak is judged on. Confirm clean wiring on the verifier `/metrics` (`:8081`):
    - the log line `Phase 2 mempool view polling task started`,
    - `verifier_phase2_degraded_total` settles at `0` after the first successful poll,
    - `verifier_mempool_view_size` tracks `getmempoolinfo .size`,
    - `verifier_phase2_checks_total{result="agreed"}` climbs as templates flow,
    - `verifier_mempool_empty_responses` holds at `0`. Anything above zero means `getrawmempool` succeeded and came back empty, so the view was refused rather than served: the node is on the wrong chain or has not finished loading `mempool.dat`. Left unfixed the view never primes, `verifier_phase2_checks_total{result="unprimed"}` climbs instead of `agreed`, and the soak measures nothing.
-2. Promote the verifier to `VELDRA_MODE=shadow`.
+2. Leave the verifier in `VELDRA_MODE=observe` for the soak. **Do not switch it to `shadow`.** Shadow does not persist verdicts: `DeployMode::persist_verdicts` is `Observe | Inline` (`services/reservegrid-common/src/mode.rs:46`) and `append_verdict_to_disk` returns early on anything else (`services/pool-verifier/src/verdicts.rs:181`). A week in shadow writes no `data/verdicts.log`, so the acceptance bar below would be read off a file that does not exist.
 3. Run the one-week soak in `docs/runbooks/phase2-shadow-soak.md` from its Pre-Soak Setup step. The acceptance bar is `FP_total == 0` at `tolerance_pct = 4.0`.
 
 ## Acceptance for this runbook
