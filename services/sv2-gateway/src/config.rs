@@ -212,7 +212,10 @@ pub struct GatewaySection {
 
     /// WAL compaction threshold. After this many completed records are appended,
     /// the WAL is rewritten with only the pending entries. Default 1000. Set 0
-    /// to disable auto-compaction.
+    /// to disable auto-compaction, which also stops completions that arrive
+    /// before their pending record (PB-47) from ever being forgotten: the set
+    /// fills to its cap and stays full, so later ones fall back to a duplicate
+    /// Event 2 on restart. The file then grows without bound. For tests only.
     #[serde(default = "default_wal_compaction_threshold")]
     pub wal_compaction_threshold: usize,
 

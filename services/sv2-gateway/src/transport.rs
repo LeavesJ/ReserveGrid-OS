@@ -195,12 +195,12 @@ pub const MINER_TCP_USER_TIMEOUT: Duration = Duration::from_secs(120);
 /// Ask the kernel to end a miner connection whose peer has vanished (PB-48).
 ///
 /// After a channel opens nothing in the session bounds a miner's silence,
-/// and nothing safely can at the application level. The shipped
-/// `deploy/gateway-prod.toml` runs without vardiff and without a channel
-/// target, so a live miner submits a share only when it meets network
-/// difficulty, and SV2's mining protocol has no keepalive message. A silent
-/// miner and a dead one look the same to the handler. They do not look the
-/// same to TCP: a vanished host or path answers nothing.
+/// and nothing safely can at the application level. How often a live miner
+/// submits depends on its hashrate and its channel's target, so a small
+/// miner under a high target can go a long time between shares, and SV2's
+/// mining protocol has no keepalive message. A silent miner and a dead one
+/// look the same to the handler. They do not look the same to TCP: a
+/// vanished host or path answers nothing.
 ///
 /// * Keepalive covers an idle connection: its probes go unanswered and the
 ///   kernel ends the connection after the first probe plus the OS's probe

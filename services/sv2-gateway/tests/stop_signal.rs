@@ -94,13 +94,20 @@ fn sigint_exits_through_the_drain_path() {
     stops_through_the_drain_path("INT", "SIGINT");
 }
 
-fn stops_through_the_drain_path(kill_name: &str, logged: &str) {
-    let scratch = ScratchDir::new("pb49-stop");
-
-    // Shadow mode: no miner listener and no Noise keypair. The verifier and
-    // template source point at a closed port; the gateway retries both, which
-    // is fine, because this test only needs its main loop running.
-    let config = r#"mode = "shadow"
+/// Shadow mode: no miner listener and no Noise keypair. The verifier and
+/// template source point at a closed port; the gateway retries both, which
+/// is fine, because these tests only need its main loop running. `extra` is
+/// appended to the `[gateway]` table.
+fn spawn_gateway(
+    scratch: &ScratchDir,
+    extra: &str,
+) -> (
+    GatewayProcess,
+    Arc<Mutex<Vec<String>>>,
+    std::thread::JoinHandle<()>,
+) {
+    let config = format!(
+        r#"mode = "shadow"
 
 [gateway]
 listen_addr = "127.0.0.1:0"
@@ -108,10 +115,11 @@ health_addr = "127.0.0.1:0"
 noise_keypair_path = "unused-in-shadow-mode.key"
 authority_pubkey = "9095236f0477b38d1dabc5a098de5f19da2b1400c67cb7b3fd15904b4b9ab7b8"
 template_url = "http://127.0.0.1:1"
-
+{extra}
 [verifier]
 addr = "127.0.0.1:1"
-"#;
+"#
+    );
     let config_path = scratch.path.join("gateway.toml");
     std::fs::write(&config_path, config).expect("write config");
 
@@ -128,6 +136,47 @@ addr = "127.0.0.1:1"
             .expect("spawn sv2-gateway"),
     };
     let (lines, reader) = collect_stdout(&mut gateway.child);
+    (gateway, lines, reader)
+}
+
+/// PB-49 T2: an exit the gateway chooses drains the accounting queues too,
+/// not only a signal. A stale upstream under `fail_closed` is the one such
+/// exit a test can drive without a fake template source: nothing ever
+/// arrives from the closed port, so the loop ends once the threshold passes.
+#[test]
+fn an_exit_on_a_stale_upstream_drains_too() {
+    let scratch = ScratchDir::new("pb49-stale");
+    let (mut gateway, lines, reader) = spawn_gateway(
+        &scratch,
+        "upstream_stale_max_ms = 2000\nprevhash_verdict_timeout_ms = 500\nprevhash_stale_hold_ms = 1000\nupstream_failure_policy = \"fail_closed\"\n",
+    );
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = gateway.child.try_wait().expect("poll child") {
+            break status;
+        }
+        assert!(
+            started.elapsed() < BOOT_DEADLINE + EXIT_DEADLINE,
+            "the gateway never exited on its stale upstream"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    reader.join().expect("stdout reader");
+    let stdout = lines.lock().unwrap().join("\n");
+    assert_eq!(status.signal(), None, "died of a signal: {status:?}");
+    assert!(
+        stdout.contains("upstream stale beyond threshold (fail_closed)"),
+        "the gateway exited for some other reason; stdout was:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("accounting queues drained on stop"),
+        "an exit on a stale upstream must drain the accounting queues; stdout was:\n{stdout}"
+    );
+}
+
+fn stops_through_the_drain_path(kill_name: &str, logged: &str) {
+    let scratch = ScratchDir::new("pb49-stop");
+    let (mut gateway, lines, reader) = spawn_gateway(&scratch, "");
 
     let booted = Instant::now();
     while !lines

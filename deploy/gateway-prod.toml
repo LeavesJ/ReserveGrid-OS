@@ -4,7 +4,8 @@
 # Copy to your deployment and fill in all TODO fields before starting.
 #
 # Key differences from dev/gateway.toml:
-#   - No regtest channel target (miners must meet real difficulty)
+#   - No regtest channel target (channels open at difficulty 1; see PB-53
+#     at channel_target_hex below)
 #   - Per-IP connection cap enforced (50)
 #   - Tighter ntime slack (10s, tuned for mainnet)
 #   - WAL enabled for crash-durable share delivery
@@ -46,7 +47,13 @@ max_shares_per_second_per_channel = 100
 # you have measured a need.
 ntime_elapsed_slack_seconds = 10
 
-# No channel_target_hex: miners must meet the real network difficulty.
+# No channel_target_hex, so every channel's target is the gateway's
+# fallback, difficulty 1 (DIFF1), and with vardiff off it stays there. That
+# is not the network difficulty: a current ASIC finds hundreds to tens of
+# thousands of DIFF1 shares a second, far past
+# max_shares_per_second_per_channel above, and the excess is rejected as
+# share_rate_limited. PB-53, open: set a target or enable vardiff before
+# mainnet.
 # channel_target_hex = (omitted)
 
 noise_cert_path = "/config/keys/noise_cert.bin"

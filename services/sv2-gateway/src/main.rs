@@ -1343,11 +1343,11 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
     let mut emit_share_event = |line: &str| info!(target: "share_events", "{}", line);
 
     // A WAL failure ends the process with a failure status, so a supervisor
-    // can tell it from a requested stop (PB-49 T2). A requested stop drains
-    // the accounting queues before exiting; a WAL failure must not, since the
-    // WAL is what failed.
+    // can tell it from a requested stop (PB-49 T2). Every other exit drains
+    // the accounting queues first, whatever ended the loop; a WAL failure
+    // must not, since the WAL is what failed.
     let mut exit_code = ExitCode::SUCCESS;
-    let mut drain_on_exit = false;
+    let mut wal_failed = false;
 
     loop {
         // Compute the stale hold sleep future. If no deadline, sleep forever.
@@ -1671,6 +1671,7 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                         readiness.set_draining();
                         let _ = shutdown_tx.send(true);
                         exit_code = ExitCode::FAILURE;
+                        wal_failed = true;
                         break;
                     }
                 }
@@ -1713,6 +1714,7 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                         readiness.set_draining();
                         let _ = shutdown_tx.send(true);
                         exit_code = ExitCode::FAILURE;
+                        wal_failed = true;
                         break;
                     }
                 }
@@ -1868,13 +1870,12 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                 info!(signal, "shutdown signal received");
                 readiness.set_draining();
                 let _ = shutdown_tx.send(true);
-                drain_on_exit = true;
                 break;
             }
         }
     }
 
-    if drain_on_exit {
+    if !wal_failed {
         let (events, results, drained) = sv2_gateway::accounting::drain_on_stop(
             &mut share_event_rx,
             &mut share_result_rx,
@@ -2381,7 +2382,7 @@ async fn accept_loop(
                         // healthy miner is better served than refused
                         // because a socket option did not take.
                         if let Err(e) = sv2_gateway::transport::configure_miner_socket(&stream) {
-                            warn!(peer = %addr, error = %e, "failed to set keepalive on miner socket");
+                            warn!(peer = %addr, error = %e, "failed to set keepalive or TCP_USER_TIMEOUT on miner socket");
                         }
 
                         metrics.connections_total.inc();

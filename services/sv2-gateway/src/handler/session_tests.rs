@@ -246,8 +246,8 @@ pub(super) async fn open_session(config: HandlerConfig) -> Session {
 /// Measured 2026-09-22: still held at 45 s in both cases. That is also the
 /// right answer after PB-48, and this test cannot see the fix. The miner
 /// here is silent but its kernel is alive and answering, which is what a
-/// quiet, healthy miner looks like in the shipped config (no vardiff, no
-/// channel target, so shares are rare). PB-48's fix is for a peer whose
+/// healthy miner looks like between shares; under a high channel target
+/// that can be a long wait. PB-48's fix is for a peer whose
 /// host or path has VANISHED, which only the kernel can see: keepalive and
 /// `TCP_USER_TIMEOUT` (`transport::configure_miner_socket`). Reproducing a
 /// vanished peer on loopback needs a packet filter and root.

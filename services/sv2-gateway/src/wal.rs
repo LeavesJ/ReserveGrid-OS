@@ -75,7 +75,8 @@ pub struct ShareWal {
     /// Number of completed records written since last compaction.
     completed_since_compaction: usize,
     /// Compaction threshold: compact when `completed_since_compaction` exceeds
-    /// this value. 0 disables auto-compaction.
+    /// this value. 0 disables auto-compaction, and with it the only pruning
+    /// of `completed_early` outside `finish_recovery`.
     compaction_threshold: usize,
     /// Completions that arrived before their pending record (PB-47), keyed
     /// like `pending` and valued by when the completion was written. A
@@ -454,7 +455,8 @@ impl ShareWal {
 
     /// Forget early completions older than `EARLY_COMPLETION_TTL`. Called
     /// only from compaction, which then leaves them out of the rewritten file,
-    /// so memory and the file forget together.
+    /// so memory and the file forget together. With a compaction threshold of
+    /// 0 that is only at `finish_recovery`, so the set fills to its cap.
     fn prune_completed_early(&mut self, now: std::time::Instant) {
         self.completed_early.retain(|_, completed_at| {
             now.saturating_duration_since(*completed_at) < EARLY_COMPLETION_TTL
@@ -548,48 +550,60 @@ impl ShareWal {
     fn compact_inner(&mut self) -> std::io::Result<()> {
         self.prune_completed_early(std::time::Instant::now());
         let tmp_path = self.path.with_extension("wal.tmp");
-        {
-            let tmp_file = std::fs::File::create(&tmp_path)?;
-            let mut tmp_writer = std::io::BufWriter::new(tmp_file);
-            for ((share_id_hex, event_id_hex), ts) in &self.pending {
-                let record = WalRecord {
-                    status: WalStatus::Pending,
-                    share_id_hex: share_id_hex.clone(),
-                    event_id_hex: event_id_hex.clone(),
-                    timestamp_ms: *ts,
-                };
-                let line = serde_json::to_string(&record)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-                tmp_writer.write_all(line.as_bytes())?;
-                tmp_writer.write_all(b"\n")?;
-            }
-            // PB-47: a completion still waiting for its pending record is a
-            // live fact, not a finished one. Dropping it here would let the
-            // late pending record, which mark_pending writes, sit alone in the
-            // file and come back on restart as a crash orphan. Pruned just
-            // above and capped, so this is at most EARLY_COMPLETION_CAP lines.
-            let rewritten_at = unix_ms_now();
-            for (share_id_hex, event_id_hex) in self.completed_early.keys() {
-                let record = WalRecord {
-                    status: WalStatus::Completed,
-                    share_id_hex: share_id_hex.clone(),
-                    event_id_hex: event_id_hex.clone(),
-                    timestamp_ms: rewritten_at,
-                };
-                let line = serde_json::to_string(&record)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-                tmp_writer.write_all(line.as_bytes())?;
-                tmp_writer.write_all(b"\n")?;
-            }
-            tmp_writer.flush()?;
-            // PB-39, and this is the worse half of it. rename(2) is atomic in
-            // the directory entry, but without syncing the replacement first a
-            // power loss can leave the WAL name pointing at a file whose
-            // contents never reached storage. That does not lose the most
-            // recent record, it loses EVERY pending record at once, because
-            // compaction rewrites the whole file.
-            tmp_writer.get_ref().sync_all()?;
+        // Opened for append before the rename, and kept as the WAL's append
+        // handle after it: the inode is the same, so there is no reopen
+        // after the rename that could fail and leave the writer on the old,
+        // now unlinked, file. `create_new` because append cannot truncate a
+        // leftover from a crash mid-compaction, which is removed first.
+        match std::fs::remove_file(&tmp_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
         }
+        let mut tmp_writer = std::io::BufWriter::new(
+            std::fs::OpenOptions::new()
+                .create_new(true)
+                .append(true)
+                .open(&tmp_path)?,
+        );
+        for ((share_id_hex, event_id_hex), ts) in &self.pending {
+            let record = WalRecord {
+                status: WalStatus::Pending,
+                share_id_hex: share_id_hex.clone(),
+                event_id_hex: event_id_hex.clone(),
+                timestamp_ms: *ts,
+            };
+            let line = serde_json::to_string(&record)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            tmp_writer.write_all(line.as_bytes())?;
+            tmp_writer.write_all(b"\n")?;
+        }
+        // PB-47: a completion still waiting for its pending record is a
+        // live fact, not a finished one. Dropping it here would let the
+        // late pending record, which mark_pending writes, sit alone in the
+        // file and come back on restart as a crash orphan. Pruned just
+        // above and capped, so this is at most EARLY_COMPLETION_CAP lines.
+        let rewritten_at = unix_ms_now();
+        for (share_id_hex, event_id_hex) in self.completed_early.keys() {
+            let record = WalRecord {
+                status: WalStatus::Completed,
+                share_id_hex: share_id_hex.clone(),
+                event_id_hex: event_id_hex.clone(),
+                timestamp_ms: rewritten_at,
+            };
+            let line = serde_json::to_string(&record)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            tmp_writer.write_all(line.as_bytes())?;
+            tmp_writer.write_all(b"\n")?;
+        }
+        tmp_writer.flush()?;
+        // PB-39, and this is the worse half of it. rename(2) is atomic in
+        // the directory entry, but without syncing the replacement first a
+        // power loss can leave the WAL name pointing at a file whose
+        // contents never reached storage. That does not lose the most
+        // recent record, it loses EVERY pending record at once, because
+        // compaction rewrites the whole file.
+        tmp_writer.get_ref().sync_all()?;
         std::fs::rename(&tmp_path, &self.path)?;
         // The rename itself is metadata in the parent directory and is not
         // durable until the directory is synced. Without this the file can
@@ -610,12 +624,7 @@ impl ShareWal {
             }
         }
 
-        // Re-open append handle.
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
-        self.writer = std::io::BufWriter::new(file);
+        self.writer = tmp_writer;
         self.completed_since_compaction = 0;
 
         info!(pending = self.pending.len(), "wal: compacted");
