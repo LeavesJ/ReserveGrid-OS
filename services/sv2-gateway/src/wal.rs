@@ -114,9 +114,10 @@ fn unix_ms_now() -> u64 {
 /// One batch is at most about 230 KB of NDJSON at the 221-byte record the
 /// PB-39 bench measured, and one fdatasync. The bound keeps a flood from
 /// holding the select loop away from its template and shutdown arms for
-/// longer than one such write, while still amortising the sync roughly a
-/// thousandfold at the load where per-record syncing used to overflow the
-/// accounting queue.
+/// longer than one such write. When a completion batch also trips compaction,
+/// compaction dominates: the PB-44 T2 reviewer measured 27.7ms for
+/// `mark_pending(1024)` and 55.6ms for `mark_completed(1024)` plus a
+/// compaction rewriting 4096 pending records, on macOS APFS.
 pub const WAL_BATCH_MAX: usize = 1024;
 
 /// How long a completion that arrived before its pending record is remembered
@@ -381,6 +382,25 @@ impl ShareWal {
     /// Number of entries currently pending (not yet completed).
     pub fn pending_count(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Syncs issued so far, for tests that hold a batch to one sync.
+    #[cfg(test)]
+    pub(crate) fn syncs_for_test(&self) -> usize {
+        self.syncs
+    }
+
+    /// Make every later append fail, by swapping the append handle for a
+    /// read-only one on the same file: a portable stand-in for a full or
+    /// read-only disk, which `/dev/full` gives only on Linux.
+    #[cfg(test)]
+    #[allow(clippy::expect_used)]
+    pub(crate) fn fail_writes_for_test(&mut self) {
+        let read_only = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&self.path)
+            .expect("reopen the WAL read-only");
+        self.writer = std::io::BufWriter::new(read_only);
     }
 
     /// Forget early completions older than `EARLY_COMPLETION_TTL_MS`, at most
@@ -798,26 +818,28 @@ mod tests {
              the high number means the sync is not reaching storage here.",
             elapsed.as_secs_f64() * 1000.0 / f64::from(n)
         );
-        // PB-44: the same records, 64 to a batch, so one sync per 64.
-        let batched_path = temp_wal_path("pb44_bench");
-        cleanup(&batched_path);
-        let mut batched_wal = ShareWal::open(&batched_path, usize::MAX).unwrap();
+        // PB-44: the same records in batches, one sync per batch.
         let ids: Vec<(String, String)> = (0..n)
             .map(|i| (format!("{i:064x}"), format!("{:064x}", i * 7)))
             .collect();
-        let start = std::time::Instant::now();
-        for chunk in ids.chunks(64) {
-            batched_wal.mark_pending(chunk).unwrap();
+        for per_sync in [64usize, 1024] {
+            let batched_path = temp_wal_path("pb44_bench");
+            cleanup(&batched_path);
+            let mut batched_wal = ShareWal::open(&batched_path, usize::MAX).unwrap();
+            let start = std::time::Instant::now();
+            for chunk in ids.chunks(per_sync) {
+                batched_wal.mark_pending(chunk).unwrap();
+            }
+            let batched = start.elapsed();
+            #[allow(clippy::cast_precision_loss)]
+            let batched_per_sec = f64::from(n) / batched.as_secs_f64();
+            println!(
+                "PB-44 batched: {n} records, {per_sync} per sync, in {batched:?} = \
+                 {batched_per_sec:.0}/s, {:.1}x the per-record rate above.",
+                batched_per_sec / per_sec
+            );
+            cleanup(&batched_path);
         }
-        let batched = start.elapsed();
-        #[allow(clippy::cast_precision_loss)]
-        let batched_per_sec = f64::from(n) / batched.as_secs_f64();
-        println!(
-            "PB-44 batched: {n} records, 64 per sync, in {batched:?} = \
-             {batched_per_sec:.0}/s, {:.1}x the per-record rate above.",
-            batched_per_sec / per_sec
-        );
-        cleanup(&batched_path);
         cleanup(&path);
     }
 
@@ -1005,99 +1027,6 @@ mod tests {
         assert_eq!(left, 5, "the rest stays queued for the next wakeup");
     }
 
-    /// PB-44's end-to-end claim, measured on whatever filesystem this runs
-    /// on. A producer offers accounting events into an mpsc(4096), the
-    /// capacity the gateway gives `share_event_tx`, with `try_send` exactly as
-    /// the handler does. A consumer drains it the way the main loop does,
-    /// paying the WAL inside `spawn_blocking` once per event (before PB-44)
-    /// or once per `take_queued` batch (after). This models the select arm
-    /// rather than running `main.rs`; the channel, the WAL and `take_queued`
-    /// are the real ones.
-    ///
-    /// `cargo test -p sv2-gateway --lib offered_load -- --ignored --nocapture`
-    #[test]
-    #[ignore = "a measurement, not an assertion: depends on this filesystem's fdatasync cost"]
-    fn offered_load_drops_with_and_without_batching() {
-        for batched in [false, true] {
-            let (offered, dropped, drained) =
-                offered_load_run(batched, 3, std::time::Duration::from_secs(4));
-            println!(
-                "PB-44 offered load, {}: offered {offered}, drained {drained}, dropped {dropped}",
-                if batched {
-                    "batched"
-                } else {
-                    "one sync per event"
-                }
-            );
-        }
-    }
-
-    /// Offer `per_ms` events every millisecond for `window`, then report
-    /// (offered, dropped at the queue, drained by the consumer in the window).
-    fn offered_load_run(
-        batched: bool,
-        per_ms: u64,
-        window: std::time::Duration,
-    ) -> (u64, u64, u64) {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        use std::sync::{Arc, Mutex};
-
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async move {
-            let path = temp_wal_path(if batched {
-                "pb44_load_batched"
-            } else {
-                "pb44_load_single"
-            });
-            cleanup(&path);
-            let wal = Arc::new(Mutex::new(ShareWal::open(&path, 1000).unwrap()));
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, String)>(4096);
-            let drained = Arc::new(AtomicU64::new(0));
-
-            let consumer = {
-                let drained = Arc::clone(&drained);
-                tokio::spawn(async move {
-                    while let Some(first) = rx.recv().await {
-                        let batch = if batched {
-                            take_queued(&mut rx, first)
-                        } else {
-                            vec![first]
-                        };
-                        let n = u64::try_from(batch.len()).unwrap();
-                        let wal = Arc::clone(&wal);
-                        tokio::task::spawn_blocking(move || {
-                            wal.lock().unwrap().mark_pending(&batch)
-                        })
-                        .await
-                        .unwrap()
-                        .unwrap();
-                        drained.fetch_add(n, Ordering::Relaxed);
-                    }
-                })
-            };
-
-            let (mut offered, mut dropped) = (0u64, 0u64);
-            let mut tick = tokio::time::interval(std::time::Duration::from_millis(1));
-            let start = tokio::time::Instant::now();
-            while start.elapsed() < window {
-                tick.tick().await;
-                for _ in 0..per_ms {
-                    let id = format!("{offered:064x}");
-                    offered += 1;
-                    if tx.try_send((id.clone(), id)).is_err() {
-                        dropped += 1;
-                    }
-                }
-            }
-            consumer.abort();
-            cleanup(&path);
-            (offered, dropped, drained.load(Ordering::Relaxed))
-        })
-    }
-
     #[test]
     fn a_completion_that_arrives_first_leaves_nothing_pending() {
         let path = temp_wal_path("pb47_reversed");
@@ -1185,6 +1114,48 @@ mod tests {
             wal.completed_early.is_empty(),
             "past the TTL it is forgotten"
         );
+        cleanup(&path);
+    }
+
+    /// PB-44 T2: a batch whose completions carry the count PAST the threshold
+    /// must still compact. Counting a batch as one completion, or comparing
+    /// with `==`, leaves compaction unreachable once batches jump the
+    /// threshold, and the WAL then grows without bound.
+    #[test]
+    fn a_batch_that_jumps_past_the_threshold_still_compacts() {
+        let path = temp_wal_path("pb44_jump_threshold");
+        cleanup(&path);
+        let ids: Vec<(String, String)> = (0..5)
+            .map(|i| (format!("{i:064x}"), format!("{:064x}", i + 50)))
+            .collect();
+        let mut wal = ShareWal::open(&path, 3).unwrap();
+        wal.mark_pending(&ids).unwrap();
+        wal.mark_completed(&ids).unwrap();
+        let contents = read_wal_file_independently(&path);
+        assert!(
+            contents.is_empty(),
+            "five completions against a threshold of three must compact to an empty file: {contents:?}"
+        );
+        cleanup(&path);
+    }
+
+    /// PB-44 T2: a pending batch that cannot be written leaves the index
+    /// exactly as it was. The Linux-only `/dev/full` test covers this on CI;
+    /// this one runs everywhere.
+    #[test]
+    fn a_failed_pending_batch_changes_nothing() {
+        let path = temp_wal_path("pb44_failed_batch");
+        cleanup(&path);
+        let mut wal = ShareWal::open(&path, 1000).unwrap();
+        wal.fail_writes_for_test();
+        let ids: Vec<(String, String)> = (0..3)
+            .map(|i| (format!("{i:064x}"), format!("{:064x}", i + 50)))
+            .collect();
+        assert!(
+            wal.mark_pending(&ids).is_err(),
+            "a read-only handle must fail the append"
+        );
+        assert_eq!(wal.pending_count(), 0, "a failed batch indexes nothing");
         cleanup(&path);
     }
 }

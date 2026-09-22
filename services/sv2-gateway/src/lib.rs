@@ -9,6 +9,7 @@
 //! - `observe`: data-plane telemetry, no verdict gating
 //! - `shadow`: out-of-band audit, no miner connections
 
+pub mod accounting;
 pub mod channels;
 pub mod config;
 pub mod connection;

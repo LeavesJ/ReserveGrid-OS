@@ -1019,6 +1019,19 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
     }
 
     // ── 4b. Share forward WAL (crash durability) ──
+    // VELDRA_WAL_WRITE_FAILURE_MODE=accept_silent was a one-release migration
+    // shim, scheduled for removal in v1.2.0 and removed in 2.0.0: a WAL write
+    // failure now always shuts the gateway down. A deployment still setting it
+    // is told so here rather than getting the fatal behaviour it opted out of
+    // without a word. Not a refusal to boot: the removed value only ever
+    // relaxed safety, and the behaviour it gets instead is the strict one.
+    if let Ok(mode) = std::env::var("VELDRA_WAL_WRITE_FAILURE_MODE") {
+        error!(
+            value = %mode,
+            "VELDRA_WAL_WRITE_FAILURE_MODE was removed in 2.0.0 and is ignored; \
+             a WAL write failure always shuts the gateway down"
+        );
+    }
     let share_wal: Option<Arc<Mutex<sv2_gateway::wal::ShareWal>>> =
         if cfg.gateway.wal_path.is_empty() {
             debug!("share wal: disabled (wal_path is empty)");
@@ -1293,6 +1306,10 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
         );
     }
 
+    // Where the accounting stream's NDJSON lines go: the `share_events`
+    // tracing target, written synchronously to stdout.
+    let mut emit_share_event = |line: &str| info!(target: "share_events", "{}", line);
+
     loop {
         // Compute the stale hold sleep future. If no deadline, sleep forever.
         let stale_hold_sleep = async {
@@ -1559,11 +1576,17 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
             // Share forward results: emit NDJSON ShareForwardResultEvent.
             result = share_result_rx.recv() => {
                 if let Some(first) = result {
-                    // PB-44: take every result already queued behind this
-                    // one, so one WAL write and one sync cover the batch.
-                    // Paying a sync per result is what capped this loop near
-                    // 1,170 accepted shares/s on the node.
-                    let results = sv2_gateway::wal::take_queued(&mut share_result_rx, first);
+                    // Every Event 2 line of the batch is emitted BEFORE the
+                    // WAL marks those shares complete, so a crash or a failed
+                    // write costs a duplicate on restart, never a missing
+                    // line (PB-44 T2; see sv2_gateway::accounting).
+                    let (results, recorded) = sv2_gateway::accounting::record_forwarded(
+                        &mut share_result_rx,
+                        first,
+                        share_wal.as_ref(),
+                        &mut emit_share_event,
+                    )
+                    .await;
                     for result in &results {
                         let fwd_result = if result.forwarded && result.upstream_accepted == Some(true) {
                             "success"
@@ -1573,75 +1596,6 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                         gw_metrics.share_forward_total.get_or_create(&ForwardLabels {
                             result: fwd_result.into(),
                         }).inc();
-                    }
-
-                    // WAL: mark forwards complete (removes pending entries).
-                    // Runs on the blocking thread pool to avoid stalling
-                    // the tokio executor on disk I/O.
-                    //
-                    // Write failures are fatal by default: a silent WAL
-                    // error would orphan pending entries with no recovery
-                    // record, permanently breaking the 1:1 join invariant
-                    // between ShareAcceptedEvent and ShareForwardResultEvent.
-                    // Set VELDRA_WAL_WRITE_FAILURE_MODE=accept_silent to
-                    // temporarily preserve the pre-R-152 behaviour; this
-                    // flag is intended for one-release migrations only and
-                    // will be removed in v1.3.0.
-                    if let Some(ref wal) = share_wal {
-                        let wal = Arc::clone(wal);
-                        let completed: Vec<(String, String)> = results
-                            .iter()
-                            .map(|r| (r.share_id_hex.clone(), r.event_id_hex.clone()))
-                            .collect();
-                        let batch = completed.len();
-                        let first_share = completed.first().map(|(sid, _)| sid.clone()).unwrap_or_default();
-                        let wal_result = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-                            let mut w = wal.lock().map_err(|_| {
-                                std::io::Error::other("wal mutex poisoned in mark_completed")
-                            })?;
-                            w.mark_completed(&completed)
-                        })
-                        .await;
-                        let io_err = match wal_result {
-                            Ok(Ok(())) => None,
-                            Ok(Err(e)) => Some(e),
-                            Err(join_err) => Some(std::io::Error::other(format!(
-                                "wal mark_completed spawn_blocking: {join_err}"
-                            ))),
-                        };
-                        if let Some(e) = io_err {
-                            let mode = std::env::var("VELDRA_WAL_WRITE_FAILURE_MODE")
-                                .unwrap_or_else(|_| "fatal".to_string());
-                            error!(
-                                share_id = %first_share,
-                                batch,
-                                op = "mark_completed",
-                                error = %e,
-                                mode = %mode,
-                                reason_code = GatewayReason::WalWriteFailure.as_str(),
-                                "wal: write failure; durability cannot be preserved"
-                            );
-                            if mode != "accept_silent" {
-                                readiness.set_draining();
-                                let _ = shutdown_tx.send(true);
-                                break;
-                            }
-                        }
-                    }
-
-                    for result in &results {
-                        let forward_evt = sv2_gateway::shares::ShareForwardResultEvent::from_relay(
-                            &result.share_id_hex,
-                            &result.event_id_hex,
-                            result.forwarded,
-                            result.upstream_accepted,
-                            result.upstream_http_status,
-                            result.upstream_error.clone(),
-                            result.reason_code.clone(),
-                        );
-                        if let Ok(line) = serde_json::to_string(&forward_evt) {
-                            info!(target: "share_events", "{}", line);
-                        }
 
                         if result.forwarded {
                             if result.upstream_accepted == Some(true) {
@@ -1664,19 +1618,40 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                             );
                         }
                     }
+                    // A WAL failure is fatal: carrying on would leave shares
+                    // whose recovery record is in doubt.
+                    if let Err(e) = recorded {
+                        error!(
+                            share_id = %results.first().map_or("", |r| r.share_id_hex.as_str()),
+                            batch = results.len(),
+                            op = "mark_completed",
+                            error = %e,
+                            reason_code = GatewayReason::WalWriteFailure.as_str(),
+                            "wal: write failure; durability cannot be preserved"
+                        );
+                        readiness.set_draining();
+                        let _ = shutdown_tx.send(true);
+                        break;
+                    }
                 }
             }
 
             // Share accepted/rejected events: emit NDJSON.
             evt = share_event_rx.recv() => {
                 if let Some(first) = evt {
-                    // PB-44: take every event already queued behind this one,
-                    // so one WAL write and one sync cover the batch. A sync
-                    // per event capped this loop near 1,170 accepted shares/s
-                    // on the node, and past that share_event_tx overflowed
-                    // and dropped accounting events.
-                    let events = sv2_gateway::wal::take_queued(&mut share_event_rx, first);
-                    let mut accepted_ids: Vec<(String, String)> = Vec::new();
+                    // Accepted lines are emitted only AFTER their pending
+                    // records are durable; rejected lines at once (PB-44 T2;
+                    // see sv2_gateway::accounting). The connection handler
+                    // has already ACKed each share, so a failure here cannot
+                    // "un-ACK" one; what it must prevent is the next share
+                    // being accepted into a state where durability is broken.
+                    let (events, recorded) = sv2_gateway::accounting::record_accepted(
+                        &mut share_event_rx,
+                        first,
+                        share_wal.as_ref(),
+                        &mut emit_share_event,
+                    )
+                    .await;
                     for evt in &events {
                         let accepted = evt.sv2_response == "success";
                         let share_result = if accepted { "accepted" } else { "rejected" };
@@ -1685,61 +1660,19 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                             reason_code: evt.reason_code.as_deref().unwrap_or("ok").into(),
                         }).inc();
                         channel_registry.update_share(evt.channel_id, accepted, evt.difficulty_u64).await;
-                        if accepted {
-                            accepted_ids.push((evt.share_id_hex.clone(), evt.event_id_hex.clone()));
-                        }
                     }
-
-                    // WAL: track accepted shares that require a forward result.
-                    // Write-ordering note: the connection handler sends each
-                    // share's SV2 ACK without waiting on this write, so a
-                    // failure here cannot "un-ACK" a share. What it MUST
-                    // prevent is the next share being accepted into a state
-                    // where durability has silently broken. See the fatality
-                    // comment on the share_result_rx arm above.
-                    if !accepted_ids.is_empty()
-                        && let Some(ref wal) = share_wal
-                    {
-                        let wal = Arc::clone(wal);
-                        let batch = accepted_ids.len();
-                        let first_share = accepted_ids.first().map(|(sid, _)| sid.clone()).unwrap_or_default();
-                        let wal_result = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-                            let mut w = wal.lock().map_err(|_| {
-                                std::io::Error::other("wal mutex poisoned in mark_pending")
-                            })?;
-                            w.mark_pending(&accepted_ids)
-                        })
-                        .await;
-                        let io_err = match wal_result {
-                            Ok(Ok(())) => None,
-                            Ok(Err(e)) => Some(e),
-                            Err(join_err) => Some(std::io::Error::other(format!(
-                                "wal mark_pending spawn_blocking: {join_err}"
-                            ))),
-                        };
-                        if let Some(e) = io_err {
-                            let mode = std::env::var("VELDRA_WAL_WRITE_FAILURE_MODE")
-                                .unwrap_or_else(|_| "fatal".to_string());
-                            error!(
-                                share_id = %first_share,
-                                batch,
-                                op = "mark_pending",
-                                error = %e,
-                                mode = %mode,
-                                reason_code = GatewayReason::WalWriteFailure.as_str(),
-                                "wal: write failure; durability cannot be preserved"
-                            );
-                            if mode != "accept_silent" {
-                                readiness.set_draining();
-                                let _ = shutdown_tx.send(true);
-                                break;
-                            }
-                        }
-                    }
-                    for evt in &events {
-                        if let Ok(line) = serde_json::to_string(evt) {
-                            info!(target: "share_events", "{}", line);
-                        }
+                    if let Err(e) = recorded {
+                        error!(
+                            share_id = %events.first().map_or("", |e| e.share_id_hex.as_str()),
+                            batch = events.len(),
+                            op = "mark_pending",
+                            error = %e,
+                            reason_code = GatewayReason::WalWriteFailure.as_str(),
+                            "wal: write failure; durability cannot be preserved"
+                        );
+                        readiness.set_draining();
+                        let _ = shutdown_tx.send(true);
+                        break;
                     }
                 }
             }

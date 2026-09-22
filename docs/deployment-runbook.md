@@ -578,13 +578,14 @@ to intervene is safer than silently losing shares.
    as `process_crash_recovery` events, so no shares are lost as long as the WAL
    file itself survived.
 
-**Migration shim:** operators running on known flaky storage (overprovisioned
-PVs, misbehaving NFS) can temporarily opt back into the pre-R-152 behaviour by
-setting `VELDRA_WAL_WRITE_FAILURE_MODE=accept_silent`. In that mode the gateway
-logs the error and continues, matching v1.0.x behaviour. This flag exists for a
-single release transition and is scheduled for removal in v1.2.0. Any
-environment still relying on it at that point will silently violate the join
-invariant and is expected to have fixed its storage layer before then.
+**Removed in 2.0.0:** `VELDRA_WAL_WRITE_FAILURE_MODE=accept_silent`, the
+one-release migration shim that let the gateway log a WAL write failure and
+carry on. It was scheduled for removal in v1.2.0. A WAL write failure now
+always shuts the gateway down. If the variable is still set, the gateway logs
+an error at startup saying it is ignored, and runs with the fatal behaviour.
+Fix flaky storage (overprovisioned PVs, misbehaving NFS) rather than masking it:
+a gateway that carries on past a failed WAL write silently breaks the join
+invariant the WAL exists to keep.
 
 ---
 
