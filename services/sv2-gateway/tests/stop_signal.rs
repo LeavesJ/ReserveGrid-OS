@@ -14,10 +14,11 @@
 #![cfg(unix)]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::io::{Read as _, Write as _};
+use std::io::BufRead as _;
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Long enough for a debug build to boot on a loaded CI runner.
@@ -60,26 +61,25 @@ impl Drop for GatewayProcess {
     }
 }
 
-fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind 0");
-    l.local_addr().expect("local addr").port()
-}
+/// The gateway's log line once its main loop is running. The stop handler is
+/// installed before anything else, so a signal sent after this line cannot
+/// race the install. Waiting on the log, not on a health port, is deliberate:
+/// a port picked free and handed to the gateway can be taken by another test
+/// in between, which made this test time out under a full parallel run.
+const IN_MAIN_LOOP: &str = "entering main loop";
 
-/// One plain HTTP/1.1 GET of the liveness route; true on a 200.
-fn health_ok(port: u16) -> bool {
-    let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) else {
-        return false;
-    };
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-    if stream
-        .write_all(b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
-        .is_err()
-    {
-        return false;
-    }
-    let mut response = String::new();
-    let _ = stream.read_to_string(&mut response);
-    response.starts_with("HTTP/1.1 200")
+/// Collect the child's stdout lines as they arrive, so the test can wait on
+/// one and still read them all after the exit.
+fn collect_stdout(child: &mut Child) -> (Arc<Mutex<Vec<String>>>, std::thread::JoinHandle<()>) {
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let out = child.stdout.take().expect("piped stdout");
+    let sink = Arc::clone(&lines);
+    let reader = std::thread::spawn(move || {
+        for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+            sink.lock().unwrap().push(line);
+        }
+    });
+    (lines, reader)
 }
 
 #[test]
@@ -96,25 +96,22 @@ fn sigint_exits_through_the_drain_path() {
 
 fn stops_through_the_drain_path(kill_name: &str, logged: &str) {
     let scratch = ScratchDir::new("pb49-stop");
-    let health_port = free_port();
 
     // Shadow mode: no miner listener and no Noise keypair. The verifier and
     // template source point at a closed port; the gateway retries both, which
     // is fine, because this test only needs its main loop running.
-    let config = format!(
-        r#"mode = "shadow"
+    let config = r#"mode = "shadow"
 
 [gateway]
 listen_addr = "127.0.0.1:0"
-health_addr = "127.0.0.1:{health_port}"
+health_addr = "127.0.0.1:0"
 noise_keypair_path = "unused-in-shadow-mode.key"
 authority_pubkey = "9095236f0477b38d1dabc5a098de5f19da2b1400c67cb7b3fd15904b4b9ab7b8"
 template_url = "http://127.0.0.1:1"
 
 [verifier]
 addr = "127.0.0.1:1"
-"#
-    );
+"#;
     let config_path = scratch.path.join("gateway.toml");
     std::fs::write(&config_path, config).expect("write config");
 
@@ -126,23 +123,27 @@ addr = "127.0.0.1:1"
             .env("VELDRA_LOG_FILTER", "info")
             .current_dir(&scratch.path)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::null())
             .spawn()
             .expect("spawn sv2-gateway"),
     };
+    let (lines, reader) = collect_stdout(&mut gateway.child);
 
-    // The SIGTERM handler is installed before the health server starts, so a
-    // /healthz answer means a signal sent now cannot race the install.
     let booted = Instant::now();
-    while !health_ok(health_port) {
+    while !lines
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|l| l.contains(IN_MAIN_LOOP))
+    {
         if let Some(status) = gateway.child.try_wait().expect("poll child") {
             panic!("the gateway exited during boot: {status:?}");
         }
         assert!(
             booted.elapsed() < BOOT_DEADLINE,
-            "the gateway never served /healthz within {BOOT_DEADLINE:?}"
+            "the gateway never reached its main loop within {BOOT_DEADLINE:?}"
         );
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(50));
     }
 
     let sent = Command::new("kill")
@@ -164,10 +165,8 @@ addr = "127.0.0.1:1"
         std::thread::sleep(Duration::from_millis(50));
     };
 
-    let mut stdout = String::new();
-    if let Some(mut out) = gateway.child.stdout.take() {
-        let _ = out.read_to_string(&mut stdout);
-    }
+    reader.join().expect("stdout reader");
+    let stdout = lines.lock().unwrap().join("\n");
     assert_eq!(
         status.signal(),
         None,
