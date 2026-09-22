@@ -343,7 +343,8 @@ pub(crate) const DEFAULT_MAX_INGRESS_CONNECTIONS: u32 = 32;
 /// peer whose cadence is not yet learned or that never heartbeats, instead
 /// of the ~58 s measured before. A path that black-holes gives the gateway
 /// no reset, so it reconnects only once it has heard nothing for three to
-/// four heartbeats (PB-51), 6 to 8 s at 2 s, by when the dead socket is past
+/// four heartbeats (PB-51), 6 to 8 s at 2 s, or about 12 s when a template
+/// write is what the black hole swallows; by then the dead socket is past
 /// its threshold. The shed does nothing for refusals by the global cap, and
 /// nothing when this ceiling is `0`. Several dead
 /// sockets at one address shed one at a time, since each may shed only

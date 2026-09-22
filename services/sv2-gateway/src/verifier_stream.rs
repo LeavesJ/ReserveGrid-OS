@@ -221,7 +221,9 @@ pub async fn run_verifier_stream(
 /// intervals: 6 to 8 s at the 2 s default. Time spent blocked writing a
 /// template does not count as silence, because the verifier cannot answer a
 /// template it is still receiving; a write that stops moving bytes altogether
-/// is failed by `StallGuard` after the same three intervals.
+/// is failed by `StallGuard` after the same three intervals. So a black hole
+/// that swallows a template written just before the deadline takes about six
+/// intervals, 12 s at the default: measured at 5.8 in the PB-51 T2 review.
 const READ_DEADLINE_BEATS: u32 = 3;
 
 /// A writer that fails a write which has moved no bytes for `stall` (PB-51).
@@ -579,13 +581,18 @@ where
                         // A stall can leave this task already scheduled by a
                         // tick when a verdict reaches the kernel, and tokio
                         // reports a socket readable only once its driver has
-                        // turned. One yield is that turn; the reads-first
-                        // order then takes the verdict ahead of the immediate
-                        // recheck. A verifier that is gone fails the recheck,
-                        // so detection is no slower (PB-51 T2).
+                        // turned. A timer fires only in a driver turn that
+                        // polled I/O first, so this sleep guarantees that
+                        // turn; the reads-first order then takes the verdict
+                        // ahead of the immediate recheck. A yield would not
+                        // do: on the multi-thread runtime, which the gateway
+                        // runs, a yielded task can be polled again with no
+                        // driver turn when another worker holds the driver.
+                        // A verifier that is gone fails the recheck, 1 ms
+                        // later than without it (PB-51 T2).
                         rechecking = true;
                         heartbeat_interval.reset_immediately();
-                        tokio::task::yield_now().await;
+                        tokio::time::sleep(Duration::from_millis(1)).await;
                         continue;
                     }
                     warn!(
@@ -1024,9 +1031,10 @@ mod tests {
             use tokio::io::AsyncWriteExt as _;
             let (head, tail) = first.split_at(first.len() / 2);
             verifier_side.write_all(head.as_bytes()).await.unwrap();
-            // Two 50 ms heartbeat ticks fire before the rest arrives, and
-            // 120 ms stays inside PB-51's three-beat read deadline (150 ms).
-            tokio::time::sleep(Duration::from_millis(120)).await;
+            // The 50 ms heartbeat tick fires before the rest arrives, and
+            // 75 ms stays well inside PB-51's three-beat read deadline
+            // (150 ms), so load cannot turn this into a silence drop.
+            tokio::time::sleep(Duration::from_millis(75)).await;
             verifier_side.write_all(tail.as_bytes()).await.unwrap();
             verifier_side.write_all(second.as_bytes()).await.unwrap();
             // Closing the verifier side ends the loop with EOF.
@@ -1051,7 +1059,7 @@ mod tests {
     /// `READ_DEADLINE_BEATS` heartbeat intervals so the outer loop reconnects.
     /// It used to be waited on forever. Paused time pins the moment: the
     /// fourth tick is the first past the deadline, and its recheck (PB-51 T2)
-    /// drops at once rather than a heartbeat later.
+    /// drops 1 ms later rather than a heartbeat later.
     #[tokio::test(start_paused = true)]
     async fn a_silent_verifier_is_dropped_after_three_heartbeats() {
         let (verifier_side, gateway_side) = tokio::io::duplex(64 * 1024);
@@ -1075,7 +1083,7 @@ mod tests {
             "dropped after {took:?}, before three 30 ms heartbeats had passed"
         );
         assert!(
-            took <= Duration::from_millis(120),
+            took <= Duration::from_millis(121),
             "dropped after {took:?}; the recheck waited for another heartbeat"
         );
     }
@@ -1266,6 +1274,26 @@ mod tests {
         .expect("a black hole with a template in flight was waited on forever");
         assert!(matches!(outcome, IoLoopOutcome::Disconnected));
         assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    /// PB-51 T2: the heartbeat writes go through the same guard. With no
+    /// template to send, a black hole that stops accepting even heartbeats is
+    /// failed by the stalled heartbeat write, not waited on in it.
+    #[tokio::test]
+    async fn a_black_hole_that_takes_no_heartbeat_is_dropped() {
+        let (_verifier_side, gateway_side) = tokio::io::duplex(64 * 1024);
+        let (outcome, _) = tokio::time::timeout(
+            Duration::from_secs(3),
+            drive_with(
+                gateway_side,
+                BlackHole { cap: 0 },
+                Duration::from_millis(30),
+                |_| {},
+            ),
+        )
+        .await
+        .expect("a stalled heartbeat write was waited on forever");
+        assert!(matches!(outcome, IoLoopOutcome::Disconnected));
     }
 
     /// PB-51 T2: a live verifier on a slow link is not silent while it is

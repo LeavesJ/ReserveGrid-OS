@@ -60,7 +60,8 @@
 //! path is dead and its new one is refused: a NAT remap that answers the
 //! gateway's next write with a reset, a gateway host that crashes and comes
 //! back, or a path that black-holes, which sv2-gateway gives up on after
-//! three to four heartbeats of silence and reconnects from (PB-51). It does
+//! three to four heartbeats of silence, or about six when the black hole
+//! swallows a template mid-write, and reconnects from (PB-51). It does
 //! not touch refusals by the global cap, and with the per-IP ceiling
 //! disabled (`0`) there is no full address and so no shed.
 //!
@@ -152,11 +153,15 @@ impl ShedAtCap {
 /// like.** It is `(latest arrival - connection start) / (heartbeats - 1)`.
 /// sv2-gateway sends heartbeats from a `tokio::time::interval`, which never
 /// fires ahead of its schedule: a late tick fires late, and missed ticks
-/// catch up but never get ahead. Its first heartbeat goes out after the TLS
-/// handshake, so after this connection started. So heartbeat `n` is sent no
-/// earlier than `start + (n - 1) * H` and read no earlier than that, and the
-/// estimate is never below `H`, however late, bunched, or reordered-in-time
-/// the verifier's reads are. That is the property the earlier estimators
+/// catch up but never get ahead. Over TLS its first heartbeat goes out after
+/// the handshake, so after this connection started. So heartbeat `n` is sent
+/// no earlier than `start + (n - 1) * H` and read no earlier than that, and
+/// the estimate is never below `H`, however late, bunched, or
+/// reordered-in-time the verifier's reads are. Over plaintext, which the
+/// gateway allows with a warning, its interval starts at TCP connect, so a
+/// verifier that accepts `D` late can learn `H - D / (n - 1)`. At 2 s the
+/// 3 s floor keeps that from ever shedding a live peer; at 5 s it takes an
+/// accept more than 7.5 s late (PB-31 final review, measured). That is the property the earlier estimators
 /// lacked: they measured intervals between READS, which a busy verifier
 /// compresses. Delays only make this estimate larger, which errs toward
 /// keeping a connection.

@@ -130,22 +130,39 @@ pub async fn record_forwarded(
     (results, recorded)
 }
 
-/// Drain what is already queued on both accounting channels, through the same
-/// two functions the main loop uses, so a requested stop does not discard the
-/// shares miners were already told were accepted (PB-49 T2).
+/// Drain both accounting channels through the same two functions the main
+/// loop uses, so a stop does not discard the shares miners were already told
+/// were accepted (PB-49 T2).
+///
+/// It runs until one pass finds both queues empty, so it also takes what the
+/// connection handlers send while they stop; the caller tells them to stop
+/// first, or the queues may never empty. `deadline` bounds it anyway. It is
+/// checked between batches, so no batch is cut in half, and passing it is
+/// returned as a `TimedOut` error naming what is still queued.
 ///
 /// Stops at the first WAL failure and returns it. Returns how many accounting
-/// events and forward results it drained. The connection handlers may still
-/// send for a moment after the stop; this takes what is queued, not what is
-/// still to come.
+/// events and forward results it drained.
 pub async fn drain_on_stop(
     events: &mut Receiver<ShareAcceptedEvent>,
     results: &mut Receiver<ShareForwardResult>,
     wal: Option<&SharedWal>,
     emit: &mut (dyn FnMut(&str) + Send),
+    deadline: tokio::time::Instant,
 ) -> (usize, usize, std::io::Result<()>) {
     let (mut drained_events, mut drained_results) = (0, 0);
     loop {
+        if tokio::time::Instant::now() >= deadline {
+            let left = std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "the accounting drain passed its deadline with {} events and {} forward \
+                     results still queued",
+                    events.len(),
+                    results.len()
+                ),
+            );
+            return (drained_events, drained_results, Err(left));
+        }
         let mut moved = false;
         if let Ok(first) = events.try_recv() {
             let (batch, recorded) = record_accepted(events, first, wal, emit).await;
@@ -562,8 +579,14 @@ mod tests {
             rtx.try_send(forward_result(n)).unwrap();
         }
         let mut lines = Vec::new();
-        let (events, results, drained) =
-            drain_on_stop(&mut erx, &mut rrx, Some(&wal), &mut collector(&mut lines)).await;
+        let (events, results, drained) = drain_on_stop(
+            &mut erx,
+            &mut rrx,
+            Some(&wal),
+            &mut collector(&mut lines),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+        )
+        .await;
         drained.unwrap();
         assert_eq!((events, results), (3, 2));
         assert_eq!(lines.len(), 5, "every queued event and result is emitted");
@@ -577,6 +600,39 @@ mod tests {
             "both queues empty"
         );
         cleanup(&path);
+    }
+
+    /// PB-49 T2: a producer that never stops cannot hold the exit open. Every
+    /// line emitted here queues another event, so the queue never empties and
+    /// only the deadline ends the drain, reported rather than swallowed.
+    #[tokio::test]
+    async fn a_drain_that_never_empties_stops_at_its_deadline() {
+        let (etx, mut erx) = tokio::sync::mpsc::channel(16);
+        let (_rtx, mut rrx) = tokio::sync::mpsc::channel::<ShareForwardResult>(16);
+        etx.try_send(accounting_event(0, false)).unwrap();
+        let mut n = 0;
+        let mut refill = move |_: &str| {
+            n += 1;
+            etx.try_send(accounting_event(n, false))
+                .expect("room for the next event");
+        };
+        let started = tokio::time::Instant::now();
+        let (events, _, drained) = drain_on_stop(
+            &mut erx,
+            &mut rrx,
+            None,
+            &mut refill,
+            started + std::time::Duration::from_millis(20),
+        )
+        .await;
+        let err = drained.expect_err("a queue that never empties must time out");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(events > 0, "it drained before the deadline");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the deadline was not honoured: {:?}",
+            started.elapsed()
+        );
     }
 
     /// PB-44's end-to-end claim against BOTH arms on one select loop, the shape

@@ -760,6 +760,11 @@ async fn gw_metrics_handler(
     )
 }
 
+/// How long an exit may spend draining the accounting queues (PB-49 T2).
+/// Inside the 10 s that `docker stop` and systemd allow before SIGKILL, with
+/// room for the rest of the exit.
+const ACCOUNTING_DRAIN_DEADLINE: Duration = Duration::from_secs(5);
+
 #[allow(clippy::too_many_lines)]
 async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
     // PB-49: SIGTERM is how docker stop, systemd and Kubernetes ask a process
@@ -1876,21 +1881,39 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
     }
 
     if !wal_failed {
+        // Stop the connection handlers before draining, so the queues stop
+        // growing. Most exits above already did; the template and verdict
+        // channels closing did not, and the drain could then run on while
+        // handlers kept accepting shares (PB-49 T2).
+        readiness.set_draining();
+        let _ = shutdown_tx.send(true);
         let (events, results, drained) = sv2_gateway::accounting::drain_on_stop(
             &mut share_event_rx,
             &mut share_result_rx,
             share_wal.as_ref(),
             &mut emit_share_event,
+            tokio::time::Instant::now() + ACCOUNTING_DRAIN_DEADLINE,
         )
         .await;
         info!(events, results, "accounting queues drained on stop");
-        if let Err(e) = drained {
-            error!(
-                error = %e,
-                reason_code = GatewayReason::WalWriteFailure.as_str(),
-                "wal: write failure while draining on stop"
-            );
-            exit_code = ExitCode::FAILURE;
+        match drained {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                error!(
+                    error = %e,
+                    "accounting drain on stop timed out; the shares still queued have \
+                     no accounting line and, with the WAL on, no pending record"
+                );
+                exit_code = ExitCode::FAILURE;
+            }
+            Err(e) => {
+                error!(
+                    error = %e,
+                    reason_code = GatewayReason::WalWriteFailure.as_str(),
+                    "wal: write failure while draining on stop"
+                );
+                exit_code = ExitCode::FAILURE;
+            }
         }
     }
 
