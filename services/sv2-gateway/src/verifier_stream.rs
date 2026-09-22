@@ -312,19 +312,19 @@ fn log_display(value: impl std::fmt::Display) -> String {
 /// Read one newline-terminated line into `buf`, enforcing `max_bytes`
 /// per line via `AsyncReadExt::take` so a verifier that never sends a
 /// newline can never grow the gateway's line buffer without bound
-/// (PB-23). The `take` adaptor is re-created per call, so the budget
-/// resets for every line.
+/// (PB-23).
 ///
-/// Mirrors `pool-verifier`'s `read_bounded_line` (PB-18b) with one
-/// difference: the budget is charged against `buf.len()` rather than
-/// applied flat, because this read is a `tokio::select!` branch and the
-/// buffer outlives a single call. A cancelled `read_line` discards what
-/// it had read (tokio moves the caller's `String` into the future and
-/// drops it), so in practice `buf` is empty on entry, but the budget
-/// must not silently become per-call if that ever changes.
+/// Cancel-safe (PB-52), which matters because this read is a branch of the
+/// I/O loop's `select!`, raced against the heartbeat tick and outbound
+/// messages. It used `read_line`, which tokio documents as not cancel-safe:
+/// when another branch won mid-line, the bytes already read were lost, the
+/// rest of the line then parsed as garbage, and a verdict never reached the
+/// gateway. `read_until` appends partial bytes to `buf`, which lives in the
+/// loop, so the next call resumes the same line. The budget is charged
+/// against `buf.len()` for that reason: a resumed line keeps its budget.
 async fn read_bounded_line<R>(
     reader: &mut R,
-    buf: &mut String,
+    buf: &mut Vec<u8>,
     max_bytes: u64,
 ) -> std::io::Result<BoundedLine>
 where
@@ -336,11 +336,14 @@ where
         // `take(0)` would report `Ok(0)`, indistinguishable from EOF.
         return Ok(BoundedLine::OverLimit);
     }
-    let n = (&mut *reader).take(remaining).read_line(buf).await?;
-    if n == 0 {
+    let n = (&mut *reader)
+        .take(remaining)
+        .read_until(b'\n', buf)
+        .await?;
+    if n == 0 && buf.is_empty() {
         return Ok(BoundedLine::Eof);
     }
-    if u64::try_from(n).unwrap_or(u64::MAX) >= remaining && !buf.ends_with('\n') {
+    if u64::try_from(n).unwrap_or(u64::MAX) >= remaining && !buf.ends_with(b"\n") {
         return Ok(BoundedLine::OverLimit);
     }
     Ok(BoundedLine::Line)
@@ -362,7 +365,7 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut reader = BufReader::new(reader);
-    let mut line_buf = String::new();
+    let mut line_buf: Vec<u8> = Vec::new();
     let mut heartbeat_interval = tokio::time::interval(config.heartbeat_interval);
     let mut malformed_count: u32 = 0;
     // PB-23: per-line byte budget, shared with the verifier's ingress.
@@ -396,14 +399,15 @@ where
                         return IoLoopOutcome::Disconnected;
                     }
                     Ok(BoundedLine::Line) => {
-                        match serde_json::from_str::<InternalMessage>(line_buf.trim()) {
+                        let text = String::from_utf8_lossy(&line_buf);
+                        match serde_json::from_str::<InternalMessage>(text.trim()) {
                             Ok(msg) => {
                                 dispatch_inbound(&msg, verdict_tx, readiness);
                             }
                             Err(e) => {
                                 warn!(
                                     error = %log_display(&e),
-                                    line = %log_sample(line_buf.trim()),
+                                    line = %log_sample(text.trim()),
                                     "malformed verifier message"
                                 );
                                 malformed_count += 1;
@@ -853,6 +857,83 @@ mod tests {
         serialize_outbound(&VerifierOutbound::TemplatePropose(tp)).unwrap()
     }
 
+    /// Drive the I/O loop with a real heartbeat interval over a reader the
+    /// test controls, until the reader closes.
+    async fn drive_with_heartbeat<R>(
+        reader: R,
+        heartbeat: Duration,
+    ) -> (IoLoopOutcome, Vec<VerifierInbound>)
+    where
+        R: AsyncRead + Unpin,
+    {
+        let (_outbound_tx, mut outbound_rx) = mpsc::channel::<VerifierOutbound>(4);
+        let (_shutdown_tx, mut shutdown) = watch::channel(false);
+        let (verdict_tx, mut verdict_rx) = broadcast::channel(64);
+        let readiness = ReadinessState::new();
+        let config = VerifierStreamConfig {
+            addr: "test".to_string(),
+            reconnect_delay: Duration::from_millis(1),
+            heartbeat_interval: heartbeat,
+            health_probe_staleness_ms: 1000,
+            tls_config: None,
+        };
+        let outcome = run_io_loop(
+            reader,
+            tokio::io::sink(),
+            &mut outbound_rx,
+            &verdict_tx,
+            &readiness,
+            &config,
+            &mut shutdown,
+        )
+        .await;
+        let mut received = Vec::new();
+        while let Ok(msg) = verdict_rx.try_recv() {
+            received.push(msg);
+        }
+        (outcome, received)
+    }
+
+    fn verdict_ids(received: &[VerifierInbound]) -> Vec<u64> {
+        received
+            .iter()
+            .filter_map(|m| match m {
+                VerifierInbound::TemplateVerdict(v) => Some(v.id),
+                VerifierInbound::HeartbeatAck => None,
+            })
+            .collect()
+    }
+
+    /// PB-52: a heartbeat tick that lands while a verdict line is half
+    /// received must not cost the verdict. The read races the heartbeat and
+    /// outbound arms in one `select!`, and `read_line` is not cancel-safe:
+    /// tokio's own docs say the partially read data "is lost".
+    #[tokio::test]
+    async fn a_heartbeat_tick_mid_line_does_not_cost_the_verdict() {
+        let (mut verifier_side, gateway_side) = tokio::io::duplex(64 * 1024);
+        let first = verdict_line(1, "split across a heartbeat");
+        let second = verdict_line(2, "whole");
+        let feeder = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt as _;
+            let (head, tail) = first.split_at(first.len() / 2);
+            verifier_side.write_all(head.as_bytes()).await.unwrap();
+            // Several 20 ms heartbeat ticks fire before the rest arrives.
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            verifier_side.write_all(tail.as_bytes()).await.unwrap();
+            verifier_side.write_all(second.as_bytes()).await.unwrap();
+            // Closing the verifier side ends the loop with EOF.
+        });
+        let (outcome, received) =
+            drive_with_heartbeat(gateway_side, Duration::from_millis(20)).await;
+        feeder.await.unwrap();
+        assert!(matches!(outcome, IoLoopOutcome::Disconnected));
+        assert_eq!(
+            verdict_ids(&received),
+            vec![1, 2],
+            "a verdict split across a heartbeat tick was lost"
+        );
+    }
+
     // ── PB-23: the read must be bounded before the allocation, not after ──
 
     #[tokio::test]
@@ -916,7 +997,7 @@ mod tests {
         // bytes against a 64-byte budget.
         let data = vec![b'a'; 200];
         let mut reader = BufReader::new(data.as_slice());
-        let mut buf = String::new();
+        let mut buf = Vec::new();
         let r = read_bounded_line(&mut reader, &mut buf, 64).await.unwrap();
         assert_eq!(r, BoundedLine::OverLimit);
         assert!(
@@ -932,12 +1013,12 @@ mod tests {
         // budget exactly; the next call reports EOF.
         let data: &[u8] = b"1234567\n";
         let mut reader = BufReader::new(data);
-        let mut buf = String::new();
+        let mut buf = Vec::new();
         assert_eq!(
             read_bounded_line(&mut reader, &mut buf, 8).await.unwrap(),
             BoundedLine::Line
         );
-        assert_eq!(buf, "1234567\n");
+        assert_eq!(buf, b"1234567\n");
         buf.clear();
         assert_eq!(
             read_bounded_line(&mut reader, &mut buf, 8).await.unwrap(),
@@ -952,7 +1033,7 @@ mod tests {
         // the limit before any further read.
         let data: &[u8] = b"more bytes\n";
         let mut reader = BufReader::new(data);
-        let mut buf = "a".repeat(8);
+        let mut buf = b"a".repeat(8);
         assert_eq!(
             read_bounded_line(&mut reader, &mut buf, 8).await.unwrap(),
             BoundedLine::OverLimit
