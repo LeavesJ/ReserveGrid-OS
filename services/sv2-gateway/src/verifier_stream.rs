@@ -203,6 +203,20 @@ pub async fn run_verifier_stream(
     }
 }
 
+/// Heartbeat intervals the verifier may stay silent before the gateway drops
+/// the connection and reconnects (PB-51).
+///
+/// A live verifier answers every heartbeat with an ack and sends a verdict for
+/// every template, so it is never silent for long: its longest gap is one
+/// template evaluation, a few seconds at most. A path that black-holes, with
+/// no FIN or reset ever arriving, used to leave this loop waiting forever:
+/// heartbeat writes still land in the kernel's send buffer, the gateway ran
+/// degraded (unenforced) because no ack came back, and nothing reconnected
+/// until TCP's retransmissions gave up, about 15 minutes on Linux by default.
+/// Three intervals is 6 s at the 2 s default, inside the gateway's 10 s
+/// degrade threshold.
+const READ_DEADLINE_BEATS: u32 = 3;
+
 /// Outcome of a single connection's I/O loop.
 enum IoLoopOutcome {
     /// Connection was lost (EOF, error, or TLS failure). Caller should reconnect.
@@ -351,6 +365,7 @@ where
 
 /// Inner I/O loop that is transport-agnostic. Accepts any `AsyncRead + AsyncWrite`
 /// pair, so the same logic serves both plaintext TCP and TLS streams.
+#[allow(clippy::too_many_lines)] // One select loop; its arms read top to bottom.
 async fn run_io_loop<R, W>(
     reader: R,
     mut writer: W,
@@ -367,6 +382,10 @@ where
     let mut reader = BufReader::new(reader);
     let mut line_buf: Vec<u8> = Vec::new();
     let mut heartbeat_interval = tokio::time::interval(config.heartbeat_interval);
+    let read_deadline = config
+        .heartbeat_interval
+        .saturating_mul(READ_DEADLINE_BEATS);
+    let mut last_heard = tokio::time::Instant::now();
     let mut malformed_count: u32 = 0;
     // PB-23: per-line byte budget, shared with the verifier's ingress.
     let max_line_bytes = u64::try_from(MAX_INTERNAL_LINE_BYTES).unwrap_or(u64::MAX);
@@ -399,6 +418,7 @@ where
                         return IoLoopOutcome::Disconnected;
                     }
                     Ok(BoundedLine::Line) => {
+                        last_heard = tokio::time::Instant::now();
                         let text = String::from_utf8_lossy(&line_buf);
                         match serde_json::from_str::<InternalMessage>(text.trim()) {
                             Ok(msg) => {
@@ -450,6 +470,17 @@ where
             }
 
             _ = heartbeat_interval.tick() => {
+                // PB-51: a verifier that has sent nothing for several
+                // heartbeats is unreachable, whatever the socket says.
+                let silent = last_heard.elapsed();
+                if silent > read_deadline {
+                    warn!(
+                        silent_ms = u64::try_from(silent.as_millis()).unwrap_or(u64::MAX),
+                        deadline_ms = u64::try_from(read_deadline.as_millis()).unwrap_or(u64::MAX),
+                        "verifier sent nothing for {READ_DEADLINE_BEATS} heartbeat intervals; reconnecting"
+                    );
+                    return IoLoopOutcome::Disconnected;
+                }
                 let hb = match serialize_outbound(&VerifierOutbound::Heartbeat) {
                     Ok(line) => line,
                     Err(e) => {
@@ -917,14 +948,15 @@ mod tests {
             use tokio::io::AsyncWriteExt as _;
             let (head, tail) = first.split_at(first.len() / 2);
             verifier_side.write_all(head.as_bytes()).await.unwrap();
-            // Several 20 ms heartbeat ticks fire before the rest arrives.
+            // Two 50 ms heartbeat ticks fire before the rest arrives, and
+            // 120 ms stays inside PB-51's three-beat read deadline (150 ms).
             tokio::time::sleep(Duration::from_millis(120)).await;
             verifier_side.write_all(tail.as_bytes()).await.unwrap();
             verifier_side.write_all(second.as_bytes()).await.unwrap();
             // Closing the verifier side ends the loop with EOF.
         });
         let (outcome, received) =
-            drive_with_heartbeat(gateway_side, Duration::from_millis(20)).await;
+            drive_with_heartbeat(gateway_side, Duration::from_millis(50)).await;
         feeder.await.unwrap();
         assert!(matches!(outcome, IoLoopOutcome::Disconnected));
         assert_eq!(
@@ -932,6 +964,57 @@ mod tests {
             vec![1, 2],
             "a verdict split across a heartbeat tick was lost"
         );
+    }
+
+    /// PB-51: a verifier that goes silent, socket open, is dropped after
+    /// `READ_DEADLINE_BEATS` heartbeat intervals so the outer loop reconnects.
+    /// It used to be waited on forever.
+    #[tokio::test]
+    async fn a_silent_verifier_is_dropped_after_three_heartbeats() {
+        let (verifier_side, gateway_side) = tokio::io::duplex(64 * 1024);
+        let start = tokio::time::Instant::now();
+        let (outcome, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            drive_with_heartbeat(gateway_side, Duration::from_millis(30)),
+        )
+        .await
+        .expect("a silent verifier was waited on forever");
+        let took = start.elapsed();
+        drop(verifier_side);
+        assert!(matches!(outcome, IoLoopOutcome::Disconnected));
+        assert!(
+            took >= Duration::from_millis(90),
+            "dropped after {took:?}, before three 30 ms heartbeats had passed"
+        );
+    }
+
+    /// PB-51, the other side: a verifier that keeps answering is never
+    /// dropped, however long the connection lives.
+    #[tokio::test]
+    async fn a_verifier_that_answers_is_never_dropped() {
+        let (mut verifier_side, gateway_side) = tokio::io::duplex(64 * 1024);
+        let feeder = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt as _;
+            for _ in 0..20 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                verifier_side
+                    .write_all(heartbeat_ack_line().as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let (outcome, received) =
+            drive_with_heartbeat(gateway_side, Duration::from_millis(30)).await;
+        feeder.await.unwrap();
+        assert!(
+            matches!(outcome, IoLoopOutcome::Disconnected),
+            "ends on EOF"
+        );
+        let acks = received
+            .iter()
+            .filter(|m| matches!(m, VerifierInbound::HeartbeatAck))
+            .count();
+        assert_eq!(acks, 20, "dropped before the verifier stopped answering");
     }
 
     // ── PB-23: the read must be bounded before the allocation, not after ──
