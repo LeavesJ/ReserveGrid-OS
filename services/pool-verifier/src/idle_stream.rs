@@ -60,8 +60,8 @@
 //! path is dead and its new one is refused: a NAT remap that answers the
 //! gateway's next write with a reset, a gateway host that crashes and comes
 //! back, or a path that black-holes, which sv2-gateway gives up on after
-//! three to four heartbeats of silence, or about six when the black hole
-//! swallows a template mid-write, and reconnects from (PB-51). It does
+//! three to four heartbeats of silence, or up to about seven when the black
+//! hole swallows a template mid-write, and reconnects from (PB-51). It does
 //! not touch refusals by the global cap, and with the per-IP ceiling
 //! disabled (`0`) there is no full address and so no shed.
 //!
@@ -157,14 +157,16 @@ impl ShedAtCap {
 /// the handshake, so after this connection started. So heartbeat `n` is sent
 /// no earlier than `start + (n - 1) * H` and read no earlier than that, and
 /// the estimate is never below `H`, however late, bunched, or
-/// reordered-in-time the verifier's reads are. Over plaintext, which the
-/// gateway allows with a warning, its interval starts at TCP connect, so a
-/// verifier that accepts `D` late can learn `H - D / (n - 1)`. At 2 s the
-/// 3 s floor keeps that from ever shedding a live peer; at 5 s it takes an
-/// accept more than 7.5 s late (PB-31 final review, measured). That is the property the earlier estimators
-/// lacked: they measured intervals between READS, which a busy verifier
-/// compresses. Delays only make this estimate larger, which errs toward
-/// keeping a connection.
+/// reordered-in-time the verifier's reads are. That is the property the
+/// earlier estimators lacked: they measured intervals between READS, which a
+/// busy verifier compresses. Delays only make this estimate larger, which
+/// errs toward keeping a connection.
+///
+/// Over plaintext, which the gateway allows with a warning, its interval
+/// starts at TCP connect, so a verifier that accepts `D` late can learn
+/// `H - D / (n - 1)`. At 2 s the 3 s floor keeps that from ever shedding a
+/// live peer; at 5 s it takes an accept more than 7.5 s late (PB-31 final
+/// review, measured).
 ///
 /// A peer that sends heartbeats faster than it later goes on to, which no
 /// fixed-interval timer does, can learn a threshold shorter than its later

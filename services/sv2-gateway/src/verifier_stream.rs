@@ -221,9 +221,11 @@ pub async fn run_verifier_stream(
 /// intervals: 6 to 8 s at the 2 s default. Time spent blocked writing a
 /// template does not count as silence, because the verifier cannot answer a
 /// template it is still receiving; a write that stops moving bytes altogether
-/// is failed by `StallGuard` after the same three intervals. So a black hole
-/// that swallows a template written just before the deadline takes about six
-/// intervals, 12 s at the default: measured at 5.8 in the PB-51 T2 review.
+/// is failed by `StallGuard` after the same three intervals. The silence
+/// check runs only on ticks, so a template can start after the deadline has
+/// passed but before the next tick, and a black hole that swallows it is
+/// dropped up to about seven intervals after the verifier last spoke: 14 s at
+/// the default. The PB-51 final review measured 6.8.
 const READ_DEADLINE_BEATS: u32 = 3;
 
 /// A writer that fails a write which has moved no bytes for `stall` (PB-51).
@@ -582,14 +584,19 @@ where
                         // tick when a verdict reaches the kernel, and tokio
                         // reports a socket readable only once its driver has
                         // turned. A timer fires only in a driver turn that
-                        // polled I/O first, so this sleep guarantees that
-                        // turn; the reads-first order then takes the verdict
-                        // ahead of the immediate recheck. A yield would not
-                        // do: on the multi-thread runtime, which the gateway
-                        // runs, a yielded task can be polled again with no
-                        // driver turn when another worker holds the driver.
+                        // polled I/O first, so this sleep forces such a turn;
+                        // the reads-first order then takes the verdict ahead
+                        // of the immediate recheck. A yield does not: on the
+                        // multi-thread runtime, which the gateway runs, a
+                        // yielded task can be polled again with no driver
+                        // turn. Measured on multi_thread in the PB-51 final
+                        // review: after a yield 79% of such verdicts were
+                        // still unseen, after this sleep 1 in 3,599. Not a
+                        // guarantee (a turn reads at most 1024 events, and
+                        // its poll can precede the recheck by a stall), and
+                        // not pinned by a test, which runs on current_thread.
                         // A verifier that is gone fails the recheck, 1 ms
-                        // later than without it (PB-51 T2).
+                        // later than without it.
                         rechecking = true;
                         heartbeat_interval.reset_immediately();
                         tokio::time::sleep(Duration::from_millis(1)).await;

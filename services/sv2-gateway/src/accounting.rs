@@ -138,7 +138,8 @@ pub async fn record_forwarded(
 /// connection handlers send while they stop; the caller tells them to stop
 /// first, or the queues may never empty. `deadline` bounds it anyway. It is
 /// checked between batches, so no batch is cut in half, and passing it is
-/// returned as a `TimedOut` error naming what is still queued.
+/// returned as a `TimedOut` error naming what is still queued. A batch's own
+/// WAL sync is not bounded, so a disk that hangs can overrun it.
 ///
 /// Stops at the first WAL failure and returns it. Returns how many accounting
 /// events and forward results it drained.
@@ -610,13 +611,19 @@ mod tests {
         let (etx, mut erx) = tokio::sync::mpsc::channel(16);
         let (_rtx, mut rrx) = tokio::sync::mpsc::channel::<ShareForwardResult>(16);
         etx.try_send(accounting_event(0, false)).unwrap();
+        let started = tokio::time::Instant::now();
         let mut n = 0;
+        // The drain never yields without a WAL, so a missing deadline check
+        // would spin forever; failing here turns that hang into a failure.
         let mut refill = move |_: &str| {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(2),
+                "the drain ran on past its deadline"
+            );
             n += 1;
             etx.try_send(accounting_event(n, false))
                 .expect("room for the next event");
         };
-        let started = tokio::time::Instant::now();
         let (events, _, drained) = drain_on_stop(
             &mut erx,
             &mut rrx,

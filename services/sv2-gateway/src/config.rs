@@ -460,8 +460,8 @@ fn default_verifier_reconnect_delay_ms() -> u64 {
 /// time, because each socket may shed only while the address is full. And
 /// a path that black-holes never resets, so the gateway reconnects only
 /// once the verifier has been silent for three to four intervals (PB-51),
-/// 6 to 8 s at 2 s, or about six, 12 s, when a template write is what the
-/// black hole swallows. A heartbeat is one small NDJSON line, so the cost is
+/// 6 to 8 s at 2 s, or up to about seven, 14 s, when a template write is
+/// what the black hole swallows. A heartbeat is one small NDJSON line, so the cost is
 /// one line every 2 s per gateway.
 fn default_verifier_heartbeat_interval_ms() -> u64 {
     2_000

@@ -761,8 +761,8 @@ async fn gw_metrics_handler(
 }
 
 /// How long an exit may spend draining the accounting queues (PB-49 T2).
-/// Inside the 10 s that `docker stop` and systemd allow before SIGKILL, with
-/// room for the rest of the exit.
+/// Inside the 10 s `docker stop` allows before SIGKILL (systemd's default is
+/// 90 s), with room for the rest of the exit.
 const ACCOUNTING_DRAIN_DEADLINE: Duration = Duration::from_secs(5);
 
 #[allow(clippy::too_many_lines)]
