@@ -2322,6 +2322,15 @@ async fn accept_loop(
                             continue;
                         };
 
+                        // PB-48: let the kernel end the connection if the
+                        // miner's host or path vanishes. Logged rather than
+                        // fatal, like the verifier ingress's keepalive: a
+                        // healthy miner is better served than refused
+                        // because a socket option did not take.
+                        if let Err(e) = sv2_gateway::transport::configure_miner_socket(&stream) {
+                            warn!(peer = %addr, error = %e, "failed to set keepalive on miner socket");
+                        }
+
                         metrics.connections_total.inc();
                         metrics.connections_active.inc();
                         info!(peer = %addr, active = limiter.active_count(), "accepted SV2 connection");
