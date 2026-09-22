@@ -36,7 +36,9 @@
 //! per-IP slot for the whole idle budget while the gateway's reconnect was
 //! refused by that very slot. So a connection that has been silent for
 //! its shed threshold, while its address sits at the per-IP ceiling,
-//! ends itself and its slot goes to whoever is being refused.
+//! ends itself, freeing its slot for whoever connects next from that
+//! address. Usually that is the gateway being refused; the shed does not
+//! check that anyone is waiting.
 //!
 //! This bounds that doubling; it does not delete it, and nothing based on
 //! silence can. A dead socket and a live gateway between two heartbeats
@@ -44,9 +46,21 @@
 //! peer's longest normal silence. The verifier cannot read the gateway's
 //! heartbeat setting, so it learns it: `HeartbeatCadence` watches when each
 //! connection's heartbeats arrive and sets the threshold to twice the
-//! largest recent interval, never under `SHED_FLOOR`. Until it has seen
-//! enough heartbeats, and forever for a peer that never sends one, the
-//! threshold is `shed_fallback(idle)`, 15 s at the shipped 60 s budget.
+//! largest of its last 16 intervals, never under `SHED_FLOOR`. Intervals
+//! under 250 ms are ignored: they are heartbeats read back to back after the
+//! verifier was busy or the gateway's sends burst, not the peer's cadence,
+//! and learning from them shed a live 5 s gateway in the PB-31 T2 review.
+//! Until three real intervals are seen, and forever for a peer that never
+//! heartbeats, the threshold is `shed_fallback(idle)`, 15 s at the shipped
+//! 60 s budget.
+//!
+//! What the shed helps, and what it does not. It helps when a gateway's old
+//! path is dead and its new one is refused: a NAT remap that answers the
+//! gateway's next write with a reset, or a gateway host that crashes and
+//! comes back. It does not help a path that black-holes, because the gateway
+//! then never learns its connection is gone and never reconnects (PB-51). It
+//! does not touch refusals by the global cap, and with the per-IP ceiling
+//! disabled (`0`) there is no full address and so no shed.
 //!
 //! Only this connection's own task ever ends it and releases its slot,
 //! so the per-IP count is decremented by its owner alone: there is no
@@ -82,15 +96,23 @@ pub(crate) const SHED_FLOOR: Duration = Duration::from_secs(3);
 pub(crate) const SHED_RECHECK: Duration = Duration::from_millis(500);
 
 /// Heartbeat intervals the cadence remembers. The threshold follows the
-/// LARGEST of them, so it errs long; a single slow read (the verifier
-/// reads a heartbeat only after finishing the message ahead of it, which
-/// can take seconds) inflates it for at most this many heartbeats.
-const CADENCE_WINDOW: usize = 4;
+/// LARGEST of them, so it errs long; a single slow read (the verifier reads a
+/// heartbeat only after finishing the message ahead of it, which can take
+/// seconds) inflates it for at most this many heartbeats. Sixteen, not the
+/// first draft's four: the longer the memory, the less likely it is that
+/// every interval in it was compressed by the verifier's own delays.
+const CADENCE_WINDOW: usize = 16;
 
-/// Intervals, not heartbeats, before a cadence is trusted: three
-/// heartbeats. Fewer and the first interval, which can be distorted by
-/// the handshake and the first template, decides alone.
-const CADENCE_LEARN_AFTER: usize = 2;
+/// Intervals shorter than this are not a cadence. They are heartbeats read
+/// back to back, queued behind a busy verifier or sent in a burst by a
+/// gateway catching up, and learning from them drove the threshold to the
+/// floor under a live 5 s gateway (PB-31 T2 review). A peer that really
+/// heartbeats this fast is never learned and keeps the fallback, which is
+/// only slower.
+const CADENCE_MIN_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Real intervals, not heartbeats, before a cadence is trusted.
+const CADENCE_LEARN_AFTER: usize = 3;
 
 /// The threshold for a connection with no learned cadence: a quarter of
 /// the idle budget, never under 10 s. That is 15 s at the shipped 60 s,
@@ -158,10 +180,16 @@ impl HeartbeatCadence {
     /// A heartbeat arrived at `now`.
     pub(crate) fn observe(&mut self, now: Instant) {
         if let Some(last) = self.last {
+            let interval = now.saturating_duration_since(last);
+            if interval < CADENCE_MIN_INTERVAL {
+                // Read back to back: not the cadence. Keep the earlier
+                // arrival, so the next real interval is measured from it.
+                return;
+            }
             if self.recent.len() == CADENCE_WINDOW {
                 self.recent.pop_front();
             }
-            self.recent.push_back(now.saturating_duration_since(last));
+            self.recent.push_back(interval);
             if self.recent.len() >= CADENCE_LEARN_AFTER
                 && let Some(longest) = self.recent.iter().max()
             {
@@ -607,42 +635,23 @@ mod tests {
         (HeartbeatCadence::new(Arc::clone(&after_ms)), after_ms)
     }
 
-    /// The fallback holds until two intervals are seen; then the threshold
-    /// is twice the longest recent interval, never under the floor.
+    /// The fallback holds until three real intervals are seen; then the
+    /// threshold is twice the longest recent interval, never under the floor.
     #[test]
     fn the_cadence_learns_twice_the_longest_recent_interval() {
-        let (mut c, after_ms) = cadence();
-        let t = tokio::time::Instant::now();
-        c.observe(t);
-        c.observe(t + Duration::from_secs(2));
+        let learned = |step_ms: u64, beats: u64| {
+            let (mut c, after_ms) = cadence();
+            let t = tokio::time::Instant::now();
+            for i in 0..beats {
+                c.observe(t + Duration::from_millis(step_ms * i));
+            }
+            after_ms.load(Ordering::Relaxed)
+        };
+        assert_eq!(learned(2_000, 3), 15_000, "two intervals are not a cadence");
+        assert_eq!(learned(2_000, 4), 4_000, "2 s heartbeats shed after 4 s");
+        assert_eq!(learned(5_000, 4), 10_000, "a pre-2.0.0 gateway's 5 s");
         assert_eq!(
-            after_ms.load(Ordering::Relaxed),
-            15_000,
-            "one interval is not a cadence"
-        );
-        c.observe(t + Duration::from_secs(4));
-        assert_eq!(
-            after_ms.load(Ordering::Relaxed),
-            4_000,
-            "2 s heartbeats shed after 4 s"
-        );
-
-        let (mut c, after_ms) = cadence();
-        c.observe(t);
-        c.observe(t + Duration::from_secs(5));
-        c.observe(t + Duration::from_secs(10));
-        assert_eq!(
-            after_ms.load(Ordering::Relaxed),
-            10_000,
-            "a pre-2.0.0 gateway's 5 s"
-        );
-
-        let (mut c, after_ms) = cadence();
-        c.observe(t);
-        c.observe(t + Duration::from_millis(500));
-        c.observe(t + Duration::from_millis(1_000));
-        assert_eq!(
-            after_ms.load(Ordering::Relaxed),
+            learned(500, 4),
             u64::try_from(SHED_FLOOR.as_millis()).unwrap(),
             "fast heartbeats stop at the floor"
         );
@@ -664,14 +673,71 @@ mod tests {
             14_000,
             "the 7 s gap dominates"
         );
-        for _ in 0..4 {
+        for _ in 0..16 {
             t += Duration::from_secs(2);
             c.observe(t);
         }
         assert_eq!(
             after_ms.load(Ordering::Relaxed),
             4_000,
-            "four 2 s beats later it is gone"
+            "sixteen 2 s beats later it is gone"
+        );
+    }
+
+    /// PB-31 T2 blocker: heartbeats read back to back are not a cadence. A
+    /// burst at connect, then a gateway's real 5 s cadence, must learn 10 s,
+    /// not the floor; learning the floor shed that live gateway 3 s into a
+    /// 5 s silence.
+    #[test]
+    fn a_burst_of_heartbeats_is_not_learned_as_the_cadence() {
+        let (mut c, after_ms) = cadence();
+        let t = tokio::time::Instant::now();
+        for i in 0..3 {
+            c.observe(t + Duration::from_millis(i));
+        }
+        assert_eq!(
+            after_ms.load(Ordering::Relaxed),
+            15_000,
+            "a burst teaches nothing"
+        );
+        for i in 1..=3 {
+            c.observe(t + Duration::from_secs(5 * i));
+        }
+        assert_eq!(after_ms.load(Ordering::Relaxed), 10_000);
+
+        // Learned, then a backlog read out together: the threshold holds.
+        let later = t + Duration::from_secs(20);
+        for i in 0..5 {
+            c.observe(later + Duration::from_millis(i));
+        }
+        assert_eq!(
+            after_ms.load(Ordering::Relaxed),
+            10_000,
+            "a later burst must not shrink it"
+        );
+    }
+
+    /// The fallback for a peer with no learned cadence: a quarter of the
+    /// idle budget, never under 10 s. At the shipped 60 s that is 15 s; at a
+    /// budget of 10 s or less it is not shorter than the budget.
+    #[test]
+    fn the_fallback_is_a_quarter_of_the_idle_budget_never_under_ten_seconds() {
+        use super::shed_fallback;
+        assert_eq!(
+            shed_fallback(Duration::from_secs(60)),
+            Duration::from_secs(15)
+        );
+        assert_eq!(
+            shed_fallback(Duration::from_secs(120)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            shed_fallback(Duration::from_secs(20)),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            shed_fallback(Duration::from_secs(8)),
+            Duration::from_secs(10)
         );
     }
 }

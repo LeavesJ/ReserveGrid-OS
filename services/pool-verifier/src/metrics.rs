@@ -291,7 +291,8 @@ impl VerifierMetrics {
             "verifier_connections_shed_at_cap",
             "NDJSON ingress connections that ended themselves after staying silent past their \
              learned shed threshold while their source address was at \
-             VELDRA_VERIFIER_MAX_CONNECTIONS_PER_IP, freeing the slot for a refused peer",
+             VELDRA_VERIFIER_MAX_CONNECTIONS_PER_IP, freeing the slot for the next connection \
+             from that address",
             m.connections_shed_at_cap_total.clone(),
         );
         registry.register(

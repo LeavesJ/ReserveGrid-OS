@@ -334,17 +334,23 @@ pub(crate) const DEFAULT_MAX_INGRESS_CONNECTIONS: u32 = 32;
 ///
 /// **Shed at cap (PB-31's root fix) bounds the doubling at a full
 /// address; it does not delete it.** A connection silent for twice its
-/// learned heartbeat interval while its address sits at this ceiling
-/// ends itself, and its slot goes to the peer being refused
-/// (`idle_stream`). So once an address is full a reconnecting gateway is
-/// refused for about 4 s at sv2-gateway's 2 s heartbeat default, 10 s for
-/// a gateway still on the pre-2.0.0 5 s default, and 15 s for a peer that
-/// never heartbeats, instead of the ~58 s measured before. Below the
-/// ceiling nothing changes, because nothing is being refused. The
-/// derivation above still sizes the default for the doubling, so the
-/// shed is a margin rather than the plan: 20 now serves up to 18 gateway
-/// streams behind one address through a reconnect, with a few seconds of
-/// refusal each.
+/// learned heartbeat interval while its address sits at this ceiling ends
+/// itself, freeing its slot for whoever connects next from that address,
+/// usually the gateway being refused (`idle_stream`). So when a gateway's
+/// old path dies and its next write gets a reset, the dead socket frees its
+/// slot about 4 s after its last heartbeat at sv2-gateway's 2 s default,
+/// 10 s for a gateway still on the pre-2.0.0 5 s default, and 15 s for a
+/// peer whose cadence is not yet learned or that never heartbeats, instead
+/// of the ~58 s measured before. The shed does nothing for a path that
+/// black-holes (the gateway never reconnects, PB-51), nothing for refusals
+/// by the global cap, and nothing when this ceiling is `0`. Several dead
+/// sockets at one address shed one at a time, since each may shed only
+/// while the address is full. The derivation above still sizes the default
+/// for the doubling, so the shed is a margin rather than the plan: 20 now
+/// serves up to 18 gateway streams behind one address through a reconnect.
+/// At that sizing the address is at its ceiling permanently, so every
+/// connection on it can be shed if it goes silent past its threshold; the
+/// threshold is what keeps that from touching a live gateway.
 ///
 /// The cost of the raise is that 20 out of the 32-slot global cap lets
 /// two addresses saturate the ingress where 8 needed four. That is
@@ -688,7 +694,7 @@ async fn serve_admitted_connection(
             shed_after_ms = shed_after_ms.load(Ordering::Relaxed),
             max_connections_per_ip = budget.per_ip.max_per_ip(),
             "ingress connection shed: silent past its threshold at a full address; \
-             its slot goes to a refused peer"
+             its slot is free for the next connection from that address"
         );
     }
 

@@ -443,11 +443,21 @@ fn default_verifier_reconnect_delay_ms() -> u64 {
     2_000
 }
 /// 2 s since 2.0.0; it was 5 s. PB-31: the verifier sheds a silent socket at
-/// a full address after twice the interval it learns, so at 2 s a gateway
-/// whose path died silently has its replacement admitted after about 4 s,
-/// inside `auto_degrade_after_ms` (10 s), and never degrades for it. At 5 s
-/// the shed came at 10 s, the degrade threshold itself. A heartbeat is one
-/// small NDJSON line, so the cost is one line every 2 s per gateway.
+/// a full address after twice the interval it learns. At 2 s, when a gateway's
+/// old path dies and its next write gets a reset, the dead socket frees its
+/// slot about 4 s after its last heartbeat, and the reconnect is admitted
+/// inside `auto_degrade_after_ms` (10 s), so a single such death does not
+/// degrade the gateway. At 5 s the shed came at 10 s, the degrade threshold
+/// itself, and the PB-31 T2 reviewer's model degraded in about a fifth of
+/// deaths.
+///
+/// Not every death clears in time, even at 2 s. A death in a connection's
+/// first seconds, before the verifier has learned its cadence, gets the 15 s
+/// fallback. Many gateways dying together behind one address shed one at a
+/// time, because each socket may shed only while the address is full. And
+/// a path that black-holes never resets, so the gateway never reconnects
+/// (PB-51). A heartbeat is one small NDJSON line, so the cost is one line
+/// every 2 s per gateway.
 fn default_verifier_heartbeat_interval_ms() -> u64 {
     2_000
 }

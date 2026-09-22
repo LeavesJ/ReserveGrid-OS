@@ -227,3 +227,53 @@ async fn a_silent_connection_keeps_its_slot_until_its_address_fills() {
         "the verifier died under the test"
     );
 }
+
+/// PB-31 T2 blocker, against the binary: a live gateway at a full address
+/// whose heartbeats arrive as a burst (read back to back, as they are after
+/// the verifier was busy) and then at a 4 s cadence, above the 3 s floor.
+/// Learning from the burst set the floor and shed it 3 s into its first
+/// 4 s silence; it must stay connected throughout.
+#[tokio::test]
+async fn a_burst_of_heartbeats_does_not_get_a_live_gateway_shed() {
+    let mut booted = boot_verifier(BootOptions {
+        label: "pb31-burst",
+        max_connections: 8,
+        max_connections_per_ip: Some(2),
+        idle_timeout_secs: Some(IDLE_SECS),
+        ..BootOptions::default()
+    })
+    .await;
+    let addr = booted.v4_addr();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let neighbour = live_gateway(
+        try_admit(&addr).await.expect("neighbour admitted"),
+        Arc::clone(&stop),
+    );
+    let mut bursty = try_admit(&addr).await.expect("the bursty gateway admitted");
+    for _ in 0..2 {
+        assert!(
+            heartbeat(&mut bursty, ACK).await,
+            "burst heartbeat unanswered"
+        );
+    }
+    for beat in 0..4 {
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert!(
+            heartbeat(&mut bursty, ACK).await,
+            "the live gateway was shed at its 4 s beat number {beat}: the burst was learned"
+        );
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    assert_eq!(neighbour.await.unwrap().1, 0, "the neighbour was shed");
+    let body = scrape_metrics(booted.http_port).await;
+    assert_eq!(
+        sample_value(&body, "verifier_connections_shed_at_cap_total"),
+        0
+    );
+    assert!(
+        booted.exit_status().is_none(),
+        "the verifier died under the test"
+    );
+}
