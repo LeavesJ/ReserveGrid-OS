@@ -352,6 +352,34 @@ pub fn envelope_line(template: &TemplatePropose) -> String {
     line
 }
 
+/// One heartbeat round trip, shaped the way sv2-gateway's verifier stream
+/// sends it: an empty-payload `heartbeat` envelope, answered with a
+/// `heartbeat_ack`. True when the ack arrived within `wait`; false on a
+/// close, a reset, or silence. PB-31's shed threshold is learned from these,
+/// so the tests that exercise it have to send them the real way.
+pub async fn heartbeat<S, W>(conn: &mut Conn<S, W>, wait: Duration) -> bool
+where
+    S: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let env = InternalMessage {
+        msg_type: msg_types::HEARTBEAT.to_string(),
+        version: PROTOCOL_VERSION,
+        payload: serde_json::json!({}),
+    };
+    let mut line = serde_json::to_string(&env).expect("serialize heartbeat");
+    line.push('\n');
+    if conn.writer.write_all(line.as_bytes()).await.is_err() || conn.writer.flush().await.is_err() {
+        return false;
+    }
+    let mut buf = String::new();
+    match tokio::time::timeout(wait, conn.reader.read_line(&mut buf)).await {
+        Ok(Ok(n)) if n > 0 => serde_json::from_str::<InternalMessage>(buf.trim())
+            .is_ok_and(|ack| ack.msg_type == msg_types::HEARTBEAT_ACK),
+        _ => false,
+    }
+}
+
 /// Outcome of pushing one template down a connection.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {

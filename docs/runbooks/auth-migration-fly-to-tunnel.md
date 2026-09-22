@@ -11,7 +11,7 @@ client → https://auth.veldra.org
        → Cloudflare edge (TLS, free plan)
        → Cloudflare Tunnel (outbound-only connection from the host)
        → cloudflared (systemd, on the host)
-       → 127.0.0.1:8080 rg-auth (Docker Compose, restart: unless-stopped)
+       → 127.0.0.1:3030 rg-auth (Docker Compose, restart: unless-stopped)
        → SQLite on a host volume (WAL mode)
 ```
 
@@ -25,7 +25,11 @@ The host firewall stays exactly as it was (SSH only). The host IP appears nowher
 2. Confirm the repo is present on the target host (the operator node already carries it for the Setup B stack).
 3. Confirm Docker and Compose on the target host (already present on the node).
 
-## Part 1. Step zero: attempt the Fly data export
+## Part 1. Step zero: get the data
+
+**Check Litestream first (added 2026-09-22).** The rg-auth image runs under Litestream whenever `LITESTREAM_REPLICA_BUCKET` is set (`services/rg-auth/entrypoint.sh`, `litestream.yml`), replicating the SQLite database to S3-compatible storage every second, and on a boot with no database file it restores from the replica. If the Fly deployment had those secrets set, the data is already in the bucket: put the same four `LITESTREAM_*` values in `.env.auth`, leave `./data/auth/auth.db` absent, and the first `up` restores it. That makes the Fly export below unnecessary. Whether they were set is visible with `fly secrets list -a rg-auth-veldra` (names only) or in the bucket itself.
+
+Otherwise, attempt the Fly data export:
 
 The rg-auth SQLite volume lives on the suspended Fly app. R-176 records that the dashboard could still wake the single machine even while every CLI path was blocked.
 
@@ -50,7 +54,7 @@ The rg-auth SQLite volume lives on the suspended Fly app. R-176 records that the
    credentials-file: /home/<user>/.cloudflared/<tunnel-id>.json
    ingress:
      - hostname: auth.veldra.org
-       service: http://127.0.0.1:8080
+       service: http://127.0.0.1:3030
      # - hostname: feed.veldra.org        # enable when rg-feed-server moves
      #   service: http://127.0.0.1:9200
      - service: http_status:404
@@ -63,34 +67,19 @@ The rg-auth SQLite volume lives on the suspended Fly app. R-176 records that the
 
 ## Part 3. rg-auth compose unit
 
-New `docker-compose.auth.yml` at the repo root on the host (commit the file; secrets stay in an env file):
+`docker-compose.auth.yml` at the repo root is the unit, committed 2026-09-22 with the production values `services/rg-auth/fly.toml` ran with. The sketch this section used to carry named `VELDRA_AUTH_DB_PATH` and port 8080; the code reads `VELDRA_AUTH_DB` and serves on 3030, and its health route is `/auth/health`, not `/health`. Secrets live in `.env.auth`, built from `deploy/env.auth.example` and the password manager, never committed (the `.env.*` rule covers it).
 
-```yaml
-services:
-  rg-auth:
-    build:
-      context: .
-      dockerfile: services/rg-auth/Dockerfile
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:8080:8080"
-    environment:
-      VELDRA_LOG_FORMAT: json
-      VELDRA_LOG_FILTER: info
-      VELDRA_AUTH_ADDR: "0.0.0.0:8080"        # container-internal; host exposure is loopback-only above
-      VELDRA_AUTH_DB_PATH: /data/auth.db
-      VELDRA_LICENSE_SIGNING_KEY: "${VELDRA_LICENSE_SIGNING_KEY}"
-    volumes:
-      - ./data/auth:/data:rw
-```
+1. `cp deploy/env.auth.example .env.auth && chmod 600 .env.auth`, then fill it. Leave a line out rather than blank: an absent SMTP variable means "email disabled", a blank one is a broken setting.
+2. Data: either the Litestream values in `.env.auth` with no `./data/auth/auth.db` (Part 1), or the exported snapshot copied to `./data/auth/auth.db`.
+3. `docker compose -f docker-compose.auth.yml up -d --build`, then `curl -sf http://127.0.0.1:3030/auth/health` on the host must print `ok`.
 
-Notes: confirm the exact env var names against `services/rg-auth` clap/env definitions before first boot (R-01); copy the exported `auth-export.db` to `./data/auth/auth.db` before `up`; create `.env.auth` from the password-manager secrets (never committed; the existing `.env.*` gitignore rule covers it). Run with `docker compose -f docker-compose.auth.yml --env-file .env.auth up -d --build`.
+`VELDRA_AUTH_TRUST_PROXY` stays off. rg-auth takes the leftmost `X-Forwarded-For` address (`services/rg-auth/src/handlers.rs`, `client_ip`), which a client can set to anything behind Cloudflare. Every request therefore reaches the limiter from cloudflared on loopback, one shared bucket, which is how it already ran behind Fly's proxy.
 
 Opportunistic P2 from the 2026-06-11 deep scan: add `PRAGMA busy_timeout = 5000` alongside the WAL pragma in `services/rg-auth/src/db.rs` in the same change window.
 
 ## Part 4. Cutover verification
 
-1. `curl -s https://auth.veldra.org/health` returns healthy through the tunnel (Cloudflare cert at the edge).
+1. `curl -s https://auth.veldra.org/auth/health` returns `ok` through the tunnel (Cloudflare cert at the edge), and the response no longer carries Fly's `server:` and `via:` headers, which is how to tell it is the new origin.
 2. Smoke the auth flows per `scripts/test-auth-flow.sh` against the new origin.
 3. Confirm the admin URL sanitizer behavior is live (the stranded `20c62a6` ships automatically since the host builds current `main`).
 4. Confirm rate limiting still returns 429s under the existing thresholds (the limiter sees Cloudflare connector IPs; if per-IP fidelity matters later, trust `CF-Connecting-IP` explicitly, as a deliberate code change, not a default).

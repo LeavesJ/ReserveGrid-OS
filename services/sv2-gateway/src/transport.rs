@@ -16,6 +16,15 @@
 //!
 //! The SV2 payload follows the 6-byte header. Large payloads may span
 //! multiple noise frames.
+//!
+//! `read_frame` is cancel-safe (PB-50). The connection handler races it
+//! against the job broadcast in one `select!`, so a job that arrives while a
+//! miner's frame is half received cancels the read. Every byte read off the
+//! socket is kept in the transport, and the only `.await` is a plain
+//! `read`, so a cancelled read resumes where it stopped. It used
+//! `read_exact` into locals, which is not cancel-safe: the bytes it had
+//! consumed were lost, the Noise stream desynced, and the miner was
+//! disconnected.
 
 use std::path::Path;
 use std::time::Duration;
@@ -160,6 +169,59 @@ pub struct Sv2Transport {
     codec: NoiseCodec,
     /// Decrypted data buffer (may contain partial SV2 frames across reads).
     read_buf: Vec<u8>,
+    /// Encrypted bytes read off the socket that do not yet make a whole
+    /// noise frame (PB-50). Kept here, not in a local, so a cancelled read
+    /// loses nothing. Bounded by one maximal noise frame plus one read.
+    raw_buf: Vec<u8>,
+}
+
+/// How much one socket read takes at most.
+const READ_CHUNK: usize = 8192;
+
+/// TCP keepalive for accepted miner sockets (PB-48): the first probe after
+/// 30 s idle, then one every 10 s. The same numbers as the pool-verifier's
+/// ingress (`pool-verifier/src/ingress.rs`); a copy rather than a shared
+/// helper until a third caller wants it.
+pub const MINER_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
+/// See [`MINER_KEEPALIVE_IDLE`].
+pub const MINER_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Linux only (PB-48): how long data the gateway has sent may stay
+/// unacknowledged before the kernel closes the connection. Two minutes,
+/// in line with keepalive's own detection time, and long enough for a
+/// route flap or a brief uplink outage to recover.
+pub const MINER_TCP_USER_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Ask the kernel to end a miner connection whose peer has vanished (PB-48).
+///
+/// After a channel opens nothing in the session bounds a miner's silence,
+/// and nothing safely can at the application level. How often a live miner
+/// submits depends on its hashrate and its channel's target, so a small
+/// miner under a high target can go a long time between shares, and SV2's
+/// mining protocol has no keepalive message. A silent miner and a dead one
+/// look the same to the handler. They do not look the same to TCP: a
+/// vanished host or path answers nothing.
+///
+/// * Keepalive covers an idle connection: its probes go unanswered and the
+///   kernel ends the connection after the first probe plus the OS's probe
+///   count (9 on Linux, 8 on macOS), about two minutes.
+/// * `TCP_USER_TIMEOUT`, on Linux, covers a connection with data in flight,
+///   which keepalive does not probe: job writes to a vanished peer are
+///   never acknowledged, and without it the connection stays up until the
+///   kernel's retransmissions give up, about 15 minutes by default.
+///
+/// A live miner whose kernel answers is never ended by either, however long
+/// it stays quiet, and that is deliberate.
+pub fn configure_miner_socket(stream: &TcpStream) -> std::io::Result<()> {
+    let sock = socket2::SockRef::from(stream);
+    sock.set_tcp_keepalive(
+        &socket2::TcpKeepalive::new()
+            .with_time(MINER_KEEPALIVE_IDLE)
+            .with_interval(MINER_KEEPALIVE_INTERVAL),
+    )?;
+    #[cfg(target_os = "linux")]
+    sock.set_tcp_user_timeout(Some(MINER_TCP_USER_TIMEOUT))?;
+    Ok(())
 }
 
 impl Sv2Transport {
@@ -169,6 +231,7 @@ impl Sv2Transport {
             stream,
             codec,
             read_buf: Vec::with_capacity(4096),
+            raw_buf: Vec::with_capacity(READ_CHUNK),
         }
     }
 
@@ -176,6 +239,9 @@ impl Sv2Transport {
     ///
     /// Returns the parsed header and the payload bytes.
     /// Blocks until a full frame is available or an error occurs.
+    ///
+    /// Cancel-safe (PB-50): dropping the future before it completes loses no
+    /// bytes, and the next call picks up where this one stopped.
     pub async fn read_frame(&mut self) -> Result<(Sv2FrameHeader, Vec<u8>)> {
         // Ensure we have at least the 6-byte SV2 header in the buffer.
         while self.read_buf.len() < SV2_FRAME_HEADER_SIZE {
@@ -255,38 +321,33 @@ impl Sv2Transport {
     /// Read one noise frame from the wire, decrypt it, and append
     /// the plaintext to `self.read_buf`.
     async fn read_noise_frame(&mut self) -> Result<()> {
-        // Read 2-byte big-endian length.
-        let mut len_buf = [0u8; 2];
-        self.stream
-            .read_exact(&mut len_buf)
-            .await
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::UnexpectedEof => TransportError::ConnectionReset,
-                _ => TransportError::Io(e),
-            })?;
-        let frame_len = u16::from_be_bytes(len_buf) as usize;
-
-        if frame_len == 0 {
-            return Err(TransportError::EmptyFrame);
+        loop {
+            // A whole noise frame already buffered: take it, with no await
+            // between reading it and decrypting it.
+            if self.raw_buf.len() >= 2 {
+                let frame_len = u16::from_be_bytes([self.raw_buf[0], self.raw_buf[1]]) as usize;
+                if frame_len == 0 {
+                    return Err(TransportError::EmptyFrame);
+                }
+                if self.raw_buf.len() >= 2 + frame_len {
+                    let mut encrypted = self.raw_buf[2..2 + frame_len].to_vec();
+                    self.raw_buf.drain(..2 + frame_len);
+                    self.codec
+                        .decrypt(&mut encrypted)
+                        .map_err(|_| TransportError::NoiseDecrypt)?;
+                    self.read_buf.extend_from_slice(&encrypted);
+                    return Ok(());
+                }
+            }
+            // Not yet: read more. `read` is cancel-safe, and what it returns
+            // is kept before anything else can be cancelled.
+            let mut chunk = [0u8; READ_CHUNK];
+            let n = self.stream.read(&mut chunk).await?;
+            if n == 0 {
+                return Err(TransportError::ConnectionReset);
+            }
+            self.raw_buf.extend_from_slice(&chunk[..n]);
         }
-
-        // Read the encrypted chunk.
-        let mut encrypted = vec![0u8; frame_len];
-        self.stream
-            .read_exact(&mut encrypted)
-            .await
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::UnexpectedEof => TransportError::ConnectionReset,
-                _ => TransportError::Io(e),
-            })?;
-
-        // Decrypt in place.
-        self.codec
-            .decrypt(&mut encrypted)
-            .map_err(|_| TransportError::NoiseDecrypt)?;
-
-        self.read_buf.extend_from_slice(&encrypted);
-        Ok(())
     }
 
     /// Access the underlying TCP stream for address information.
@@ -716,5 +777,37 @@ mod tests {
         assert!(matches!(result, Err(KeyLoadError::InvalidPubkeyHex(_))));
 
         let _ = std::fs::remove_file(&sk_path);
+    }
+
+    /// PB-48: an accepted miner socket carries keepalive, and on Linux a user
+    /// timeout. Read back off a real accepted socket through a separate
+    /// `SockRef`, so the kernel's state is what is checked.
+    #[tokio::test]
+    async fn accepted_miner_sockets_ask_the_kernel_to_end_a_vanished_peer() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (accepted, _) = listener.accept().await.unwrap();
+        assert!(
+            !socket2::SockRef::from(&accepted).keepalive().unwrap(),
+            "the OS default must be off, or this proves nothing"
+        );
+
+        configure_miner_socket(&accepted).unwrap();
+
+        let sock = socket2::SockRef::from(&accepted);
+        assert!(sock.keepalive().unwrap(), "SO_KEEPALIVE must be on");
+        assert_eq!(sock.tcp_keepalive_time().unwrap(), MINER_KEEPALIVE_IDLE);
+        assert_eq!(
+            sock.tcp_keepalive_interval().unwrap(),
+            MINER_KEEPALIVE_INTERVAL
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            sock.tcp_user_timeout().unwrap(),
+            Some(MINER_TCP_USER_TIMEOUT),
+            "TCP_USER_TIMEOUT must bound unacknowledged data on Linux"
+        );
     }
 }

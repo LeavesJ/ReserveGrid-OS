@@ -18,6 +18,12 @@ reservegrid-common = { path = "../reservegrid-common", features = [
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
+# PB-48. Keepalive and, on Linux, TCP_USER_TIMEOUT for miner sockets;
+# tokio's TcpStream sets neither. Not a new crate in the build: tokio and
+# pool-verifier already depend on socket2 0.6. `all` is the feature that
+# exposes `set_tcp_user_timeout`.
+socket2 = { version = "0.6", features = ["all"] }
+
 # SV2 protocol stack
 noise_sv2 = "1.4"
 codec_sv2 = { version = "4.0", features = ["noise_sv2"] }

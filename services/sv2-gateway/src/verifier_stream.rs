@@ -9,7 +9,10 @@
 //! the raw TCP stream is wrapped with `tokio_rustls::TlsConnector` using
 //! mTLS client certificates. The NDJSON framing is unchanged.
 
+use std::future::Future as _;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use reservegrid_common::reason::GatewayReason;
@@ -203,6 +206,102 @@ pub async fn run_verifier_stream(
     }
 }
 
+/// Heartbeat intervals the verifier may stay silent before the gateway drops
+/// the connection and reconnects (PB-51).
+///
+/// A live verifier answers every heartbeat with an ack and sends a verdict for
+/// every template, so it is never silent for long: its longest gap is one
+/// template evaluation, a few seconds at most. A path that black-holes, with
+/// no FIN or reset ever arriving, used to leave this loop waiting forever:
+/// heartbeat writes still land in the kernel's send buffer, the gateway ran
+/// degraded (unenforced) because no ack came back, and nothing reconnected
+/// until TCP's retransmissions gave up, about 15 minutes on Linux by default.
+///
+/// The check runs on each heartbeat tick, so detection takes three to four
+/// intervals: 6 to 8 s at the 2 s default. Time spent blocked writing a
+/// template does not count as silence, because the verifier cannot answer a
+/// template it is still receiving; a write that stops moving bytes altogether
+/// is failed by `StallGuard` after the same three intervals. The silence
+/// check runs only on ticks, so a template can start after the deadline has
+/// passed but before the next tick, and a black hole that swallows it is
+/// dropped up to about seven intervals after the verifier last spoke: 14 s at
+/// the default. The PB-51 final review measured 6.8.
+const READ_DEADLINE_BEATS: u32 = 3;
+
+/// A writer that fails a write which has moved no bytes for `stall` (PB-51).
+///
+/// Without it, a write to a black-holed verifier (a template larger than the
+/// kernel's send buffer, which every mainnet `raw_block_hex` is) parks the
+/// I/O loop inside that write, where no silence check can run, until TCP gives
+/// up. A slow link is not a stall: every byte the peer accepts restarts the
+/// clock, so only a write that makes no progress at all is failed. The same
+/// idea as the verifier's `IdleTimeout`, which bounds progress in both
+/// directions for one budget; this bounds only how long one write may wait,
+/// and is a copy of the idea rather than a shared type until a third caller
+/// wants it.
+struct StallGuard<W> {
+    inner: W,
+    stall: Duration,
+    blocked: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<W> StallGuard<W> {
+    fn new(inner: W, stall: Duration) -> Self {
+        Self {
+            inner,
+            stall,
+            blocked: None,
+        }
+    }
+
+    /// The inner writer is not ready: fail once it has been so for `stall`.
+    fn poll_stalled(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Error> {
+        let stall = self.stall;
+        let sleep = self
+            .blocked
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(stall)));
+        match sleep.as_mut().poll(cx) {
+            Poll::Ready(()) => Poll::Ready(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("the verifier accepted no bytes for {stall:?}"),
+            )),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for StallGuard<W> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_write(cx, buf) {
+            Poll::Ready(r) => {
+                this.blocked = None;
+                Poll::Ready(r)
+            }
+            Poll::Pending => this.poll_stalled(cx).map(Err),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_flush(cx) {
+            Poll::Ready(r) => {
+                this.blocked = None;
+                Poll::Ready(r)
+            }
+            Poll::Pending => this.poll_stalled(cx).map(Err),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
 /// Outcome of a single connection's I/O loop.
 enum IoLoopOutcome {
     /// Connection was lost (EOF, error, or TLS failure). Caller should reconnect.
@@ -312,19 +411,19 @@ fn log_display(value: impl std::fmt::Display) -> String {
 /// Read one newline-terminated line into `buf`, enforcing `max_bytes`
 /// per line via `AsyncReadExt::take` so a verifier that never sends a
 /// newline can never grow the gateway's line buffer without bound
-/// (PB-23). The `take` adaptor is re-created per call, so the budget
-/// resets for every line.
+/// (PB-23).
 ///
-/// Mirrors `pool-verifier`'s `read_bounded_line` (PB-18b) with one
-/// difference: the budget is charged against `buf.len()` rather than
-/// applied flat, because this read is a `tokio::select!` branch and the
-/// buffer outlives a single call. A cancelled `read_line` discards what
-/// it had read (tokio moves the caller's `String` into the future and
-/// drops it), so in practice `buf` is empty on entry, but the budget
-/// must not silently become per-call if that ever changes.
+/// Cancel-safe (PB-52), which matters because this read is a branch of the
+/// I/O loop's `select!`, raced against the heartbeat tick and outbound
+/// messages. It used `read_line`, which tokio documents as not cancel-safe:
+/// when another branch won mid-line, the bytes already read were lost, the
+/// rest of the line then parsed as garbage, and a verdict never reached the
+/// gateway. `read_until` appends partial bytes to `buf`, which lives in the
+/// loop, so the next call resumes the same line. The budget is charged
+/// against `buf.len()` for that reason: a resumed line keeps its budget.
 async fn read_bounded_line<R>(
     reader: &mut R,
-    buf: &mut String,
+    buf: &mut Vec<u8>,
     max_bytes: u64,
 ) -> std::io::Result<BoundedLine>
 where
@@ -336,11 +435,14 @@ where
         // `take(0)` would report `Ok(0)`, indistinguishable from EOF.
         return Ok(BoundedLine::OverLimit);
     }
-    let n = (&mut *reader).take(remaining).read_line(buf).await?;
-    if n == 0 {
+    let n = (&mut *reader)
+        .take(remaining)
+        .read_until(b'\n', buf)
+        .await?;
+    if n == 0 && buf.is_empty() {
         return Ok(BoundedLine::Eof);
     }
-    if u64::try_from(n).unwrap_or(u64::MAX) >= remaining && !buf.ends_with('\n') {
+    if u64::try_from(n).unwrap_or(u64::MAX) >= remaining && !buf.ends_with(b"\n") {
         return Ok(BoundedLine::OverLimit);
     }
     Ok(BoundedLine::Line)
@@ -348,9 +450,10 @@ where
 
 /// Inner I/O loop that is transport-agnostic. Accepts any `AsyncRead + AsyncWrite`
 /// pair, so the same logic serves both plaintext TCP and TLS streams.
+#[allow(clippy::too_many_lines)] // One select loop; its arms read top to bottom.
 async fn run_io_loop<R, W>(
     reader: R,
-    mut writer: W,
+    writer: W,
     outbound_rx: &mut mpsc::Receiver<VerifierOutbound>,
     verdict_tx: &broadcast::Sender<VerifierInbound>,
     readiness: &ReadinessState,
@@ -362,14 +465,29 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut reader = BufReader::new(reader);
-    let mut line_buf = String::new();
+    let mut line_buf: Vec<u8> = Vec::new();
     let mut heartbeat_interval = tokio::time::interval(config.heartbeat_interval);
+    let read_deadline = config
+        .heartbeat_interval
+        .saturating_mul(READ_DEADLINE_BEATS);
+    let mut writer = StallGuard::new(writer, read_deadline);
+    // When the verifier was last heard from, moved later by any time spent
+    // blocked writing a template to it (PB-51).
+    let mut last_heard = tokio::time::Instant::now();
+    // Set when a tick has found the verifier past the deadline and the loop
+    // has given the runtime one turn before believing it (PB-51 T2).
+    let mut rechecking = false;
     let mut malformed_count: u32 = 0;
     // PB-23: per-line byte budget, shared with the verifier's ingress.
     let max_line_bytes = u64::try_from(MAX_INTERNAL_LINE_BYTES).unwrap_or(u64::MAX);
 
     loop {
         tokio::select! {
+            // Reads first (PB-51 T2): after any stall, a verdict already in
+            // the socket must be seen before the silence check on a catch-up
+            // tick, or a live verifier is dropped with its answer unread.
+            biased;
+
             result = read_bounded_line(&mut reader, &mut line_buf, max_line_bytes) => {
                 match result {
                     Ok(BoundedLine::Eof) => {
@@ -396,14 +514,19 @@ where
                         return IoLoopOutcome::Disconnected;
                     }
                     Ok(BoundedLine::Line) => {
-                        match serde_json::from_str::<InternalMessage>(line_buf.trim()) {
+                        last_heard = tokio::time::Instant::now();
+                        // Parsed from the bytes, so invalid UTF-8 anywhere,
+                        // including inside a JSON string, is a malformed
+                        // strike rather than silently replaced (PB-52 T2).
+                        match serde_json::from_slice::<InternalMessage>(line_buf.trim_ascii()) {
                             Ok(msg) => {
                                 dispatch_inbound(&msg, verdict_tx, readiness);
                             }
                             Err(e) => {
+                                let text = String::from_utf8_lossy(&line_buf);
                                 warn!(
                                     error = %log_display(&e),
-                                    line = %log_sample(line_buf.trim()),
+                                    line = %log_sample(text.trim()),
                                     "malformed verifier message"
                                 );
                                 malformed_count += 1;
@@ -431,6 +554,7 @@ where
                             continue;
                         }
                     };
+                    let writing_since = tokio::time::Instant::now();
                     if let Err(e) = writer.write_all(line.as_bytes()).await {
                         warn!(error = %e, "verifier write error");
                         return IoLoopOutcome::Disconnected;
@@ -439,6 +563,11 @@ where
                         warn!(error = %e, "verifier flush error");
                         return IoLoopOutcome::Disconnected;
                     }
+                    // The verifier cannot answer while it is still receiving,
+                    // so time spent blocked in this write is not its silence.
+                    // An instant write excuses nothing, which keeps a small
+                    // template from hiding a black hole (PB-51 T2).
+                    last_heard = (last_heard + writing_since.elapsed()).min(tokio::time::Instant::now());
                 } else {
                     info!("outbound channel closed; shutting down verifier stream");
                     return IoLoopOutcome::Shutdown;
@@ -446,6 +575,41 @@ where
             }
 
             _ = heartbeat_interval.tick() => {
+                // PB-51: a verifier that has sent nothing for several
+                // heartbeats is unreachable, whatever the socket says.
+                let silent = last_heard.elapsed();
+                if silent > read_deadline {
+                    if !rechecking {
+                        // A stall can leave this task already scheduled by a
+                        // tick when a verdict reaches the kernel, and tokio
+                        // reports a socket readable only once its driver has
+                        // turned. A timer fires only in a driver turn that
+                        // polled I/O first, so this sleep forces such a turn;
+                        // the reads-first order then takes the verdict ahead
+                        // of the immediate recheck. A yield does not: on the
+                        // multi-thread runtime, which the gateway runs, a
+                        // yielded task can be polled again with no driver
+                        // turn. Measured on multi_thread in the PB-51 final
+                        // review: after a yield 79% of such verdicts were
+                        // still unseen, after this sleep 1 in 3,599. Not a
+                        // guarantee (a turn reads at most 1024 events, and
+                        // its poll can precede the recheck by a stall), and
+                        // not pinned by a test, which runs on current_thread.
+                        // A verifier that is gone fails the recheck, 1 ms
+                        // later than without it.
+                        rechecking = true;
+                        heartbeat_interval.reset_immediately();
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                        continue;
+                    }
+                    warn!(
+                        silent_ms = u64::try_from(silent.as_millis()).unwrap_or(u64::MAX),
+                        deadline_ms = u64::try_from(read_deadline.as_millis()).unwrap_or(u64::MAX),
+                        "verifier sent nothing for {READ_DEADLINE_BEATS} heartbeat intervals; reconnecting"
+                    );
+                    return IoLoopOutcome::Disconnected;
+                }
+                rechecking = false;
                 let hb = match serialize_outbound(&VerifierOutbound::Heartbeat) {
                     Ok(line) => line,
                     Err(e) => {
@@ -549,9 +713,7 @@ fn serialize_outbound(msg: &VerifierOutbound) -> Result<String, serde_json::Erro
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use std::pin::Pin;
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-    use std::task::{Context, Poll};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use tokio::io::{AsyncReadExt, ReadBuf};
 
     // ── PB-23: log write amplification ──
@@ -853,6 +1015,511 @@ mod tests {
         serialize_outbound(&VerifierOutbound::TemplatePropose(tp)).unwrap()
     }
 
+    fn verdict_ids(received: &[VerifierInbound]) -> Vec<u64> {
+        received
+            .iter()
+            .filter_map(|m| match m {
+                VerifierInbound::TemplateVerdict(v) => Some(v.id),
+                VerifierInbound::HeartbeatAck => None,
+            })
+            .collect()
+    }
+
+    /// PB-52: a heartbeat tick that lands while a verdict line is half
+    /// received must not cost the verdict. The read races the heartbeat and
+    /// outbound arms in one `select!`, and `read_line` is not cancel-safe:
+    /// tokio's own docs say the partially read data "is lost".
+    #[tokio::test]
+    async fn a_heartbeat_tick_mid_line_does_not_cost_the_verdict() {
+        let (mut verifier_side, gateway_side) = tokio::io::duplex(64 * 1024);
+        let first = verdict_line(1, "split across a heartbeat");
+        let second = verdict_line(2, "whole");
+        let feeder = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt as _;
+            let (head, tail) = first.split_at(first.len() / 2);
+            verifier_side.write_all(head.as_bytes()).await.unwrap();
+            // The 50 ms heartbeat tick fires before the rest arrives, and
+            // 75 ms stays well inside PB-51's three-beat read deadline
+            // (150 ms), so load cannot turn this into a silence drop.
+            tokio::time::sleep(Duration::from_millis(75)).await;
+            verifier_side.write_all(tail.as_bytes()).await.unwrap();
+            verifier_side.write_all(second.as_bytes()).await.unwrap();
+            // Closing the verifier side ends the loop with EOF.
+        });
+        let (outcome, received) = drive_with(
+            gateway_side,
+            tokio::io::sink(),
+            Duration::from_millis(50),
+            |_| {},
+        )
+        .await;
+        feeder.await.unwrap();
+        assert!(matches!(outcome, IoLoopOutcome::Disconnected));
+        assert_eq!(
+            verdict_ids(&received),
+            vec![1, 2],
+            "a verdict split across a heartbeat tick was lost"
+        );
+    }
+
+    /// PB-51: a verifier that goes silent, socket open, is dropped after
+    /// `READ_DEADLINE_BEATS` heartbeat intervals so the outer loop reconnects.
+    /// It used to be waited on forever. Paused time pins the moment: the
+    /// fourth tick is the first past the deadline, and its recheck (PB-51 T2)
+    /// drops 1 ms later rather than a heartbeat later.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_verifier_is_dropped_after_three_heartbeats() {
+        let (verifier_side, gateway_side) = tokio::io::duplex(64 * 1024);
+        let start = tokio::time::Instant::now();
+        let (outcome, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            drive_with(
+                gateway_side,
+                tokio::io::sink(),
+                Duration::from_millis(30),
+                |_| {},
+            ),
+        )
+        .await
+        .expect("a silent verifier was waited on forever");
+        let took = start.elapsed();
+        drop(verifier_side);
+        assert!(matches!(outcome, IoLoopOutcome::Disconnected));
+        assert!(
+            took >= Duration::from_millis(90),
+            "dropped after {took:?}, before three 30 ms heartbeats had passed"
+        );
+        assert!(
+            took <= Duration::from_millis(121),
+            "dropped after {took:?}; the recheck waited for another heartbeat"
+        );
+    }
+
+    /// PB-51, the other side: a verifier that keeps answering is never
+    /// dropped, however long the connection lives.
+    #[tokio::test]
+    async fn a_verifier_that_answers_is_never_dropped() {
+        let (mut verifier_side, gateway_side) = tokio::io::duplex(64 * 1024);
+        let feeder = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt as _;
+            for _ in 0..20 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                verifier_side
+                    .write_all(heartbeat_ack_line().as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let (outcome, received) = drive_with(
+            gateway_side,
+            tokio::io::sink(),
+            Duration::from_millis(30),
+            |_| {},
+        )
+        .await;
+        feeder.await.unwrap();
+        assert!(
+            matches!(outcome, IoLoopOutcome::Disconnected),
+            "ends on EOF"
+        );
+        let acks = received
+            .iter()
+            .filter(|m| matches!(m, VerifierInbound::HeartbeatAck))
+            .count();
+        assert_eq!(acks, 20, "dropped before the verifier stopped answering");
+    }
+
+    /// A propose whose `raw_block_hex` makes it `bytes` long on the wire.
+    fn propose_of(id: u64, bytes: usize) -> VerifierOutbound {
+        VerifierOutbound::TemplatePropose(TemplatePropose {
+            version: PROTOCOL_VERSION,
+            id,
+            block_height: 800_000,
+            prev_hash: "a".repeat(64),
+            coinbase_value: 312_500_000,
+            tx_count: 1,
+            total_fees: 0,
+            observed_weight: None,
+            created_at_unix_ms: None,
+            total_sigops: None,
+            coinbase_sigops: None,
+            template_weight: None,
+            gateway_instance_id: None,
+            raw_block_hex: Some("0".repeat(bytes)),
+        })
+    }
+
+    /// Drive the loop with a chosen writer and heartbeat; `feed` gets a
+    /// clone of the outbound sender to queue proposes as the gateway's main
+    /// loop would. The original is held until the loop returns, as the main
+    /// loop holds it, so a closed channel cannot end the loop first.
+    async fn drive_with<R, W>(
+        reader: R,
+        writer: W,
+        heartbeat: Duration,
+        feed: impl FnOnce(mpsc::Sender<VerifierOutbound>),
+    ) -> (IoLoopOutcome, Vec<VerifierInbound>)
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        let (outbound_tx, mut outbound_rx) = mpsc::channel::<VerifierOutbound>(64);
+        feed(outbound_tx.clone());
+        let (_shutdown_tx, mut shutdown) = watch::channel(false);
+        let (verdict_tx, mut verdict_rx) = broadcast::channel(256);
+        let readiness = ReadinessState::new();
+        let config = VerifierStreamConfig {
+            addr: "test".to_string(),
+            reconnect_delay: Duration::from_millis(1),
+            heartbeat_interval: heartbeat,
+            health_probe_staleness_ms: 1000,
+            tls_config: None,
+        };
+        let outcome = run_io_loop(
+            reader,
+            writer,
+            &mut outbound_rx,
+            &verdict_tx,
+            &readiness,
+            &config,
+            &mut shutdown,
+        )
+        .await;
+        drop(outbound_tx);
+        let mut received = Vec::new();
+        while let Ok(msg) = verdict_rx.try_recv() {
+            received.push(msg);
+        }
+        (outcome, received)
+    }
+
+    /// Accepts `cap` bytes, then never again: a peer behind a black hole once
+    /// the kernel's send buffer is full.
+    struct BlackHole {
+        cap: usize,
+    }
+
+    impl AsyncWrite for BlackHole {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            if this.cap == 0 {
+                return Poll::Pending;
+            }
+            let n = buf.len().min(this.cap);
+            this.cap -= n;
+            Poll::Ready(Ok(n))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Passes at most `chunk` bytes every `every` to `inner`: a live verifier
+    /// on a slow link.
+    struct SlowLink<W> {
+        inner: W,
+        chunk: usize,
+        every: Duration,
+        next: Pin<Box<tokio::time::Sleep>>,
+    }
+
+    impl<W: AsyncWrite + Unpin> AsyncWrite for SlowLink<W> {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            if this.next.as_mut().poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+            let n = buf.len().min(this.chunk);
+            let written = Pin::new(&mut this.inner).poll_write(cx, &buf[..n]);
+            if written.is_ready() {
+                let every = this.every;
+                this.next
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + every);
+            }
+            written
+        }
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
+    /// PB-51 T2 blocker: a black-holed verifier with a template in flight.
+    /// The write parks once the send buffer is full, and the silence check
+    /// on the heartbeat arm cannot run while the loop sits in the write, so
+    /// the stall itself has to end it.
+    #[tokio::test]
+    async fn a_black_hole_with_a_template_in_flight_is_dropped() {
+        let (_verifier_side, gateway_side) = tokio::io::duplex(64 * 1024);
+        let start = tokio::time::Instant::now();
+        let (outcome, _) = tokio::time::timeout(
+            Duration::from_secs(3),
+            drive_with(
+                gateway_side,
+                BlackHole { cap: 64 * 1024 },
+                Duration::from_millis(30),
+                |tx| {
+                    tx.try_send(propose_of(1, 1024 * 1024)).unwrap();
+                },
+            ),
+        )
+        .await
+        .expect("a black hole with a template in flight was waited on forever");
+        assert!(matches!(outcome, IoLoopOutcome::Disconnected));
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    /// PB-51 T2: the heartbeat writes go through the same guard. With no
+    /// template to send, a black hole that stops accepting even heartbeats is
+    /// failed by the stalled heartbeat write, not waited on in it.
+    #[tokio::test]
+    async fn a_black_hole_that_takes_no_heartbeat_is_dropped() {
+        let (_verifier_side, gateway_side) = tokio::io::duplex(64 * 1024);
+        let (outcome, _) = tokio::time::timeout(
+            Duration::from_secs(3),
+            drive_with(
+                gateway_side,
+                BlackHole { cap: 0 },
+                Duration::from_millis(30),
+                |_| {},
+            ),
+        )
+        .await
+        .expect("a stalled heartbeat write was waited on forever");
+        assert!(matches!(outcome, IoLoopOutcome::Disconnected));
+    }
+
+    /// PB-51 T2: a live verifier on a slow link is not silent while it is
+    /// receiving a template, and must not be dropped for it. The verifier
+    /// here behaves as the real one does: it says nothing until the whole
+    /// template has arrived, then answers it and the heartbeats after it.
+    /// The first cut counted the write's duration as silence, so the first
+    /// tick after the write dropped it with the verdict unread.
+    #[tokio::test]
+    async fn a_live_verifier_on_a_slow_link_is_not_dropped() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+        let (verifier_in, gateway_out) = tokio::io::duplex(64 * 1024);
+        let (mut verifier_out, gateway_in) = tokio::io::duplex(64 * 1024);
+        let verifier = tokio::spawn(async move {
+            let mut lines = BufReader::new(verifier_in);
+            let mut line = Vec::new();
+            lines.read_until(b'\n', &mut line).await.unwrap();
+            assert!(line.len() > 1024 * 1024, "the template arrives first");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            verifier_out
+                .write_all(verdict_line(7, "after a slow write").as_bytes())
+                .await
+                .unwrap();
+            for _ in 0..5 {
+                line.clear();
+                lines.read_until(b'\n', &mut line).await.unwrap();
+                verifier_out
+                    .write_all(heartbeat_ack_line().as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let slow = SlowLink {
+            inner: gateway_out,
+            chunk: 16 * 1024,
+            every: Duration::from_millis(10),
+            next: Box::pin(tokio::time::sleep(Duration::ZERO)),
+        };
+        let (outcome, received) = drive_with(gateway_in, slow, Duration::from_millis(50), |tx| {
+            tx.try_send(propose_of(7, 1024 * 1024)).unwrap();
+        })
+        .await;
+        verifier.await.unwrap();
+        assert!(
+            matches!(outcome, IoLoopOutcome::Disconnected),
+            "ends when the verifier hangs up"
+        );
+        assert_eq!(
+            verdict_ids(&received),
+            vec![7],
+            "the verifier was dropped during or after a slow write"
+        );
+    }
+
+    /// PB-51 T2: small templates written instantly into a black hole must not
+    /// hide it. Only time actually spent blocked in a write is excused.
+    #[tokio::test]
+    async fn small_templates_do_not_hide_a_black_hole() {
+        let (_verifier_side, gateway_side) = tokio::io::duplex(64 * 1024);
+        let (outcome, _) = tokio::time::timeout(
+            Duration::from_secs(3),
+            drive_with(
+                gateway_side,
+                tokio::io::sink(),
+                Duration::from_millis(30),
+                |tx| {
+                    tokio::spawn(async move {
+                        for id in 0.. {
+                            if tx.send(propose_of(id, 64)).await.is_err() {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    });
+                },
+            ),
+        )
+        .await
+        .expect("small instant writes hid a silent verifier");
+        assert!(matches!(outcome, IoLoopOutcome::Disconnected));
+    }
+
+    /// PB-51 T2: when the loop resumes after a stall past the deadline, a
+    /// verdict already waiting in the socket is read before a catch-up tick
+    /// can drop the connection. Unbiased, the reviewer's probe lost it 37
+    /// times in 60.
+    ///
+    /// Real sockets, because an in-memory duplex wakes the reader the moment
+    /// it is written, which no TCP socket does. The stall is the runtime
+    /// thread blocked, as a starved gateway's is. With reads first and no
+    /// recheck this still lost the verdict about once in 60 trials: the case
+    /// the next test pins down deterministically.
+    #[tokio::test]
+    async fn a_verdict_already_waiting_beats_the_silence_check() {
+        use std::io::Write as _;
+        for trial in 0..20 {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut verifier =
+                std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (accepted, _) = listener.accept().unwrap();
+            accepted.set_nonblocking(true).unwrap();
+            let (gateway_in, _gateway_out) = tokio::net::TcpStream::from_std(accepted)
+                .unwrap()
+                .into_split();
+            let run = tokio::spawn(drive_with(
+                gateway_in,
+                tokio::io::sink(),
+                Duration::from_millis(20),
+                |_| {},
+            ));
+            tokio::task::yield_now().await;
+            verifier
+                .write_all(verdict_line(trial, "waiting").as_bytes())
+                .unwrap();
+            // Past the 60 ms deadline with the loop unable to run.
+            std::thread::sleep(Duration::from_millis(80));
+            drop(verifier);
+            let (_, received) = run.await.unwrap();
+            assert_eq!(
+                verdict_ids(&received),
+                vec![trial],
+                "trial {trial}: the silence check ran before a waiting verdict was read"
+            );
+        }
+    }
+
+    /// A socket whose line has reached the kernel but not the runtime. Once
+    /// `arrived` is set, the first poll returns `Pending` and asks to be
+    /// polled again, as tokio does until its driver has recorded the
+    /// readiness; later polls return the line, then EOF.
+    struct UnseenReadiness {
+        arrived: Arc<AtomicBool>,
+        seen: bool,
+        line: Vec<u8>,
+        pos: usize,
+    }
+
+    impl AsyncRead for UnseenReadiness {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            if !this.arrived.load(AtomicOrdering::SeqCst) {
+                // Nothing yet; the loop's ticks keep it polled.
+                return Poll::Pending;
+            }
+            if !this.seen {
+                this.seen = true;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            let n = buf.remaining().min(this.line.len() - this.pos);
+            buf.put_slice(&this.line[this.pos..this.pos + n]);
+            this.pos += n;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// PB-51 T2: the case reads-first alone does not cover. A tick schedules
+    /// the loop, the runtime stalls past the deadline, and a verdict reaches
+    /// the kernel meanwhile; when the loop runs, the tick is ready and the
+    /// socket is not yet. The recheck gives the runtime one turn to see it.
+    /// Paused time, so every trial takes exactly this path.
+    #[tokio::test(start_paused = true)]
+    async fn a_verdict_the_runtime_has_not_yet_seen_beats_the_silence_check() {
+        for trial in 0..30 {
+            let arrived = Arc::new(AtomicBool::new(false));
+            let reader = UnseenReadiness {
+                arrived: Arc::clone(&arrived),
+                seen: false,
+                line: verdict_line(trial, "unseen").into_bytes(),
+                pos: 0,
+            };
+            let run = tokio::spawn(drive_with(
+                reader,
+                tokio::io::sink(),
+                Duration::from_millis(20),
+                |_| {},
+            ));
+            // The loop starts, and its first tick is armed.
+            tokio::task::yield_now().await;
+            arrived.store(true, AtomicOrdering::SeqCst);
+            // The stall: the clock passes the 60 ms deadline before the loop,
+            // already scheduled by that tick, runs again.
+            tokio::time::advance(Duration::from_millis(100)).await;
+            let (_, received) = run.await.unwrap();
+            assert_eq!(
+                verdict_ids(&received),
+                vec![trial],
+                "trial {trial}: a verdict the runtime had not yet seen was counted as silence"
+            );
+        }
+    }
+
+    /// PB-52 T2: invalid UTF-8 inside a JSON string is a malformed line, not
+    /// replacement characters dispatched as a verdict.
+    #[tokio::test]
+    async fn invalid_utf8_inside_a_verdict_is_struck_not_rewritten() {
+        let mut bytes = Vec::new();
+        for id in 0..3 {
+            let line = verdict_line(id, "@@").into_bytes();
+            let at = line.windows(2).position(|w| w == b"@@").unwrap();
+            bytes.extend_from_slice(&line[..at]);
+            bytes.extend_from_slice(&[0xFF, 0xFE]);
+            bytes.extend_from_slice(&line[at + 2..]);
+        }
+        let (outcome, received) = drive_io_loop(bytes.as_slice()).await;
+        assert!(
+            matches!(outcome, IoLoopOutcome::Disconnected),
+            "three strikes"
+        );
+        assert!(
+            received.is_empty(),
+            "invalid UTF-8 was rewritten and dispatched: {received:?}"
+        );
+    }
+
     // ── PB-23: the read must be bounded before the allocation, not after ──
 
     #[tokio::test]
@@ -916,7 +1583,7 @@ mod tests {
         // bytes against a 64-byte budget.
         let data = vec![b'a'; 200];
         let mut reader = BufReader::new(data.as_slice());
-        let mut buf = String::new();
+        let mut buf = Vec::new();
         let r = read_bounded_line(&mut reader, &mut buf, 64).await.unwrap();
         assert_eq!(r, BoundedLine::OverLimit);
         assert!(
@@ -932,12 +1599,12 @@ mod tests {
         // budget exactly; the next call reports EOF.
         let data: &[u8] = b"1234567\n";
         let mut reader = BufReader::new(data);
-        let mut buf = String::new();
+        let mut buf = Vec::new();
         assert_eq!(
             read_bounded_line(&mut reader, &mut buf, 8).await.unwrap(),
             BoundedLine::Line
         );
-        assert_eq!(buf, "1234567\n");
+        assert_eq!(buf, b"1234567\n");
         buf.clear();
         assert_eq!(
             read_bounded_line(&mut reader, &mut buf, 8).await.unwrap(),
@@ -952,7 +1619,7 @@ mod tests {
         // the limit before any further read.
         let data: &[u8] = b"more bytes\n";
         let mut reader = BufReader::new(data);
-        let mut buf = "a".repeat(8);
+        let mut buf = b"a".repeat(8);
         assert_eq!(
             read_bounded_line(&mut reader, &mut buf, 8).await.unwrap(),
             BoundedLine::OverLimit

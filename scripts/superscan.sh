@@ -441,6 +441,35 @@ gate "deep: exactly one rustls provider, or an explicit install (PB-34)" \
     exit $fail
   '
 
+# ── D14. The tracked gate is the canonical gate (J, 2026-09-10) ──
+#
+# scripts/gate.sh used to be an untracked symlink into the local Felix project,
+# by standing decision 1, so a public clone or a cloud session had no gate at
+# all while .claude/CLAUDE.md told everyone to run it. J decided to track it.
+# Felix keeps the canonical copy (its own tests read it), so the two must not
+# drift: under Felix, which exports FELIX_PROJECT, this fails on any
+# difference. Anywhere else it says plainly that it could not check, rather
+# than passing a comparison it never made.
+gate "deep: scripts/gate.sh is tracked and matches Felix's canonical copy" \
+  bash -c '
+    if [ -L scripts/gate.sh ] || [ ! -f scripts/gate.sh ]; then
+      echo "ERROR: scripts/gate.sh must be a regular tracked file, not a symlink or absent"
+      exit 1
+    fi
+    git ls-files --error-unmatch scripts/gate.sh >/dev/null 2>&1 \
+      || { echo "ERROR: scripts/gate.sh is not tracked"; exit 1; }
+    canon="${FELIX_PROJECT:-}/gate.sh"
+    if [ -z "${FELIX_PROJECT:-}" ] || [ ! -f "$canon" ]; then
+      echo "WARN: not run under Felix, so drift from the canonical copy was not checked"
+      exit 0
+    fi
+    if ! cmp -s scripts/gate.sh "$canon"; then
+      echo "ERROR: scripts/gate.sh differs from $canon"
+      echo "       copy the newer one over the other, then commit the repo copy"
+      exit 1
+    fi
+  '
+
 # ── D12. Canonical counts: reason-code stability (R-13/R-155) ───
 gate "deep: reason-code count assertions present" \
   bash -c '

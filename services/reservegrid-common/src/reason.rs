@@ -200,10 +200,10 @@ pub enum GatewayReason {
     /// Emitted during WAL reconciliation on startup.
     ProcessCrashRecovery,
 
-    /// WAL append failed (disk full, fsync error, mutex poisoned, `spawn_blocking`
-    /// join failure). Emitted as a structured log event immediately before the
-    /// gateway begins graceful shutdown when `VELDRA_WAL_WRITE_FAILURE_MODE` is
-    /// not set to `accept_silent`. Never reaches the SV2 wire.
+    /// WAL append or compaction failed (disk full, fsync error, mutex poisoned,
+    /// `spawn_blocking` join failure). Emitted as a structured log event
+    /// immediately before the gateway begins graceful shutdown, which since
+    /// 2.0.0 it always does. Never reaches the SV2 wire.
     WalWriteFailure,
 
     // ── Connection lifecycle (disconnect telemetry) ──
