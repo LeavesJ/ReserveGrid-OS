@@ -1,0 +1,49 @@
+# rg-auth on a self-managed host behind Cloudflare Tunnel (PB-14).
+#
+# Replaces the Fly app that has been suspended since 2026-04-12. The runbook is
+# docs/runbooks/auth-migration-fly-to-tunnel.md. The service listens on the
+# host's loopback only; cloudflared dials out to Cloudflare and forwards
+# https://auth.veldra.org to 127.0.0.1:3030, so no inbound port ever opens.
+#
+# Production values below are the ones services/rg-auth/fly.toml ran with.
+# Secrets come from .env.auth, which is gitignored and built from the password
+# manager using deploy/env.auth.example as the template. An env_file rather
+# than ${VAR:-} defaults, because rg-auth treats an EMPTY SMTP variable as set
+# (and breaks) but an ABSENT one as "email disabled".
+#
+# Usage, from the repo root on the host:
+#   docker compose -f docker-compose.auth.yml up -d --build
+services:
+  rg-auth:
+    build:
+      context: .
+      dockerfile: services/rg-auth/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3030:3030"
+    env_file:
+      - .env.auth
+    environment:
+      # The container binds all interfaces; the host exposes loopback only.
+      VELDRA_ALLOW_NON_LOOPBACK: "1"
+      VELDRA_LOG_FORMAT: json
+      VELDRA_LOG_FILTER: info
+      VELDRA_AUTH_ADDR: "0.0.0.0:3030"
+      VELDRA_AUTH_DB: /data/auth.db
+      VELDRA_AUTH_SITE_URL: "https://veldra.org"
+      VELDRA_AUTH_URL: "https://auth.veldra.org"
+      VELDRA_AUTH_ALLOWED_ORIGIN: "https://veldra.org"
+      VELDRA_AUTH_SESSION_TTL_HOURS: "168"
+      # VELDRA_AUTH_TRUST_PROXY stays OFF. rg-auth takes the LEFTMOST
+      # X-Forwarded-For address, and behind Cloudflare a client can put
+      # anything there. Every request then arrives from cloudflared on
+      # loopback, so the rate limiter shares one bucket, as it did behind
+      # Fly's proxy. Trusting CF-Connecting-IP is a deliberate code change.
+    volumes:
+      - ./data/auth:/data:rw
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3030/auth/health || exit 1"]
+      interval: 10s
+      timeout: 3s
+      start_period: 10s
+      retries: 6
