@@ -44,13 +44,15 @@
 //! silence can. A dead socket and a live gateway between two heartbeats
 //! look identical on the wire, so the threshold has to outlast a live
 //! peer's longest normal silence. The verifier cannot read the gateway's
-//! heartbeat setting, so it learns it: `HeartbeatCadence` watches when each
-//! connection's heartbeats arrive and sets the threshold to twice the
-//! largest of its last 16 intervals, never under `SHED_FLOOR`. Intervals
-//! under 250 ms are ignored: they are heartbeats read back to back after the
-//! verifier was busy or the gateway's sends burst, not the peer's cadence,
-//! and learning from them shed a live 5 s gateway in the PB-31 T2 review.
-//! Until three real intervals are seen, and forever for a peer that never
+//! heartbeat setting, so it learns it: `HeartbeatCadence` counts a
+//! connection's heartbeats and sets the threshold to twice the time since the
+//! connection started divided by the intervals seen, never under
+//! `SHED_FLOOR`. For sv2-gateway that estimate can never fall below the real
+//! interval, however late or bunched the verifier's reads are (see the type).
+//! The two estimators before it, the largest recent interval and then the
+//! same with short intervals ignored, both learned too short a threshold from
+//! reads that arrived bunched, and each got a live gateway shed in a T2
+//! review. Until four heartbeats are seen, and forever for a peer that never
 //! heartbeats, the threshold is `shed_fallback(idle)`, 15 s at the shipped
 //! 60 s budget.
 //!
@@ -68,7 +70,6 @@
 //! newcomer is still refused until the shed happens, and gets in on its
 //! next retry.
 
-use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
 use std::net::IpAddr;
@@ -95,24 +96,8 @@ pub(crate) const SHED_FLOOR: Duration = Duration::from_secs(3);
 /// refused gateway's next attempt.
 pub(crate) const SHED_RECHECK: Duration = Duration::from_millis(500);
 
-/// Heartbeat intervals the cadence remembers. The threshold follows the
-/// LARGEST of them, so it errs long; a single slow read (the verifier reads a
-/// heartbeat only after finishing the message ahead of it, which can take
-/// seconds) inflates it for at most this many heartbeats. Sixteen, not the
-/// first draft's four: the longer the memory, the less likely it is that
-/// every interval in it was compressed by the verifier's own delays.
-const CADENCE_WINDOW: usize = 16;
-
-/// Intervals shorter than this are not a cadence. They are heartbeats read
-/// back to back, queued behind a busy verifier or sent in a burst by a
-/// gateway catching up, and learning from them drove the threshold to the
-/// floor under a live 5 s gateway (PB-31 T2 review). A peer that really
-/// heartbeats this fast is never learned and keeps the fallback, which is
-/// only slower.
-const CADENCE_MIN_INTERVAL: Duration = Duration::from_millis(250);
-
-/// Real intervals, not heartbeats, before a cadence is trusted.
-const CADENCE_LEARN_AFTER: usize = 3;
+/// Heartbeats before a cadence is trusted: four, so three intervals.
+const CADENCE_LEARN_AFTER: u32 = 4;
 
 /// The threshold for a connection with no learned cadence: a quarter of
 /// the idle budget, never under 10 s. That is 15 s at the shipped 60 s,
@@ -154,51 +139,59 @@ impl ShedAtCap {
     }
 }
 
-/// Learns a peer's heartbeat interval from when its heartbeats arrive, and
-/// publishes the shed threshold that follows from it (PB-31).
+/// Learns a peer's heartbeat interval from its heartbeats, and publishes the
+/// shed threshold that follows from it (PB-31).
 ///
 /// The verifier cannot read the gateway's `heartbeat_interval_ms`, and the
 /// heartbeat payload is empty, so the interval is observed rather than
 /// configured. That is also what lets a gateway still on the pre-2.0.0
 /// default of 5 s and one on the current 2 s share a verifier safely: each
 /// connection gets a threshold fitted to its own peer.
+///
+/// **The estimate is an upper bound on the interval, whatever the reads look
+/// like.** It is `(latest arrival - connection start) / (heartbeats - 1)`.
+/// sv2-gateway sends heartbeats from a `tokio::time::interval`, which never
+/// fires ahead of its schedule: a late tick fires late, and missed ticks
+/// catch up but never get ahead. Its first heartbeat goes out after the TLS
+/// handshake, so after this connection started. So heartbeat `n` is sent no
+/// earlier than `start + (n - 1) * H` and read no earlier than that, and the
+/// estimate is never below `H`, however late, bunched, or reordered-in-time
+/// the verifier's reads are. That is the property the earlier estimators
+/// lacked: they measured intervals between READS, which a busy verifier
+/// compresses. Delays only make this estimate larger, which errs toward
+/// keeping a connection.
+///
+/// A peer that sends heartbeats faster than it later goes on to, which no
+/// fixed-interval timer does, can learn a threshold shorter than its later
+/// silences. It is treated like any other quiet connection at a full
+/// address, which J accepted for diagnostic connections.
 pub(crate) struct HeartbeatCadence {
     after_ms: Arc<AtomicU64>,
-    last: Option<Instant>,
-    recent: VecDeque<Duration>,
+    started: Instant,
+    heartbeats: u32,
 }
 
 impl HeartbeatCadence {
-    pub(crate) fn new(after_ms: Arc<AtomicU64>) -> Self {
+    /// `started` must not be after the peer's first heartbeat could be sent:
+    /// the connection's own start, taken before its TLS handshake.
+    pub(crate) fn new(after_ms: Arc<AtomicU64>, started: Instant) -> Self {
         Self {
             after_ms,
-            last: None,
-            recent: VecDeque::with_capacity(CADENCE_WINDOW),
+            started,
+            heartbeats: 0,
         }
     }
 
     /// A heartbeat arrived at `now`.
     pub(crate) fn observe(&mut self, now: Instant) {
-        if let Some(last) = self.last {
-            let interval = now.saturating_duration_since(last);
-            if interval < CADENCE_MIN_INTERVAL {
-                // Read back to back: not the cadence. Keep the earlier
-                // arrival, so the next real interval is measured from it.
-                return;
-            }
-            if self.recent.len() == CADENCE_WINDOW {
-                self.recent.pop_front();
-            }
-            self.recent.push_back(interval);
-            if self.recent.len() >= CADENCE_LEARN_AFTER
-                && let Some(longest) = self.recent.iter().max()
-            {
-                let after = (*longest * 2).max(SHED_FLOOR);
-                let ms = u64::try_from(after.as_millis()).unwrap_or(u64::MAX);
-                self.after_ms.store(ms, Ordering::Relaxed);
-            }
+        self.heartbeats = self.heartbeats.saturating_add(1);
+        if self.heartbeats < CADENCE_LEARN_AFTER {
+            return;
         }
-        self.last = Some(now);
+        let per_interval = now.saturating_duration_since(self.started) / (self.heartbeats - 1);
+        let after = (per_interval * 2).max(SHED_FLOOR);
+        let ms = u64::try_from(after.as_millis()).unwrap_or(u64::MAX);
+        self.after_ms.store(ms, Ordering::Relaxed);
     }
 }
 
@@ -630,24 +623,31 @@ mod tests {
         writer.abort();
     }
 
-    fn cadence() -> (HeartbeatCadence, Arc<AtomicU64>) {
+    fn cadence(started: tokio::time::Instant) -> (HeartbeatCadence, Arc<AtomicU64>) {
         let after_ms = Arc::new(AtomicU64::new(15_000));
-        (HeartbeatCadence::new(Arc::clone(&after_ms)), after_ms)
+        (
+            HeartbeatCadence::new(Arc::clone(&after_ms), started),
+            after_ms,
+        )
     }
 
-    /// The fallback holds until three real intervals are seen; then the
-    /// threshold is twice the longest recent interval, never under the floor.
+    /// The fallback holds until four heartbeats are seen; then the threshold
+    /// is twice the interval, never under the floor.
     #[test]
-    fn the_cadence_learns_twice_the_longest_recent_interval() {
+    fn the_cadence_learns_twice_the_interval() {
         let learned = |step_ms: u64, beats: u64| {
-            let (mut c, after_ms) = cadence();
             let t = tokio::time::Instant::now();
+            let (mut c, after_ms) = cadence(t);
             for i in 0..beats {
                 c.observe(t + Duration::from_millis(step_ms * i));
             }
             after_ms.load(Ordering::Relaxed)
         };
-        assert_eq!(learned(2_000, 3), 15_000, "two intervals are not a cadence");
+        assert_eq!(
+            learned(2_000, 3),
+            15_000,
+            "three heartbeats are not a cadence"
+        );
         assert_eq!(learned(2_000, 4), 4_000, "2 s heartbeats shed after 4 s");
         assert_eq!(learned(5_000, 4), 10_000, "a pre-2.0.0 gateway's 5 s");
         assert_eq!(
@@ -657,64 +657,46 @@ mod tests {
         );
     }
 
-    /// One slow read inflates the threshold, on the safe side, and it ages
-    /// out after the window instead of sticking for the connection's life.
+    /// The property the estimator exists for (PB-31 T2, twice): heartbeats
+    /// SENT on a fixed interval, as sv2-gateway sends them, and READ with any
+    /// delay at all, never teach a threshold under twice the interval. Each
+    /// pattern is a list of read delays, one per heartbeat; the reviews' shed
+    /// reproductions were all reads bunched like these.
     #[test]
-    fn a_slow_heartbeat_ages_out_of_the_cadence() {
-        let (mut c, after_ms) = cadence();
-        let mut t = tokio::time::Instant::now();
-        for gap in [2u64, 2, 7, 2] {
-            c.observe(t);
-            t += Duration::from_secs(gap);
+    fn late_or_bunched_reads_never_lower_it_below_twice_the_interval() {
+        let patterns: [&[u64]; 6] = [
+            // the first reads held back, then read out together
+            &[9_000, 5_000, 1_000, 0, 0, 0, 0, 0],
+            // one slow read in the middle, the rest on time
+            &[0, 0, 0, 7_000, 3_000, 0, 0, 0],
+            // every read a little late, by varying amounts
+            &[300, 1_900, 200, 2_600, 100, 2_400, 0, 1_700],
+            // a backlog drained at connect, then steady
+            &[20_000, 18_000, 16_000, 14_000, 12_000, 10_000, 0, 0],
+            // on time throughout
+            &[0; 8],
+            // late by a constant
+            &[4_000; 8],
+        ];
+        for interval_ms in [1_000u64, 2_000, 5_000, 10_000] {
+            for delays in patterns {
+                let t = tokio::time::Instant::now();
+                let (mut c, after_ms) = cadence(t);
+                for (n, delay) in delays.iter().enumerate() {
+                    let sent = interval_ms * u64::try_from(n).unwrap();
+                    c.observe(t + Duration::from_millis(sent + delay));
+                    if n + 1 < usize::try_from(super::CADENCE_LEARN_AFTER).unwrap() {
+                        continue; // still the fallback, which is not learned
+                    }
+                    let learned = after_ms.load(Ordering::Relaxed);
+                    assert!(
+                        learned >= 2 * interval_ms,
+                        "a {interval_ms} ms gateway read with delays {delays:?} learned \
+                         {learned} ms after heartbeat {n}: it would be shed between beats"
+                    );
+                }
+            }
         }
-        c.observe(t);
-        assert_eq!(
-            after_ms.load(Ordering::Relaxed),
-            14_000,
-            "the 7 s gap dominates"
-        );
-        for _ in 0..16 {
-            t += Duration::from_secs(2);
-            c.observe(t);
-        }
-        assert_eq!(
-            after_ms.load(Ordering::Relaxed),
-            4_000,
-            "sixteen 2 s beats later it is gone"
-        );
-    }
-
-    /// PB-31 T2 blocker: heartbeats read back to back are not a cadence. A
-    /// burst at connect, then a gateway's real 5 s cadence, must learn 10 s,
-    /// not the floor; learning the floor shed that live gateway 3 s into a
-    /// 5 s silence.
-    #[test]
-    fn a_burst_of_heartbeats_is_not_learned_as_the_cadence() {
-        let (mut c, after_ms) = cadence();
-        let t = tokio::time::Instant::now();
-        for i in 0..3 {
-            c.observe(t + Duration::from_millis(i));
-        }
-        assert_eq!(
-            after_ms.load(Ordering::Relaxed),
-            15_000,
-            "a burst teaches nothing"
-        );
-        for i in 1..=3 {
-            c.observe(t + Duration::from_secs(5 * i));
-        }
-        assert_eq!(after_ms.load(Ordering::Relaxed), 10_000);
-
-        // Learned, then a backlog read out together: the threshold holds.
-        let later = t + Duration::from_secs(20);
-        for i in 0..5 {
-            c.observe(later + Duration::from_millis(i));
-        }
-        assert_eq!(
-            after_ms.load(Ordering::Relaxed),
-            10_000,
-            "a later burst must not shrink it"
-        );
     }
 
     /// The fallback for a peer with no learned cadence: a quarter of the

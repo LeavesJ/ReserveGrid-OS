@@ -655,7 +655,10 @@ async fn serve_admitted_connection(
             shed: Arc::clone(&shed),
         })
     };
-    let mut cadence = crate::idle_stream::HeartbeatCadence::new(Arc::clone(&shed_after_ms));
+    let mut cadence = crate::idle_stream::HeartbeatCadence::new(
+        Arc::clone(&shed_after_ms),
+        tokio::time::Instant::now(),
+    );
 
     // Upgrade to TLS if configured, then split into reader/writer.
     if let Some(acceptor) = acceptor {
@@ -1607,9 +1610,10 @@ mod tests {
                     log_id_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                     metrics,
                 },
-                &mut crate::idle_stream::HeartbeatCadence::new(std::sync::Arc::new(
-                    std::sync::atomic::AtomicU64::new(0),
-                )),
+                &mut crate::idle_stream::HeartbeatCadence::new(
+                    std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                    tokio::time::Instant::now(),
+                ),
             )
             .await;
         }
