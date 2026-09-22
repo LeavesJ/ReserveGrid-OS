@@ -332,6 +332,20 @@ pub(crate) const DEFAULT_MAX_INGRESS_CONNECTIONS: u32 = 32;
 /// Refusing a real gateway is not a safe failure. It drives the
 /// gateway's `auto_degrade` (default true), which suspends enforcement.
 ///
+/// **Shed at cap (PB-31's root fix) bounds the doubling at a full
+/// address; it does not delete it.** A connection silent for twice its
+/// learned heartbeat interval while its address sits at this ceiling
+/// ends itself, and its slot goes to the peer being refused
+/// (`idle_stream`). So once an address is full a reconnecting gateway is
+/// refused for about 4 s at sv2-gateway's 2 s heartbeat default, 10 s for
+/// a gateway still on the pre-2.0.0 5 s default, and 15 s for a peer that
+/// never heartbeats, instead of the ~58 s measured before. Below the
+/// ceiling nothing changes, because nothing is being refused. The
+/// derivation above still sizes the default for the doubling, so the
+/// shed is a margin rather than the plan: 20 now serves up to 18 gateway
+/// streams behind one address through a reconnect, with a few seconds of
+/// refusal each.
+///
 /// The cost of the raise is that 20 out of the 32-slot global cap lets
 /// two addresses saturate the ingress where 8 needed four. That is
 /// accepted because the per-IP ceiling was never what stops a squatter:
@@ -354,9 +368,9 @@ pub(crate) const DEFAULT_MAX_INGRESS_CONNECTIONS_PER_IP: u32 = 20;
 /// when `VELDRA_VERIFIER_IDLE_TIMEOUT_SECS` is unset.
 ///
 /// Measured since the last byte that actually moved, never from the
-/// connection's start; see `idle_stream`. 60 s is twelve times
-/// sv2-gateway's default `heartbeat_interval_ms` of 5 000
-/// (`sv2-gateway/src/config.rs:440`), so a scheduler stall, a policy
+/// connection's start; see `idle_stream`. 60 s is thirty times
+/// sv2-gateway's default `heartbeat_interval_ms` of 2 000, and twelve times
+/// the 5 000 it shipped with before 2.0.0, so a scheduler stall, a policy
 /// reload or a slow verdict can never look like silence, and
 /// template-manager's per-template connections close long before it.
 /// Against a squatter it bounds a stolen slot to one minute instead of
@@ -538,6 +552,7 @@ pub(crate) async fn run_tcp_server(
             IdleBudget {
                 idle_timeout,
                 idle_timeout_secs,
+                per_ip: per_ip.clone(),
             },
             ConnectionDeps {
                 app_state: app_state.clone(),
@@ -570,7 +585,8 @@ fn enable_tcp_keepalive(stream: &tokio::net::TcpStream) -> std::io::Result<()> {
 /// TLS one and the plaintext one, hand the same five values to
 /// `handle_tcp_connection`, and the accept loop clones them once per
 /// connection. Without it the accept loop carries five `let x = y.clone()`
-/// lines and the task body threads five more parameters.
+/// lines and `handle_tcp_connection` takes five more parameters; it takes
+/// this struct whole.
 struct ConnectionDeps {
     app_state: AppState,
     verdict_log: VerdictLog,
@@ -579,12 +595,14 @@ struct ConnectionDeps {
     metrics: Arc<crate::metrics::VerifierMetrics>,
 }
 
-/// The no-progress budget, and the same number in seconds for the log
-/// line that reports a reap. Two representations of one setting rather
-/// than a `Duration::as_secs()` call inside a warn field.
+/// The no-progress budget, the same number in seconds for the log line
+/// that reports a reap, and the per-IP tracker the shed-at-cap rule reads
+/// (PB-31) so "the address is full" means the count the accept loop
+/// refuses on.
 struct IdleBudget {
     idle_timeout: Duration,
     idle_timeout_secs: u64,
+    per_ip: reservegrid_common::per_ip::PerIpConnectionTracker,
 }
 
 /// Serve one admitted ingress connection, from permit to close (PB-26,
@@ -604,13 +622,7 @@ async fn serve_admitted_connection(
     // `handle_tcp_connection` and on a panic in this task.
     let _slot = slot;
 
-    let ConnectionDeps {
-        app_state,
-        verdict_log,
-        mempool_url,
-        log_id_counter,
-        metrics,
-    } = deps;
+    let metrics = Arc::clone(&deps.metrics);
 
     // PB-27. Wrapped before the TLS acceptor, so a peer that opens TCP
     // and never sends a `ClientHello` is on the clock too.
@@ -618,21 +630,33 @@ async fn serve_admitted_connection(
     let stream =
         crate::idle_stream::IdleTimeout::new(tcp_stream, budget.idle_timeout, Arc::clone(&reaped));
 
+    // PB-31. Shed at cap: silent past its threshold while this address is
+    // full, the connection ends itself so a refused peer gets the slot.
+    // The threshold starts at the fallback and is replaced by the peer's
+    // learned heartbeat cadence once the message loop has seen enough.
+    let shed_after_ms = Arc::new(std::sync::atomic::AtomicU64::new(
+        u64::try_from(crate::idle_stream::shed_fallback(budget.idle_timeout).as_millis())
+            .unwrap_or(u64::MAX),
+    ));
+    let shed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stream = if budget.per_ip.is_disabled() {
+        stream
+    } else {
+        stream.with_shed_at_cap(crate::idle_stream::ShedAtCap {
+            per_ip: budget.per_ip.clone(),
+            ip: peer.ip(),
+            after_ms: Arc::clone(&shed_after_ms),
+            shed: Arc::clone(&shed),
+        })
+    };
+    let mut cadence = crate::idle_stream::HeartbeatCadence::new(Arc::clone(&shed_after_ms));
+
     // Upgrade to TLS if configured, then split into reader/writer.
     if let Some(acceptor) = acceptor {
         match timeout(TLS_HANDSHAKE_BUDGET, acceptor.accept(stream)).await {
             Ok(Ok(tls_stream)) => {
                 let (reader, writer) = tokio::io::split(tls_stream);
-                handle_tcp_connection(
-                    reader,
-                    writer,
-                    app_state,
-                    verdict_log,
-                    mempool_url,
-                    log_id_counter,
-                    Arc::clone(&metrics),
-                )
-                .await;
+                handle_tcp_connection(reader, writer, deps, &mut cadence).await;
             }
             Ok(Err(e)) => {
                 warn!(peer = %peer, error = %e, "TLS accept failed");
@@ -654,16 +678,18 @@ async fn serve_admitted_connection(
         }
     } else {
         let (reader, writer) = tokio::io::split(stream);
-        handle_tcp_connection(
-            reader,
-            writer,
-            app_state,
-            verdict_log,
-            mempool_url,
-            log_id_counter,
-            Arc::clone(&metrics),
-        )
-        .await;
+        handle_tcp_connection(reader, writer, deps, &mut cadence).await;
+    }
+
+    if shed.load(Ordering::Relaxed) {
+        metrics.connections_shed_at_cap_total.inc();
+        warn!(
+            peer = %peer,
+            shed_after_ms = shed_after_ms.load(Ordering::Relaxed),
+            max_connections_per_ip = budget.per_ip.max_per_ip(),
+            "ingress connection shed: silent past its threshold at a full address; \
+             its slot goes to a refused peer"
+        );
     }
 
     if reaped.load(Ordering::Relaxed) {
@@ -822,24 +848,24 @@ where
 /// Handles a single TCP connection (plaintext or TLS) by reading NDJSON lines
 /// and dispatching template proposals.
 #[allow(clippy::too_many_lines)]
-pub(crate) async fn handle_tcp_connection<R, W>(
+async fn handle_tcp_connection<R, W>(
     reader: R,
     mut writer: W,
-    app_state: AppState,
-    verdict_log: VerdictLog,
-    mempool_url: Option<String>,
-    log_id_counter: LogIdCounter,
-    metrics: Arc<crate::metrics::VerifierMetrics>,
+    deps: ConnectionDeps,
+    cadence: &mut crate::idle_stream::HeartbeatCadence,
 ) where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let max_log = crate::verdicts::verdict_log_max_entries();
 
-    let state_clone = app_state;
-    let url_clone = mempool_url;
-    let id_ctr = log_id_counter;
-    let log = verdict_log;
+    let ConnectionDeps {
+        app_state: state_clone,
+        verdict_log: log,
+        mempool_url: url_clone,
+        log_id_counter: id_ctr,
+        metrics,
+    } = deps;
     {
         let mut reader = BufReader::new(reader);
         let mut line = String::new();
@@ -894,6 +920,9 @@ pub(crate) async fn handle_tcp_connection<R, W>(
                             }
                         }
                         msg_types::HEARTBEAT => {
+                            // PB-31: the peer's heartbeat cadence sets how
+                            // long it may stay silent at a full address.
+                            cadence.observe(tokio::time::Instant::now());
                             // Respond with heartbeat_ack in envelope format.
                             let ack = InternalMessage {
                                 msg_type: msg_types::HEARTBEAT_ACK.to_string(),
@@ -1565,11 +1594,16 @@ mod tests {
             super::handle_tcp_connection(
                 stream.as_bytes(),
                 tokio::io::sink(),
-                app_state,
-                std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-                None,
-                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                metrics,
+                super::ConnectionDeps {
+                    app_state,
+                    verdict_log: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                    mempool_url: None,
+                    log_id_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                    metrics,
+                },
+                &mut crate::idle_stream::HeartbeatCadence::new(std::sync::Arc::new(
+                    std::sync::atomic::AtomicU64::new(0),
+                )),
             )
             .await;
         }

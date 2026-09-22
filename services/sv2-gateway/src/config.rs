@@ -265,7 +265,12 @@ pub struct VerifierSection {
     #[serde(default = "default_verifier_reconnect_delay_ms")]
     pub reconnect_delay_ms: u64,
 
-    /// Heartbeat send interval on the verifier stream (ms). Default 5000.
+    /// Heartbeat send interval on the verifier stream (ms). Default 2000.
+    ///
+    /// The verifier learns this from when heartbeats arrive, and a
+    /// connection silent for twice it, while its source address is at the
+    /// verifier's per-IP ceiling, yields its slot (PB-31). A shorter
+    /// interval therefore frees a dead socket's slot sooner.
     #[serde(default = "default_verifier_heartbeat_interval_ms")]
     pub heartbeat_interval_ms: u64,
 
@@ -437,8 +442,14 @@ fn default_health_probe_staleness_ms() -> u64 {
 fn default_verifier_reconnect_delay_ms() -> u64 {
     2_000
 }
+/// 2 s since 2.0.0; it was 5 s. PB-31: the verifier sheds a silent socket at
+/// a full address after twice the interval it learns, so at 2 s a gateway
+/// whose path died silently has its replacement admitted after about 4 s,
+/// inside `auto_degrade_after_ms` (10 s), and never degrades for it. At 5 s
+/// the shed came at 10 s, the degrade threshold itself. A heartbeat is one
+/// small NDJSON line, so the cost is one line every 2 s per gateway.
 fn default_verifier_heartbeat_interval_ms() -> u64 {
-    5_000
+    2_000
 }
 fn default_channel_open_timeout_ms() -> u64 {
     30_000
@@ -686,16 +697,19 @@ pub fn validate(config: &GatewayConfig) -> Result<Vec<String>, String> {
     validate_timing_chain(config, &mut warnings)?;
     validate_verifier_security(config, &mut warnings)?;
 
-    // Degradation threshold must exceed heartbeat interval, otherwise
-    // the gateway will enter degraded mode between heartbeats and never
-    // recover because no ack can arrive in time.
+    // Degradation threshold must be at least the heartbeat interval,
+    // otherwise the gateway enters degraded mode between heartbeats and
+    // never recovers, because no ack can arrive in time. A refusal, not a
+    // warning: a gateway configured this way is permanently unenforced from
+    // its first minute, and `docs/deployment-runbook.md` has long told
+    // operators it "will refuse to start" while the code only warned.
     if config.gateway.auto_degrade
         && config.mode.enforces_verdicts()
         && config.gateway.auto_degrade_after_ms < config.verifier.heartbeat_interval_ms
     {
-        warnings.push(format!(
+        return Err(format!(
             "auto_degrade_after_ms ({}) is below \
-             heartbeat_interval_ms ({}); the gateway will enter \
+             heartbeat_interval_ms ({}); the gateway would enter \
              permanent degradation because no heartbeat ack can \
              arrive within the threshold",
             config.gateway.auto_degrade_after_ms, config.verifier.heartbeat_interval_ms,
@@ -1119,18 +1133,36 @@ mod tests {
     }
 
     #[test]
-    fn validate_warns_degrade_below_heartbeat() {
+    fn validate_refuses_degrade_below_heartbeat() {
         let mut config = minimal_config(GatewayMode::Inline);
         config.gateway.prevhash_verdict_timeout_ms = 2000;
         config.gateway.auto_degrade_after_ms = 2000;
         config.verifier.heartbeat_interval_ms = 5000;
-        let result = validate(&config);
-        assert!(result.is_ok());
-        let warnings = result.unwrap();
+        let err = validate(&config).expect_err("a permanently degraded gateway must not start");
         assert!(
-            warnings.iter().any(|w| w.contains("auto_degrade_after_ms")),
-            "expected degradation threshold warning, got: {warnings:?}",
+            err.contains("auto_degrade_after_ms") && err.contains("heartbeat_interval_ms"),
+            "the refusal must name both settings: {err}"
         );
+    }
+
+    /// The shipped heartbeat must fit inside the shipped degrade threshold
+    /// with room for PB-31's shed: the verifier frees a dead socket's slot
+    /// after twice the heartbeat interval, and the replacement's first ack
+    /// has to land before the gateway degrades.
+    #[test]
+    fn the_default_heartbeat_leaves_room_for_the_shed_inside_the_degrade_threshold() {
+        let config = minimal_config(GatewayMode::Inline);
+        let heartbeat = config.verifier.heartbeat_interval_ms;
+        let degrade = config.gateway.auto_degrade_after_ms;
+        let reconnect = config.verifier.reconnect_delay_ms;
+        assert_eq!(heartbeat, 2_000);
+        // Shed after two heartbeats, then one full reconnect delay plus its
+        // worst jitter (half again) for the retry that lands after it.
+        assert!(
+            2 * heartbeat + reconnect * 3 / 2 < degrade,
+            "heartbeat {heartbeat} ms, reconnect {reconnect} ms, degrade {degrade} ms"
+        );
+        assert!(validate(&config).is_ok());
     }
 
     #[test]

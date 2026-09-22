@@ -148,6 +148,17 @@ pub(crate) struct VerifierMetrics {
     /// the wrong port, never a budget that needs widening.
     pub(crate) connections_reaped_handshake_total: Counter,
 
+    /// PB-31. Ingress connections that ended themselves because they had
+    /// been silent past their shed threshold while their source address
+    /// sat at `VELDRA_VERIFIER_MAX_CONNECTIONS_PER_IP`, freeing the slot
+    /// for a peer being refused there. Normally a gateway's dead socket
+    /// making way for that gateway's reconnect. Separate from
+    /// `connections_reaped_idle_total` because the threshold is not the
+    /// idle budget: it is learned from each peer's own heartbeat cadence.
+    /// A rate with no gateway restarts means a live peer is going quiet
+    /// for longer than twice its own heartbeat interval.
+    pub(crate) connections_shed_at_cap_total: Counter,
+
     /// PB-27. Ingress slots currently held. Without it, "the cap is too
     /// low", "slots are leaking" and "a squatter is present" are
     /// indistinguishable, and all three are only visible after capacity
@@ -178,6 +189,7 @@ impl VerifierMetrics {
             connections_refused_per_ip_total: Counter::default(),
             connections_reaped_idle_total: Counter::default(),
             connections_reaped_handshake_total: Counter::default(),
+            connections_shed_at_cap_total: Counter::default(),
             connections_active: Gauge::default(),
         };
         registry.register(
@@ -276,6 +288,13 @@ impl VerifierMetrics {
             m.connections_reaped_handshake_total.clone(),
         );
         registry.register(
+            "verifier_connections_shed_at_cap",
+            "NDJSON ingress connections that ended themselves after staying silent past their \
+             learned shed threshold while their source address was at \
+             VELDRA_VERIFIER_MAX_CONNECTIONS_PER_IP, freeing the slot for a refused peer",
+            m.connections_shed_at_cap_total.clone(),
+        );
+        registry.register(
             "verifier_connections_active",
             "NDJSON ingress slots currently held, out of VELDRA_VERIFIER_MAX_CONNECTIONS",
             m.connections_active.clone(),
@@ -321,6 +340,7 @@ mod tests {
         m.connections_refused_per_ip_total.inc();
         m.connections_reaped_idle_total.inc();
         m.connections_reaped_handshake_total.inc();
+        m.connections_shed_at_cap_total.inc();
         m.verdicts_total
             .get_or_create(&VerdictLabels {
                 accepted: "true".to_string(),
@@ -352,6 +372,7 @@ mod tests {
             "verifier_connections_refused_per_ip_total",
             "verifier_connections_reaped_idle_total",
             "verifier_connections_reaped_handshake_total",
+            "verifier_connections_shed_at_cap_total",
         ] {
             assert!(body.contains(name), "missing exported counter `{name}`");
             let doubled = format!("{name}_total");

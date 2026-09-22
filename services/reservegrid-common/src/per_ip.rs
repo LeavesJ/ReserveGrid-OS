@@ -130,7 +130,9 @@ impl PerIpConnectionTracker {
         })
     }
 
-    /// Current active connection count for an IP. For diagnostics only.
+    /// Current active connection count for an IP. The pool-verifier's
+    /// shed-at-cap rule reads it to decide whether an address is full
+    /// (PB-31); a poisoned lock reads as zero, which never sheds.
     pub fn count_for(&self, ip: IpAddr) -> u32 {
         let Ok(map) = self.counts.lock() else {
             return 0;
