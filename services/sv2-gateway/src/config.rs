@@ -455,9 +455,10 @@ fn default_verifier_reconnect_delay_ms() -> u64 {
 /// first seconds, before the verifier has learned its cadence, gets the 15 s
 /// fallback. Many gateways dying together behind one address shed one at a
 /// time, because each socket may shed only while the address is full. And
-/// a path that black-holes never resets, so the gateway never reconnects
-/// (PB-51). A heartbeat is one small NDJSON line, so the cost is one line
-/// every 2 s per gateway.
+/// a path that black-holes never resets, so the gateway reconnects only
+/// once the verifier has been silent for three to four intervals (PB-51),
+/// 6 to 8 s at 2 s. A heartbeat is one small NDJSON line, so the cost is one
+/// line every 2 s per gateway.
 fn default_verifier_heartbeat_interval_ms() -> u64 {
     2_000
 }

@@ -341,9 +341,11 @@ pub(crate) const DEFAULT_MAX_INGRESS_CONNECTIONS: u32 = 32;
 /// slot about 4 s after its last heartbeat at sv2-gateway's 2 s default,
 /// 10 s for a gateway still on the pre-2.0.0 5 s default, and 15 s for a
 /// peer whose cadence is not yet learned or that never heartbeats, instead
-/// of the ~58 s measured before. The shed does nothing for a path that
-/// black-holes (the gateway never reconnects, PB-51), nothing for refusals
-/// by the global cap, and nothing when this ceiling is `0`. Several dead
+/// of the ~58 s measured before. A path that black-holes gives the gateway
+/// no reset, so it reconnects only once it has heard nothing for three to
+/// four heartbeats (PB-51), 6 to 8 s at 2 s, by when the dead socket is past
+/// its threshold. The shed does nothing for refusals by the global cap, and
+/// nothing when this ceiling is `0`. Several dead
 /// sockets at one address shed one at a time, since each may shed only
 /// while the address is full. The derivation above still sizes the default
 /// for the doubling, so the shed is a margin rather than the plan: 20 now

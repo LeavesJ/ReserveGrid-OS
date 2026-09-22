@@ -58,10 +58,10 @@
 //!
 //! What the shed helps, and what it does not. It helps when a gateway's old
 //! path is dead and its new one is refused: a NAT remap that answers the
-//! gateway's next write with a reset, or a gateway host that crashes and
-//! comes back. It does not help a path that black-holes, because the gateway
-//! then never learns its connection is gone and never reconnects (PB-51). It
-//! does not touch refusals by the global cap, and with the per-IP ceiling
+//! gateway's next write with a reset, a gateway host that crashes and comes
+//! back, or a path that black-holes, which sv2-gateway gives up on after
+//! three to four heartbeats of silence and reconnects from (PB-51). It does
+//! not touch refusals by the global cap, and with the per-IP ceiling
 //! disabled (`0`) there is no full address and so no shed.
 //!
 //! Only this connection's own task ever ends it and releases its slot,
