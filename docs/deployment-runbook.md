@@ -1008,6 +1008,19 @@ externally.
 When a gateway receives SIGTERM (from the orchestrator, rolling restart, or
 manual stop):
 
+> **Before 2.0.0 none of this happened on SIGTERM (PB-49).** The gateway
+> handled only SIGINT. Under systemd SIGTERM killed it at once; in its
+> container it runs as PID 1 with no init, the kernel ignores a
+> default-action signal sent to PID 1, and every `docker stop` waited out its
+> 10s grace before a SIGKILL. Either way the process died wherever its main
+> loop happened to be. It now installs a SIGTERM handler before anything else
+> and refuses to start if it cannot.
+>
+> **The drain is immediate, not held open.** The steps below run as soon as
+> the main loop stops, and the process exits within milliseconds, so a load
+> balancer sees the health port close rather than a sustained 503 on
+> `/readyz`. Size the LB's failure detection on that basis.
+
 1. The gateway sets `readiness.draining = true`.
 2. `/readyz` immediately returns 503 with `reason_code: "shutdown_drain"`.
 3. The load balancer detects the 503 within its health check interval (e.g.,

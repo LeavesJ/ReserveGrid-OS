@@ -762,6 +762,23 @@ async fn gw_metrics_handler(
 
 #[allow(clippy::too_many_lines)]
 async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
+    // PB-49: SIGTERM is how docker stop, systemd and Kubernetes ask a process
+    // to stop, and the gateway used to handle only SIGINT. Under systemd that
+    // killed it at once, wherever it was. In its container it is PID 1 with no
+    // init (`ENTRYPOINT ["sv2-gateway"]`), and the kernel does not deliver a
+    // default-action signal to PID 1, so SIGTERM was ignored and every stop
+    // waited out docker's 10s before a SIGKILL did the same thing. Installed
+    // first, ahead of the health server, so a signal that arrives during
+    // startup is held and acted on when the main loop runs. If it cannot be
+    // installed the gateway refuses to start rather than run unstoppable.
+    let mut stop_signal = match install_stop_signal() {
+        Ok(signal) => signal,
+        Err(e) => {
+            error!(error = %e, "cannot install the SIGTERM handler; refusing to start");
+            return ExitCode::FAILURE;
+        }
+    };
+
     // Shutdown coordination.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -1821,9 +1838,10 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                 }
             }
 
-            // Ctrl+C / SIGTERM.
-            _ = tokio::signal::ctrl_c() => {
-                info!("shutdown signal received");
+            // SIGINT or SIGTERM (PB-49). The loop stops at an arm boundary,
+            // so no accounting batch is left half-recorded.
+            signal = stop_requested(&mut stop_signal) => {
+                info!(signal, "shutdown signal received");
                 readiness.set_draining();
                 let _ = shutdown_tx.send(true);
                 break;
@@ -1833,6 +1851,42 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
 
     info!("sv2-gateway shutting down");
     ExitCode::SUCCESS
+}
+
+/// The signal a supervisor sends to stop the gateway: SIGTERM on Unix. On
+/// other platforms there is none beyond SIGINT, which `stop_requested` always
+/// handles.
+#[cfg(unix)]
+type StopSignal = tokio::signal::unix::Signal;
+#[cfg(not(unix))]
+type StopSignal = ();
+
+#[cfg(unix)]
+fn install_stop_signal() -> std::io::Result<StopSignal> {
+    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+}
+
+#[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)] // Same signature as the Unix install.
+fn install_stop_signal() -> std::io::Result<StopSignal> {
+    Ok(())
+}
+
+/// Resolves when the gateway is asked to stop, naming the signal.
+async fn stop_requested(stop_signal: &mut StopSignal) -> &'static str {
+    #[cfg(unix)]
+    {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => "SIGINT",
+            _ = stop_signal.recv() => "SIGTERM",
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = stop_signal;
+        let _ = tokio::signal::ctrl_c().await;
+        "SIGINT"
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
