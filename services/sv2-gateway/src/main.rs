@@ -774,7 +774,7 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
     let mut stop_signal = match install_stop_signal() {
         Ok(signal) => signal,
         Err(e) => {
-            error!(error = %e, "cannot install the SIGTERM handler; refusing to start");
+            error!(error = %e, "cannot install the SIGTERM and SIGINT handlers; refusing to start");
             return ExitCode::FAILURE;
         }
     };
@@ -1059,16 +1059,31 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                 cfg.gateway.wal_compaction_threshold,
             ) {
                 Ok(mut wal) => {
+                    // Emit the synthetic Event 2 lines BEFORE the WAL lets the
+                    // orphans go, so a crash in between replays them again
+                    // rather than losing them (PB-47 T2 re-review).
                     let recovery = wal.recover();
-                    if !recovery.synthetic_events.is_empty() {
-                        for evt in &recovery.synthetic_events {
-                            if let Ok(line) = serde_json::to_string(evt) {
-                                info!(target: "share_events", "{}", line);
-                            }
+                    for evt in &recovery.synthetic_events {
+                        match serde_json::to_string(evt) {
+                            Ok(line) => info!(target: "share_events", "{}", line),
+                            Err(e) => error!(
+                                share_id = %evt.share_id_hex,
+                                error = %e,
+                                "recovered event failed to serialize; line not emitted"
+                            ),
                         }
+                    }
+                    if !recovery.synthetic_events.is_empty() {
                         info!(
                             orphans = recovery.synthetic_events.len(),
                             "share wal: emitted synthetic process_crash_recovery events"
+                        );
+                    }
+                    if let Err(e) = wal.finish_recovery() {
+                        error!(
+                            error = %e,
+                            "share wal: compaction after recovery failed; the orphans \
+                             stay on disk and will be emitted again at the next start"
                         );
                     }
                     info!(path = %cfg.gateway.wal_path, "share wal: opened");
@@ -1326,6 +1341,13 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
     // Where the accounting stream's NDJSON lines go: the `share_events`
     // tracing target, written synchronously to stdout.
     let mut emit_share_event = |line: &str| info!(target: "share_events", "{}", line);
+
+    // A WAL failure ends the process with a failure status, so a supervisor
+    // can tell it from a requested stop (PB-49 T2). A requested stop drains
+    // the accounting queues before exiting; a WAL failure must not, since the
+    // WAL is what failed.
+    let mut exit_code = ExitCode::SUCCESS;
+    let mut drain_on_exit = false;
 
     loop {
         // Compute the stale hold sleep future. If no deadline, sleep forever.
@@ -1648,6 +1670,7 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                         );
                         readiness.set_draining();
                         let _ = shutdown_tx.send(true);
+                        exit_code = ExitCode::FAILURE;
                         break;
                     }
                 }
@@ -1689,6 +1712,7 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                         );
                         readiness.set_draining();
                         let _ = shutdown_tx.send(true);
+                        exit_code = ExitCode::FAILURE;
                         break;
                     }
                 }
@@ -1844,26 +1868,55 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                 info!(signal, "shutdown signal received");
                 readiness.set_draining();
                 let _ = shutdown_tx.send(true);
+                drain_on_exit = true;
                 break;
             }
         }
     }
 
+    if drain_on_exit {
+        let (events, results, drained) = sv2_gateway::accounting::drain_on_stop(
+            &mut share_event_rx,
+            &mut share_result_rx,
+            share_wal.as_ref(),
+            &mut emit_share_event,
+        )
+        .await;
+        info!(events, results, "accounting queues drained on stop");
+        if let Err(e) = drained {
+            error!(
+                error = %e,
+                reason_code = GatewayReason::WalWriteFailure.as_str(),
+                "wal: write failure while draining on stop"
+            );
+            exit_code = ExitCode::FAILURE;
+        }
+    }
+
     info!("sv2-gateway shutting down");
-    ExitCode::SUCCESS
+    exit_code
 }
 
-/// The signal a supervisor sends to stop the gateway: SIGTERM on Unix. On
-/// other platforms there is none beyond SIGINT, which `stop_requested` always
-/// handles.
+/// The signals that stop the gateway: SIGTERM, which a supervisor sends, and
+/// SIGINT. Both are persistent handlers installed once, so a signal that
+/// arrives while the loop is busy inside an arm is held until the next
+/// iteration; a `ctrl_c()` future made fresh each iteration, as SIGINT used,
+/// missed it (PB-49 T2). On other platforms only `ctrl_c()` exists.
 #[cfg(unix)]
-type StopSignal = tokio::signal::unix::Signal;
+struct StopSignal {
+    terminate: tokio::signal::unix::Signal,
+    interrupt: tokio::signal::unix::Signal,
+}
 #[cfg(not(unix))]
 type StopSignal = ();
 
 #[cfg(unix)]
 fn install_stop_signal() -> std::io::Result<StopSignal> {
-    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    use tokio::signal::unix::{SignalKind, signal};
+    Ok(StopSignal {
+        terminate: signal(SignalKind::terminate())?,
+        interrupt: signal(SignalKind::interrupt())?,
+    })
 }
 
 #[cfg(not(unix))]
@@ -1877,8 +1930,8 @@ async fn stop_requested(stop_signal: &mut StopSignal) -> &'static str {
     #[cfg(unix)]
     {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => "SIGINT",
-            _ = stop_signal.recv() => "SIGTERM",
+            _ = stop_signal.interrupt.recv() => "SIGINT",
+            _ = stop_signal.terminate.recv() => "SIGTERM",
         }
     }
     #[cfg(not(unix))]

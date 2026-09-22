@@ -84,7 +84,18 @@ fn health_ok(port: u16) -> bool {
 
 #[test]
 fn sigterm_exits_through_the_drain_path() {
-    let scratch = ScratchDir::new("pb49-sigterm");
+    stops_through_the_drain_path("TERM", "SIGTERM");
+}
+
+/// PB-49 T2: SIGINT is a persistent handler too, so it is not missed while
+/// the loop is busy inside an arm, and it ends the same way.
+#[test]
+fn sigint_exits_through_the_drain_path() {
+    stops_through_the_drain_path("INT", "SIGINT");
+}
+
+fn stops_through_the_drain_path(kill_name: &str, logged: &str) {
+    let scratch = ScratchDir::new("pb49-stop");
     let health_port = free_port();
 
     // Shadow mode: no miner listener and no Noise keypair. The verifier and
@@ -135,11 +146,11 @@ addr = "127.0.0.1:1"
     }
 
     let sent = Command::new("kill")
-        .arg("-TERM")
+        .arg(format!("-{kill_name}"))
         .arg(gateway.child.id().to_string())
         .status()
         .expect("run kill");
-    assert!(sent.success(), "kill -TERM failed: {sent:?}");
+    assert!(sent.success(), "kill -{kill_name} failed: {sent:?}");
 
     let stopping = Instant::now();
     let status = loop {
@@ -148,7 +159,7 @@ addr = "127.0.0.1:1"
         }
         assert!(
             stopping.elapsed() < EXIT_DEADLINE,
-            "the gateway was still running {EXIT_DEADLINE:?} after SIGTERM"
+            "the gateway was still running {EXIT_DEADLINE:?} after {logged}"
         );
         std::thread::sleep(Duration::from_millis(50));
     };
@@ -167,7 +178,11 @@ addr = "127.0.0.1:1"
     assert!(
         stdout
             .lines()
-            .any(|l| l.contains("shutdown signal received") && l.contains("SIGTERM")),
-        "the drain arm did not log that SIGTERM stopped it; stdout was:\n{stdout}"
+            .any(|l| l.contains("shutdown signal received") && l.contains(logged)),
+        "the drain arm did not log that {logged} stopped it; stdout was:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("accounting queues drained on stop"),
+        "a requested stop must drain the accounting queues; stdout was:\n{stdout}"
     );
 }

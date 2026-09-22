@@ -34,7 +34,7 @@ use std::io::{BufRead, Write as IoWrite};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use reservegrid_common::reason::GatewayReason;
 
@@ -80,11 +80,9 @@ pub struct ShareWal {
     /// Completions that arrived before their pending record (PB-47), keyed
     /// like `pending` and valued by when the completion was written. A
     /// pending record for one of these is neither written nor indexed.
+    /// Monotonic, so a wall-clock step cannot expire every early completion
+    /// at once. Bounded by `EARLY_COMPLETION_CAP`.
     completed_early: HashMap<(String, String), std::time::Instant>,
-    /// When `completed_early` was last pruned of entries past
-    /// `EARLY_COMPLETION_TTL`. Monotonic, so a wall-clock step cannot expire
-    /// every early completion at once.
-    early_pruned_at: std::time::Instant,
     /// Syncs issued by `append_records`. Test-only instrumentation and this
     /// file's one structural override: fsync is not observable in-process,
     /// and PB-44's claim is that a batch costs one sync, so this counter is
@@ -123,21 +121,36 @@ fn unix_ms_now() -> u64 {
 pub const WAL_BATCH_MAX: usize = 1024;
 
 /// How long a completion that arrived before its pending record is remembered
-/// (PB-47). Pruned at most once per TTL, so an entry actually lives between one
-/// and two TTLs, and pruning runs only when completions keep arriving, so a
-/// quiet gateway keeps its few entries rather than growing the set.
+/// (PB-47), at least. Entries are pruned only when compaction runs, so that
+/// the file and memory forget a completion at the same moment and replay goes
+/// on agreeing with the in-memory index.
 ///
 /// A completion reaches the WAL first while the share's accounting event is
 /// still queued in `share_event_rx`, or while its handler is preempted between
 /// the forward enqueue and the event send. Both normally resolve in
-/// milliseconds; a minute is thousands of times that. So an entry this old
+/// milliseconds; ten seconds is thousands of times that. An older entry
 /// normally belongs to an accounting event dropped at the queue
 /// (`svtwo_share_events_dropped`), whose pending record never comes. Not
-/// always: a select loop stalled past a minute (a hung fdatasync, a blocked
-/// send) can deliver a genuine late pending record after its entry is gone.
-/// That share is then indexed, which is exactly what happened before PB-47:
-/// the same defect under a minute-long stall, not a new one.
-const EARLY_COMPLETION_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+/// always: a select loop stalled for longer can still deliver a genuine late
+/// pending record, and that share is then indexed, which is the pre-PB-47
+/// behaviour: at worst a duplicate `process_crash_recovery` Event 2 on
+/// restart, never a missing one.
+///
+/// Ten seconds, not the first draft's minute. The PB-47 T2 re-review measured
+/// what a minute cost under overload: every dropped accounting event leaves a
+/// completion that never gets its pending record, compaction rewrote all of
+/// them, and at 20,000 offered shares/s the forward arm spent 164 s of a 12 s
+/// run in the WAL.
+const EARLY_COMPLETION_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Most completions remembered at once (PB-47). Compaction rewrites each one,
+/// so this also bounds what a completion that never gets its pending record
+/// can cost a compaction: about 4096 lines of 221 bytes, under a megabyte.
+/// Under overload the set fills with completions whose accounting event was
+/// dropped, which have no pending record to wait for, so turning a new one
+/// away costs nothing; for a genuine late pending record it means the
+/// pre-PB-47 behaviour, a duplicate Event 2 on restart.
+const EARLY_COMPLETION_CAP: usize = 4096;
 
 /// `first`, plus whatever is already queued behind it, up to
 /// [`WAL_BATCH_MAX`] items. Never waits: it takes only what is there.
@@ -190,7 +203,6 @@ impl ShareWal {
             completed_since_compaction: 0,
             compaction_threshold,
             completed_early: HashMap::new(),
-            early_pruned_at: std::time::Instant::now(),
             #[cfg(test)]
             syncs: 0,
         })
@@ -249,8 +261,13 @@ impl ShareWal {
         Ok(pending)
     }
 
-    /// Emit synthetic `ShareForwardResultEvent` for each orphaned pending entry,
-    /// then clear the pending index and compact the WAL.
+    /// Build a synthetic `ShareForwardResultEvent` for each orphaned pending
+    /// entry and clear the in-memory pending index. The file is NOT touched:
+    /// the orphans stay on disk until the caller has emitted these events and
+    /// calls [`ShareWal::finish_recovery`]. A crash in between replays them
+    /// again, a duplicate, rather than losing them. Compacting here first, as
+    /// this did until the PB-47 T2 re-review, left a window in which a crash
+    /// gave an orphan zero Event 2 lines.
     ///
     /// Call this once at startup before entering the main event loop.
     pub fn recover(&mut self) -> WalRecovery {
@@ -278,16 +295,27 @@ impl ShareWal {
                 orphaned = orphaned_count,
                 "wal: recovered orphaned share events with process_crash_recovery"
             );
-            // Compact: the pending set is empty, so truncate the WAL.
-            if let Err(e) = self.compact_inner() {
-                error!(error = %e, "wal: compaction after recovery failed");
-            }
         }
 
         WalRecovery {
             synthetic_events,
             completed_count: 0,
         }
+    }
+
+    /// Finish startup recovery once the caller has emitted the events
+    /// [`ShareWal::recover`] returned: rewrite the file without them.
+    ///
+    /// Always compacts, orphans or not, so completions that were still waiting
+    /// for their pending record when the last process stopped leave the file
+    /// too. The in-memory set starts empty after a restart, and no pending
+    /// record for a share from before it can still arrive, because the queues
+    /// it would have come through died with that process; a later pending
+    /// record for the same share is a genuine re-accept. Without this, replay
+    /// spent such a completion on the re-accept and disagreed with memory
+    /// (PB-47 T2 re-review).
+    pub fn finish_recovery(&mut self) -> std::io::Result<()> {
+        self.compact_inner()
     }
 
     /// Record a batch of accepted shares as pending, with ONE write and ONE
@@ -378,7 +406,9 @@ impl ShareWal {
             // late pending record is dropped rather than indexed (PB-47). An
             // indexed one would survive compaction and come back on restart as
             // a crash orphan with a second forward result.
-            if self.pending.remove(&key).is_none() {
+            if self.pending.remove(&key).is_none()
+                && self.completed_early.len() < EARLY_COMPLETION_CAP
+            {
                 self.completed_early.insert(key.clone(), arrived);
             }
             records.push(WalRecord {
@@ -388,7 +418,6 @@ impl ShareWal {
                 timestamp_ms: now,
             });
         }
-        self.prune_completed_early(arrived);
         self.append_records(&records)?;
         self.completed_since_compaction += records.len();
         if self.compaction_threshold > 0
@@ -423,19 +452,13 @@ impl ShareWal {
         self.writer = std::io::BufWriter::new(read_only);
     }
 
-    /// Forget early completions older than `EARLY_COMPLETION_TTL`, at most
-    /// once per TTL, so an entry lives between one and two TTLs. Past that age
-    /// its pending record is normally not still on its way (see the constant).
+    /// Forget early completions older than `EARLY_COMPLETION_TTL`. Called
+    /// only from compaction, which then leaves them out of the rewritten file,
+    /// so memory and the file forget together.
     fn prune_completed_early(&mut self, now: std::time::Instant) {
-        if self.completed_early.is_empty()
-            || now.saturating_duration_since(self.early_pruned_at) < EARLY_COMPLETION_TTL
-        {
-            return;
-        }
         self.completed_early.retain(|_, completed_at| {
             now.saturating_duration_since(*completed_at) < EARLY_COMPLETION_TTL
         });
-        self.early_pruned_at = now;
     }
 
     /// Append a batch of NDJSON records with one flush and one sync.
@@ -523,6 +546,7 @@ impl ShareWal {
     /// Writes to a temporary file then atomically renames. The in-memory
     /// index is the source of truth.
     fn compact_inner(&mut self) -> std::io::Result<()> {
+        self.prune_completed_early(std::time::Instant::now());
         let tmp_path = self.path.with_extension("wal.tmp");
         {
             let tmp_file = std::fs::File::create(&tmp_path)?;
@@ -542,7 +566,8 @@ impl ShareWal {
             // PB-47: a completion still waiting for its pending record is a
             // live fact, not a finished one. Dropping it here would let the
             // late pending record, which mark_pending writes, sit alone in the
-            // file and come back on restart as a crash orphan.
+            // file and come back on restart as a crash orphan. Pruned just
+            // above and capped, so this is at most EARLY_COMPLETION_CAP lines.
             let rewritten_at = unix_ms_now();
             for (share_id_hex, event_id_hex) in self.completed_early.keys() {
                 let record = WalRecord {
@@ -898,6 +923,8 @@ mod tests {
             let r = wal.recover();
             assert_eq!(r.synthetic_events.len(), 1);
             assert_eq!(r.synthetic_events[0].share_id_hex, "s1");
+            // The caller has emitted the synthetic line; now it may go.
+            wal.finish_recovery().unwrap();
         }
 
         // Crash 2: leave s2 pending.
@@ -951,7 +978,6 @@ mod tests {
             completed_since_compaction: 0,
             compaction_threshold: 0,
             completed_early: HashMap::new(),
-            early_pruned_at: std::time::Instant::now(),
             syncs: 0,
         };
 
@@ -1278,6 +1304,127 @@ mod tests {
         drop(wal);
         assert_eq!(
             ShareWal::open(&path, 0).unwrap().pending_count(),
+            1,
+            "replay agrees"
+        );
+        cleanup(&path);
+    }
+
+    /// PB-47 T2 re-review: recovery used to compact before the caller emitted
+    /// the synthetic lines, so a crash in between gave an orphan zero Event 2.
+    /// Now the orphan stays on disk until `finish_recovery`, and a crash before
+    /// it replays the orphan again: a duplicate, never nothing.
+    #[test]
+    fn orphans_stay_on_disk_until_their_lines_are_out() {
+        let path = temp_wal_path("pb47r_recover_order");
+        cleanup(&path);
+        ShareWal::open(&path, 100)
+            .unwrap()
+            .mark_pending(&[("aa", "bb")])
+            .unwrap();
+
+        let mut first = ShareWal::open(&path, 100).unwrap();
+        assert_eq!(first.recover().synthetic_events.len(), 1);
+        assert!(
+            read_wal_file_independently(&path).contains("\"aa\""),
+            "recover() must not drop the orphan from disk before its line is out"
+        );
+        drop(first); // a crash before finish_recovery
+
+        let mut second = ShareWal::open(&path, 100).unwrap();
+        assert_eq!(
+            second.recover().synthetic_events.len(),
+            1,
+            "the orphan comes back: a duplicate, never nothing"
+        );
+        second.finish_recovery().unwrap();
+        assert!(read_wal_file_independently(&path).is_empty());
+        drop(second);
+        assert_eq!(
+            ShareWal::open(&path, 100)
+                .unwrap()
+                .recover()
+                .synthetic_events
+                .len(),
+            0
+        );
+        cleanup(&path);
+    }
+
+    /// PB-47 T2 re-review: a completion still waiting when the process
+    /// stopped must leave the file at the next start, as it leaves memory, or
+    /// replay spends it on a later genuine re-accept of the same share.
+    #[test]
+    fn a_restart_forgets_waiting_completions_in_the_file_as_in_memory() {
+        let path = temp_wal_path("pb47r_restart");
+        cleanup(&path);
+        ShareWal::open(&path, 0)
+            .unwrap()
+            .mark_completed(&[("aa", "bb")])
+            .unwrap();
+
+        let mut wal = ShareWal::open(&path, 0).unwrap();
+        wal.recover();
+        wal.finish_recovery().unwrap();
+        wal.mark_pending(&[("aa", "bb")]).unwrap();
+        assert_eq!(
+            wal.pending_count(),
+            1,
+            "a re-accept after a restart is pending"
+        );
+        drop(wal);
+        assert_eq!(
+            ShareWal::open(&path, 0).unwrap().pending_count(),
+            1,
+            "replay must agree"
+        );
+        cleanup(&path);
+    }
+
+    /// PB-47 T2 re-review: the waiting set is bounded, because under overload
+    /// it fills with completions whose accounting event was dropped.
+    #[test]
+    fn the_waiting_set_is_capped() {
+        let path = temp_wal_path("pb47r_cap");
+        cleanup(&path);
+        let mut wal = ShareWal::open(&path, 0).unwrap();
+        let ids: Vec<(String, String)> = (0..EARLY_COMPLETION_CAP + 10)
+            .map(|i| (format!("{i:064x}"), format!("{:064x}", i + 1)))
+            .collect();
+        wal.mark_completed(&ids).unwrap();
+        assert_eq!(wal.completed_early.len(), EARLY_COMPLETION_CAP);
+        cleanup(&path);
+    }
+
+    /// PB-47 T2 re-review: pruning happens in compaction, so the file forgets a
+    /// completion at the same moment memory does. Pruned in memory alone, the
+    /// file kept it, and replay spent it on the share's next pending record.
+    #[test]
+    fn a_pruned_completion_leaves_the_file_with_memory() {
+        let path = temp_wal_path("pb47r_prune");
+        cleanup(&path);
+        let mut wal = ShareWal::open(&path, 1).unwrap();
+        wal.mark_completed(&[("aa", "bb")]).unwrap();
+        let expired = std::time::Instant::now()
+            .checked_sub(EARLY_COMPLETION_TTL + std::time::Duration::from_secs(1))
+            .expect("uptime longer than the TTL");
+        wal.completed_early
+            .insert(("aa".to_string(), "bb".to_string()), expired);
+        // The next completion compacts, which prunes "aa" from both.
+        wal.mark_completed(&[("cc", "dd")]).unwrap();
+        assert!(
+            !wal.completed_early
+                .contains_key(&("aa".to_string(), "bb".to_string()))
+        );
+        assert!(
+            !read_wal_file_independently(&path).contains("\"aa\""),
+            "memory forgot the completion but the file kept it"
+        );
+        wal.mark_pending(&[("aa", "bb")]).unwrap();
+        assert_eq!(wal.pending_count(), 1);
+        drop(wal);
+        assert_eq!(
+            ShareWal::open(&path, 1).unwrap().pending_count(),
             1,
             "replay agrees"
         );

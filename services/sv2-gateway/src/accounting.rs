@@ -20,10 +20,13 @@
 //!   before logging it, and nothing ever emitted that Event 2. With batching
 //!   that was up to a whole batch of shares at once.
 //!
-//! So Event 2 is delivered AT LEAST once and never zero times. A line counts as
-//! emitted when the process has written it to stdout: the gateway's tracing
-//! writer is synchronous and flushes per line, so it survives the process dying
-//! but not the host losing power, which the WAL's fdatasync does.
+//! So Event 2 is delivered AT LEAST once and never zero times, with the WAL
+//! enabled (`wal_path` set, which the shipped `deploy/gateway-prod.toml` does;
+//! the built-in default is off) and with `VELDRA_LOG_FILTER` admitting the
+//! `share_events` target that carries the lines. A line counts as emitted when
+//! the process has written it to stdout: the gateway's tracing writer is
+//! synchronous and flushes per line, so it survives the process dying but not
+//! the host losing power, which the WAL's fdatasync does.
 //!
 //! Both functions drain everything already queued behind the item that woke the
 //! arm (`wal::take_queued`), so one WAL write and one sync cover the batch
@@ -125,6 +128,45 @@ pub async fn record_forwarded(
         None => Ok(()),
     };
     (results, recorded)
+}
+
+/// Drain what is already queued on both accounting channels, through the same
+/// two functions the main loop uses, so a requested stop does not discard the
+/// shares miners were already told were accepted (PB-49 T2).
+///
+/// Stops at the first WAL failure and returns it. Returns how many accounting
+/// events and forward results it drained. The connection handlers may still
+/// send for a moment after the stop; this takes what is queued, not what is
+/// still to come.
+pub async fn drain_on_stop(
+    events: &mut Receiver<ShareAcceptedEvent>,
+    results: &mut Receiver<ShareForwardResult>,
+    wal: Option<&SharedWal>,
+    emit: &mut (dyn FnMut(&str) + Send),
+) -> (usize, usize, std::io::Result<()>) {
+    let (mut drained_events, mut drained_results) = (0, 0);
+    loop {
+        let mut moved = false;
+        if let Ok(first) = events.try_recv() {
+            let (batch, recorded) = record_accepted(events, first, wal, emit).await;
+            drained_events += batch.len();
+            moved = true;
+            if recorded.is_err() {
+                return (drained_events, drained_results, recorded);
+            }
+        }
+        if let Ok(first) = results.try_recv() {
+            let (batch, recorded) = record_forwarded(results, first, wal, emit).await;
+            drained_results += batch.len();
+            moved = true;
+            if recorded.is_err() {
+                return (drained_events, drained_results, recorded);
+            }
+        }
+        if !moved {
+            return (drained_events, drained_results, Ok(()));
+        }
+    }
 }
 
 /// Run `f` against the WAL on the blocking pool, folding a poisoned mutex and a
@@ -471,6 +513,69 @@ mod tests {
         assert_eq!(w.syncs_for_test(), 2, "six forward results, one more sync");
         assert_eq!(w.pending_count(), 0);
         drop(w);
+        cleanup(&path);
+    }
+
+    /// With the WAL disabled, the shipped built-in default, both functions
+    /// still emit every line: the WAL decides durability, not whether the
+    /// accounting stream exists.
+    #[tokio::test]
+    async fn without_a_wal_every_line_is_still_emitted() {
+        let (etx, mut erx) = tokio::sync::mpsc::channel(16);
+        etx.try_send(accounting_event(1, false)).unwrap();
+        let mut lines = Vec::new();
+        record_accepted(
+            &mut erx,
+            accounting_event(0, true),
+            None,
+            &mut collector(&mut lines),
+        )
+        .await
+        .1
+        .unwrap();
+        let (rtx, mut rrx) = tokio::sync::mpsc::channel(16);
+        rtx.try_send(forward_result(1)).unwrap();
+        record_forwarded(
+            &mut rrx,
+            forward_result(0),
+            None,
+            &mut collector(&mut lines),
+        )
+        .await
+        .1
+        .unwrap();
+        assert_eq!(lines.len(), 4, "two Event 1 lines and two Event 2 lines");
+    }
+
+    /// PB-49 T2: a requested stop drains both queues, so shares already acknowledged
+    /// to miners reach the accounting stream and the WAL.
+    #[tokio::test]
+    async fn a_stop_drains_both_accounting_queues() {
+        let path = scratch_path("drain_on_stop");
+        let wal = shared(ShareWal::open(&path, 0).unwrap());
+        let (etx, mut erx) = tokio::sync::mpsc::channel(16);
+        let (rtx, mut rrx) = tokio::sync::mpsc::channel(16);
+        for n in 0..3 {
+            etx.try_send(accounting_event(n, true)).unwrap();
+        }
+        for n in 0..2 {
+            rtx.try_send(forward_result(n)).unwrap();
+        }
+        let mut lines = Vec::new();
+        let (events, results, drained) =
+            drain_on_stop(&mut erx, &mut rrx, Some(&wal), &mut collector(&mut lines)).await;
+        drained.unwrap();
+        assert_eq!((events, results), (3, 2));
+        assert_eq!(lines.len(), 5, "every queued event and result is emitted");
+        assert_eq!(
+            wal.lock().unwrap().pending_count(),
+            1,
+            "three accepted, two forwarded: one still owes an Event 2"
+        );
+        assert!(
+            erx.try_recv().is_err() && rrx.try_recv().is_err(),
+            "both queues empty"
+        );
         cleanup(&path);
     }
 
