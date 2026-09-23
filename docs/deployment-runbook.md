@@ -205,16 +205,17 @@ Fill in the TODO fields:
 3. `template_url`: your template-manager URL (default `http://template-manager:8082` if same compose stack)
 4. Verify `wal_path` points to a persistent volume mount
 
-**Tunable gateway keys (defaults shown, all optional):**
+**Tunable gateway keys (defaults shown; optional unless marked required):**
 
 | Key | Default | What it does |
 |---|---|---|
 | `extranonce_prefix_len` | `4` | Bytes of extranonce reserved by the gateway for per-channel prefix allocation. Downstream miners get `16 - extranonce_prefix_len` bytes for their own extranonce2 search space. |
 | `extended_channels_enabled` | `true` | Accept `OpenExtendedMiningChannel` requests. Disable to force every client onto standard channels. |
-| `vardiff_enabled` | `false` | Per-connection target difficulty retargeting based on observed share rate. Off by default so operators opt in after baselining share volume. |
+| `channel_target_hex` | none; **required** in inline and observe | Every channel's target: 64 hex characters, most significant byte first. The gateway refuses to start without it in a mode that serves miners, because every channel would otherwise run at difficulty 1 and drop the excess over the rate limit, block solutions included, before the proof-of-work check (PB-53). It also refuses a value that does not parse or is zero, and warns at difficulty 1 or easier (regtest only). `deploy/gateway-prod.toml` ships difficulty 16,384. |
+| `vardiff_enabled` | `false` | Per-channel target retargeting from the observed share rate, starting from `channel_target_hex`. Off in the prod template until each share is judged against its own job's target: today a raised target also applies to shares on jobs the miner already has, so a step up rejects honest shares (PB-53). |
 | `vardiff_target_shares_per_min` | `20.0` | Target share submission rate per channel once vardiff is enabled. |
 | `vardiff_retarget_interval_secs` | `90` | How often vardiff evaluates share rate and adjusts target. |
-| `vardiff_min_difficulty` | `1` | Floor for retargeting. Prevents vardiff from collapsing into single-share-per-block territory on small miners. |
+| `vardiff_min_difficulty` | `1` | Floor for retargeting. The prod template sets 16,384, the floor OCEAN's DATUM gateway uses, so vardiff can never ease a channel back toward difficulty 1, where a large miner floods the rate limit. |
 | `vardiff_max_difficulty` | `u64::MAX` | Ceiling for retargeting. Only set if the pool imposes a policy limit. |
 | `vardiff_max_adjustment_factor` | `4.0` | Maximum single-step multiplier up or down per retarget. Dampens oscillation under bursty share rates. |
 | `auto_degrade` | `true` | When the verifier stops serving verdicts, either by heartbeat loss or by verdict starvation while proposals are outstanding, for longer than `auto_degrade_after_ms`, the gateway flips readiness to degraded and keeps distributing jobs without enforcement. See "Degradation Behavior" further down. |
@@ -708,6 +709,14 @@ fail the Noise handshake and be rejected.
 
 ## Troubleshooting
 
+### Gateway Exits at Startup Citing PB-53
+
+**Symptom:** the gateway logs `config validation failed` with a message naming PB-53, and exits.
+
+**Cause:** a mode that serves miners (inline or observe) has no `channel_target_hex`, or it is zero or does not parse. Without a target every channel would run at difficulty 1.
+
+**Fix:** set `channel_target_hex = "000000000003fffc000000000000000000000000000000000000000000000000"` (difficulty 16,384) in the `[gateway]` table, as `deploy/gateway-prod.toml` does. A startup warning about `vardiff_enabled` means vardiff is on; the prod template keeps it off until per-job targets land.
+
 ### Templates Not Flowing
 
 **Symptom:** `curl http://localhost:8082/latest` returns 404 or stale data.
@@ -958,7 +967,10 @@ connection-level stickiness by default for TCP targets.
 ### Gateway Instance Configuration
 
 Each gateway instance requires a unique `gateway_instance_id` and its own
-Noise keypair, but must share the same `authority_pubkey`.
+Noise keypair, but must share the same `authority_pubkey`. The two examples
+below show only what differs per instance: start each from
+`deploy/gateway-prod.toml`, which supplies `mode`, `channel_target_hex` and
+`[share_upstream]`, and note that the `[verifier]` key is `addr`.
 
 **Instance A (`config/gateway-a.toml`):**
 
@@ -1098,7 +1110,7 @@ filter or aggregate by instance. Key metrics to compare across instances:
 |---|---|
 | `svtwo_connections_active` | Even distribution in active/active, all on one instance in active/standby |
 | `svtwo_mode_transitions_total` | Degradation events should correlate across instances (same verifier) |
-| `svtwo_vardiff_retarget_up_total` | Per-instance retarget rates indicate hashrate distribution |
+| `svtwo_vardiff_retargets_total{direction="up"\|"down"}` | Per-instance retarget rates indicate hashrate distribution |
 | `svtwo_shares_total` | Share volume should track connection distribution |
 
 ### Limitations of Active/Standby (v1.1.0)

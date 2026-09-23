@@ -5,7 +5,15 @@ All notable changes to ReserveGrid OS are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Operators: an older gateway config may now refuse to start (PB-53).** A mode that serves miners (inline or observe) requires `channel_target_hex`. Without it every channel ran at difficulty 1, where any current miner exceeds `max_shares_per_second_per_channel` and the excess, block solutions included, was dropped before the proof-of-work check. Vardiff does not avoid this, because it starts from the channel target. A config copied from the old `deploy/gateway-prod.toml` needs `channel_target_hex = "000000000003fffc000000000000000000000000000000000000000000000000"` (difficulty 16,384, as the template now ships). A target that does not parse, or is zero, is refused instead of falling back to difficulty 1. If you followed the old template's advice to enable vardiff instead, also set `vardiff_enabled = false` and `vardiff_min_difficulty = 16384`, as the template now ships: until each share is judged against its own job's target, a vardiff step up rejects honest shares, and the gateway now warns when vardiff is on.
+
 ## [1.1.0] — 2026-04-13 — Yield
+
+> Correction, 2026-09-22: extended channels and vardiff, listed below, were not in the `v1.1.0` tag. They landed on 2026-04-22 (`3607408`) and were first tagged in `v2.0.0-rc1`.
 
 ### Added
 

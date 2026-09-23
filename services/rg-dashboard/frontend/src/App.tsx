@@ -972,11 +972,18 @@ function SettingsPage({ caps }: { caps: ModeCapabilities }) {
     }
 
     const result = await saveGatewaySettings(patch);
-    const msg = result.ok ? "Settings saved." : (result.error ?? "Unknown error");
+    // A saved file can still carry warnings, such as an easy target or
+    // vardiff on (PB-53). Show them and keep them up until the next save.
+    const warnings = result.warnings ?? [];
+    const msg = !result.ok
+      ? (result.error ?? "Unknown error")
+      : warnings.length > 0
+        ? `Settings saved, with warnings: ${warnings.join(" ")}`
+        : "Settings saved.";
     setGsSaveResult(msg);
     if (result.ok) {
       gsBaselineRef.current = { ...b, ...Object.fromEntries(Object.entries(patch).map(([k, v]) => [k, v])) } as typeof gs;
-      setTimeout(() => setGsSaveResult(null), 4000);
+      if (warnings.length === 0) setTimeout(() => setGsSaveResult(null), 4000);
     }
   };
 
@@ -1208,6 +1215,9 @@ function SettingsPage({ caps }: { caps: ModeCapabilities }) {
             </SettingsRow>
             <SettingsRow label="channel_target_hex">
               <SettingsInput value={editGsChannelTargetHex} onChange={setEditGsChannelTargetHex} />
+              <div className="text-[10px] mt-1" style={{ color: V.steelDim, fontFamily: "var(--mono)" }}>
+                Required in inline and observe (PB-53). 64 hex, most significant byte first; 000000000003fffc then zeros is difficulty 16,384.
+              </div>
             </SettingsRow>
           </div>
           <div className="grid grid-cols-2 gap-x-6">

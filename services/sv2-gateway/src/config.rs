@@ -130,9 +130,14 @@ pub struct GatewaySection {
     #[serde(default = "default_job_retention_ms")]
     pub job_retention_ms: u64,
 
-    /// Optional channel share target as 64-char hex (32 bytes LE).
-    /// Overrides the default DIFF1 target. Use all-FF for regtest
-    /// where miners submit random nonces.
+    /// Channel share target: 64 hex characters of the 32-byte target, most
+    /// significant byte first, the way a target is usually printed
+    /// (`shares::display_hex_to_wire_bytes` reverses it for the wire).
+    /// `000000000003fffc` followed by zeros is difficulty 16,384. Required in
+    /// the modes that serve miners (PB-53): without it every channel would
+    /// start at DIFF1, and vardiff starts from it. Use all-FF for regtest,
+    /// where miners submit random nonces. `validate` refuses a value that
+    /// does not parse or is zero, and warns at difficulty 1 or easier.
     #[serde(default)]
     pub channel_target_hex: Option<String>,
 
@@ -638,6 +643,85 @@ fn validate_verifier_security(
 
 /// Validate configuration at startup. Returns a list of warnings
 /// (non-fatal) and an error if anything is invalid.
+/// PB-53: the channel target checks, split out of `validate` to keep it
+/// readable, like `validate_timing_chain`.
+fn validate_channel_target(
+    config: &GatewayConfig,
+    warnings: &mut Vec<String>,
+) -> Result<(), String> {
+    // PB-53: a target that does not parse used to log an error and fall back
+    // to DIFF1, the silent fallback Invariant 3 forbids. Checked here so the
+    // settings API, which re-validates a patched file, refuses it too.
+    if let Some(ref hex) = config.gateway.channel_target_hex {
+        let target = crate::shares::display_hex_to_wire_bytes(hex).map_err(|e| {
+            format!(
+                "channel_target_hex does not parse ({e}). It is 64 hex characters of the \
+                 32-byte target, most significant byte first."
+            )
+        })?;
+        // A target no share can meet rejects every share, block solutions
+        // included. `target_to_difficulty_u64` saturates at u64::MAX for zero
+        // and for anything harder than difficulty 2^64.
+        if target.iter().all(|&b| b == 0) {
+            return Err(
+                "channel_target_hex is zero, which no share can meet. It is the 32-byte \
+                 target, most significant byte first; difficulty 16,384 is 000000000003fffc \
+                 followed by zeros."
+                    .to_string(),
+            );
+        }
+        match crate::shares::target_to_difficulty_u64(&target) {
+            u64::MAX => {
+                return Err(
+                    "channel_target_hex is harder than difficulty 2^64, which no share can \
+                     meet. It is the 32-byte target, most significant byte first; difficulty \
+                     16,384 is 000000000003fffc followed by zeros."
+                        .to_string(),
+                );
+            }
+            0 | 1 if config.mode.accepts_miners() => warnings.push(
+                "channel_target_hex is difficulty 1 or easier. That suits regtest only: on \
+                 mainnet any current miner floods the gateway with shares, and with \
+                 max_shares_per_second_per_channel set the excess, block solutions included, is \
+                 dropped before the proof-of-work check (PB-53)."
+                    .to_string(),
+            ),
+            _ => {}
+        }
+    }
+
+    // PB-53: vardiff applies a raised target at once, to shares on jobs the
+    // miner already has, where SV2 applies a new target to future jobs only.
+    // So each step up rejects honest shares until per-job targets land.
+    if config.mode.accepts_miners() && config.gateway.vardiff_enabled {
+        warnings.push(
+            "vardiff_enabled: until each share is judged against its own job's target, a \
+             step up applies to jobs the miner already has and rejects honest shares. The prod \
+             template keeps it off (PB-53)."
+                .to_string(),
+        );
+    }
+
+    // PB-53: with no target every channel opens at DIFF1, and vardiff does not
+    // save it: vardiff starts from the channel target and climbs at most 4x per
+    // retarget window, so each channel spends its first minutes over
+    // max_shares_per_second_per_channel, where the rate limit drops the excess
+    // before the proof-of-work check, block solutions among them. Refused in
+    // every mode that serves miners; observe does too, not only inline.
+    if config.mode.accepts_miners() && config.gateway.channel_target_hex.is_none() {
+        return Err(format!(
+            "{} mode serves miners, and with no channel_target_hex every channel opens at \
+             difficulty 1, where any current miner floods the gateway with shares; with \
+             max_shares_per_second_per_channel set, the excess, block solutions included, is \
+             dropped before the proof-of-work check (PB-53). Vardiff does not prevent it: it \
+             starts from the channel target. Set channel_target_hex, as \
+             deploy/gateway-prod.toml does.",
+            config.mode
+        ));
+    }
+    Ok(())
+}
+
 pub fn validate(config: &GatewayConfig) -> Result<Vec<String>, String> {
     let mut warnings = Vec::new();
 
@@ -691,6 +775,8 @@ pub fn validate(config: &GatewayConfig) -> Result<Vec<String>, String> {
     if config.mode == GatewayMode::Inline && config.share_upstream.is_none() {
         return Err("inline mode requires [share_upstream] configuration".to_string());
     }
+
+    validate_channel_target(config, &mut warnings)?;
 
     // M-7: Bounds validation on timing-critical fields.
     if config.gateway.noise_handshake_timeout_ms == 0 {
@@ -759,6 +845,9 @@ pub fn validate(config: &GatewayConfig) -> Result<Vec<String>, String> {
 mod tests {
     use super::*;
 
+    /// Difficulty 16,384, most significant byte first.
+    const TARGET_16384: &str = "000000000003fffc000000000000000000000000000000000000000000000000";
+
     fn minimal_config(mode: GatewayMode) -> GatewayConfig {
         GatewayConfig {
             mode,
@@ -786,7 +875,9 @@ mod tests {
                 max_future_block_time_seconds: default_max_future_block_time_seconds(),
                 miner_auth: MinerAuthMode::Open,
                 job_retention_ms: default_job_retention_ms(),
-                channel_target_hex: None,
+                // PB-53: a mode that serves miners refuses to start without
+                // a target, so a minimal valid config has one: 16,384.
+                channel_target_hex: Some(TARGET_16384.to_string()),
                 max_shares_per_second_per_channel: 0,
                 extranonce_prefix_len: default_extranonce_prefix_len(),
                 extended_channels_enabled: default_extended_channels_enabled(),
@@ -835,6 +926,124 @@ mod tests {
         let result = validate(&config);
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
+    }
+
+    /// PB-53: a mode that serves miners, inline or observe, is refused
+    /// without a target, vardiff or not, because vardiff starts from the
+    /// target. Shadow mode serves no miners and is not held to it.
+    #[test]
+    fn validate_refuses_a_miner_serving_mode_without_a_target() {
+        for mode in [GatewayMode::Inline, GatewayMode::Observe] {
+            for vardiff in [false, true] {
+                let mut config = minimal_config(mode);
+                config.gateway.prevhash_verdict_timeout_ms = 2000;
+                config.gateway.channel_target_hex = None;
+                config.gateway.vardiff_enabled = vardiff;
+                let err = validate(&config)
+                    .expect_err("no target must be refused in a mode that serves miners");
+                assert!(err.contains("PB-53"), "{mode} vardiff={vardiff}: {err}");
+            }
+        }
+        let mut shadow = minimal_config(GatewayMode::Shadow);
+        shadow.gateway.channel_target_hex = None;
+        shadow.share_upstream = None;
+        assert!(validate(&shadow).is_ok(), "shadow mode serves no miners");
+    }
+
+    /// PB-53: a zero target can never be met and is refused; a target at
+    /// DIFF1 or easier is allowed, for regtest, with a warning.
+    #[test]
+    fn validate_refuses_a_zero_target_and_warns_at_diff1_or_easier() {
+        let mut config = minimal_config(GatewayMode::Inline);
+        config.gateway.prevhash_verdict_timeout_ms = 2000;
+        config.gateway.channel_target_hex = Some("00".repeat(32));
+        let err = validate(&config).expect_err("a zero target must be refused");
+        assert!(err.contains("is zero"), "{err}");
+
+        config.gateway.channel_target_hex = Some(format!("{}01", "00".repeat(31)));
+        let err = validate(&config).expect_err("an unmeetable target must be refused");
+        assert!(err.contains("harder than difficulty 2^64"), "{err}");
+
+        for easy in [
+            "00000000ffff0000000000000000000000000000000000000000000000000000".to_string(),
+            "ff".repeat(32),
+        ] {
+            config.gateway.channel_target_hex = Some(easy.clone());
+            let warnings = validate(&config).expect("DIFF1 or easier is allowed for regtest");
+            assert!(
+                warnings.iter().any(|w| w.contains("regtest only")),
+                "{easy}: {warnings:?}"
+            );
+        }
+
+        // Shadow mode serves no miners, so an easy target is not a warning.
+        let mut shadow = minimal_config(GatewayMode::Shadow);
+        shadow.share_upstream = None;
+        shadow.gateway.channel_target_hex = Some("ff".repeat(32));
+        let warnings = validate(&shadow).expect("shadow accepts any parsable target");
+        assert!(
+            !warnings.iter().any(|w| w.contains("regtest only")),
+            "{warnings:?}"
+        );
+    }
+
+    /// PB-53: vardiff in a mode that serves miners warns until per-job
+    /// targets land, because each step up rejects honest shares.
+    #[test]
+    fn validate_warns_while_vardiff_would_reject_shares_on_a_step_up() {
+        let mut config = minimal_config(GatewayMode::Inline);
+        config.gateway.prevhash_verdict_timeout_ms = 2000;
+        let quiet = validate(&config).expect("valid");
+        assert!(
+            !quiet.iter().any(|w| w.contains("vardiff_enabled")),
+            "{quiet:?}"
+        );
+        config.gateway.vardiff_enabled = true;
+        let warnings = validate(&config).expect("vardiff is allowed, with a warning");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("vardiff_enabled") && w.contains("PB-53")),
+            "{warnings:?}"
+        );
+    }
+
+    /// PB-53: a target that does not parse is refused, not replaced by DIFF1.
+    #[test]
+    fn validate_refuses_a_channel_target_that_does_not_parse() {
+        for bad in ["not hex", "ff", &"f".repeat(63), &"ff".repeat(33)] {
+            let mut config = minimal_config(GatewayMode::Inline);
+            config.gateway.channel_target_hex = Some(bad.to_string());
+            let err = validate(&config).expect_err("a bad target must be refused");
+            assert!(
+                err.contains("channel_target_hex does not parse"),
+                "{bad}: {err}"
+            );
+        }
+    }
+
+    /// PB-53: the shipped prod template runs every channel at difficulty
+    /// 16,384, the floor in OCEAN's DATUM gateway, with vardiff off until a
+    /// share is judged against its own job's target, and with the floor
+    /// already set for when vardiff comes back (J's choices, 2026-09-22). So
+    /// neither the template nor the guard above can drift unnoticed.
+    #[test]
+    fn the_prod_template_runs_at_16384_with_vardiff_off() {
+        let text = include_str!("../../../deploy/gateway-prod.toml");
+        let config: GatewayConfig = toml::from_str(text).expect("the prod template parses");
+        assert_eq!(config.mode, GatewayMode::Inline);
+        assert!(
+            !config.gateway.vardiff_enabled,
+            "vardiff stays off in prod until per-job targets land"
+        );
+        assert_eq!(config.gateway.vardiff_min_difficulty, 16_384);
+        let hex = config
+            .gateway
+            .channel_target_hex
+            .as_deref()
+            .expect("the prod template sets a starting target");
+        let target = crate::shares::display_hex_to_wire_bytes(hex).expect("the target parses");
+        assert_eq!(crate::shares::target_to_difficulty_u64(&target), 16_384);
     }
 
     #[test]

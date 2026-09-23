@@ -12,9 +12,11 @@ Variable difficulty adjusts the channel target based on observed share submissio
 
 Config fields: `extended_channels_enabled` (default true), `vardiff_enabled` (default true), `vardiff_target_shares_per_min`, `vardiff_retarget_interval_secs`, `vardiff_min_difficulty`, `vardiff_max_difficulty`, `vardiff_max_adjustment_factor`. Prometheus metric: `svtwo_vardiff_retargets_total{direction}`.
 
+**Correction, 2026-09-22 (PB-53).** This section, the summary at the top and upgrade step 3 do not describe the `v1.1.0` tag, which still rejected extended channels with `ExtendedChannelUnsupported` and had no vardiff at all. Both landed nine days later, on 2026-04-22 (`3607408`), and were first tagged in `v2.0.0-rc1`. Vardiff's actual defaults are also different: `vardiff_enabled` false, 20 shares per minute, a 90 second retarget interval, and a 4x cap. It starts from the channel target, not from `nominal_hash_rate`, which the gateway does not read. Since PB-53 the shipped `deploy/gateway-prod.toml` runs channels at a fixed difficulty 16,384 with vardiff off, and the gateway refuses to start without a `channel_target_hex` in a mode that serves miners.
+
 ## Automatic inline-to-observe degradation
 
-When the verifier heartbeat is lost, the gateway suspends verdict enforcement and flushes all pending templates to miners without blocking. Recovery requires a full `HeartbeatAck` round trip, not just TCP reconnect. The health probe returns `"status":"degraded"` during the window. A config validation warning fires at startup if `auto_degrade_after_ms` is set below the verifier heartbeat interval, which would cause permanent degradation.
+When the verifier heartbeat is lost, the gateway suspends verdict enforcement and flushes all pending templates to miners without blocking. Recovery requires a full `HeartbeatAck` round trip, not just TCP reconnect. The health probe returns `"status":"degraded"` during the window. A config validation warning fires at startup if `auto_degrade_after_ms` is set below the verifier heartbeat interval, which would cause permanent degradation. (Since PB-31 that is a startup refusal, not a warning.)
 
 Config fields: `auto_degrade` (default true), `auto_degrade_after_ms` (default 10000). Prometheus counter: `svtwo_mode_transitions_total{direction}`.
 

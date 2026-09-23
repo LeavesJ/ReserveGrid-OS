@@ -129,7 +129,8 @@ pub enum GatewayReason {
     /// Channel ID does not exist or was closed
     InvalidChannelId,
 
-    /// Extended mining channels not supported in v1.0.0
+    /// Extended mining channels are disabled (`extended_channels_enabled`
+    /// false). Before 2026-04-22 they were never supported.
     ExtendedChannelUnsupported,
 
     // ── Job path ──
