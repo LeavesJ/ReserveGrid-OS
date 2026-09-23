@@ -21,9 +21,11 @@ The host firewall stays exactly as it was (SSH only). The host IP appears nowher
 
 ## Part 0. Prerequisites (one-time, free)
 
-1. Cloudflare account, free plan. Add the `veldra.org` zone and switch the domain's nameservers to Cloudflare at the registrar. Re-create the existing DNS records first (GitHub Pages A/AAAA or CNAME records for the apex and any www record) so the site never blips; Pages records can stay DNS-only (grey cloud). Propagation typically minutes, allow up to 24h.
-2. Confirm the repo is present on the target host (the operator node already carries it for the Setup B stack).
-3. Confirm Docker and Compose on the target host (already present on the node).
+1. Cloudflare account, free plan. Add the `veldra.org` zone, but **do not switch the nameservers yet**.
+2. Re-create every record before the switch, all **DNS only** (grey cloud). The domain carries company email on Microsoft 365 provisioned through GoDaddy (MX to `veldra-org.mail.protection.outlook.com`, the `NETORG…onmicrosoft.com` TXT, SPF `include:secureserver.net`, `autodiscover`, `lyncdiscover`, `sip`, `msoid`, and the `_sip._tls` / `_sipfederationtls._tcp` SRV records), and proxying the M365 records breaks them. Take the inventory from the live zone rather than from memory: while the zone is NSEC-signed, probing names between the known ones returns the next owner name and its record types, so the chain can be walked to completeness (done 2026-09-23: 17 records across 12 names, including `pay` to GoDaddy payments and `email` to GoDaddy webmail). Then query the two Cloudflare-assigned nameservers directly (`dig @<ns>.ns.cloudflare.com <name> <type>`) and compare every record before anything switches.
+3. **Turn DNSSEC off at the registrar first.** `veldra.org` had DS records at `.org`. Switching nameservers while the parent still holds a DS for the old keys makes the whole domain, site and email, fail validation (SERVFAIL on validating resolvers such as 1.1.1.1 and 8.8.8.8). Remove the DS at GoDaddy, watch `dig +short DS veldra.org` go empty, then wait out the DS TTL (3600 s at `.org`) before the switch. Once the zone is active at Cloudflare, enable DNSSEC there and paste its DS record at GoDaddy.
+4. Switch the nameservers at GoDaddy. Propagation typically minutes, allow up to 24h.
+5. Target host: Docker with Compose **and the buildx plugin** (`docker-buildx` on Ubuntu). `services/rg-auth/Dockerfile` uses BuildKit cache mounts, which the legacy builder refuses.
 
 ## Part 1. Step zero: get the data
 
@@ -69,6 +71,7 @@ The rg-auth SQLite volume lives on the suspended Fly app. R-176 records that the
 
 `docker-compose.auth.yml` at the repo root is the unit, committed 2026-09-22 with the production values `services/rg-auth/fly.toml` ran with. The sketch this section used to carry named `VELDRA_AUTH_DB_PATH` and port 8080; the code reads `VELDRA_AUTH_DB` and serves on 3030, and its health route is `/auth/health`, not `/health`. Secrets live in `.env.auth`, built from `deploy/env.auth.example` and the password manager, never committed (the `.env.*` rule covers it).
 
+0. Stage a clean tree of the commit to deploy in its own directory, never the Setup B stack's copy (`~/veldra`, an rsync tree the soak stack runs from): `git archive --format=tar origin/main | ssh <host> 'mkdir ~/veldra-auth && tar -x -C ~/veldra-auth'`. Build with `docker buildx build --load -f services/rg-auth/Dockerfile -t veldra-auth-rg-auth .`, which is the image name Compose uses for a project directory called `veldra-auth`.
 1. `cp deploy/env.auth.example .env.auth && chmod 600 .env.auth`, then fill it. Leave a line out rather than blank: an absent SMTP variable means "email disabled", a blank one is a broken setting.
 2. Data: either the Litestream values in `.env.auth` with no `./data/auth/auth.db` (Part 1), or the exported snapshot copied to `./data/auth/auth.db`.
 3. `docker compose -f docker-compose.auth.yml up -d --build`, then `curl -sf http://127.0.0.1:3030/auth/health` on the host must print `ok`.
