@@ -314,7 +314,7 @@ Shadow is intentionally limited so evaluators can try it without infrastructure 
 | Real miner connections | inline (paid) |
 | SV2 gateway with Noise NX | inline (paid) |
 | Share lifecycle WAL | inline (paid) |
-| Vardiff + extended channels | inline (paid) |
+| Extended channels, and vardiff (off by default) | inline (paid) |
 | Auto inline-to-observe degradation | inline (paid) |
 | Multi-gateway deployment | inline (paid) |
 

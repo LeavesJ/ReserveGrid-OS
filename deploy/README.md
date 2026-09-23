@@ -6,7 +6,7 @@ Production configuration templates. Copy and customize before deploying.
 
 | File | Purpose |
 |---|---|
-| `gateway-prod.toml` | SV2 gateway config with hardened defaults (per-IP cap, fail-closed upstream, WAL, no regtest target) |
+| `gateway-prod.toml` | SV2 gateway config with hardened defaults (per-IP cap, fail-closed upstream, WAL, a difficulty 16,384 target instead of the regtest one) |
 | `policy-prod.toml` | Policy with all enforcement flags enabled (stale rejection, weight ratio, empty templates, coinbase zero) |
 | `env.prod.example` | Environment template with no default credentials and structured JSON logging |
 

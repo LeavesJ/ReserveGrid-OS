@@ -24,7 +24,7 @@ Built in Rust. Ships as a native macOS/Linux desktop app (`rg-desktop`) with emb
 - Evaluates candidate block templates against a configurable `policy.toml`
 - Returns accept/reject verdicts with stable machine readable reason codes and policy context
 - Runs a full Stratum V2 gateway (Noise NX encrypted) with standard and extended mining channels
-- Adjusts per channel difficulty dynamically via variable difficulty (vardiff)
+- Sets each channel's difficulty from `channel_target_hex`, with optional variable difficulty (vardiff, off by default and in the prod template until per-job targets land; see PB-53 in the runbook)
 - Tracks per channel hashrate with a sliding window estimator
 - Degrades automatically from inline to observe mode when the verifier is unreachable, then recovers on heartbeat
 - Enforces consensus safety checks: weight ratio, template age, sigops budget, coinbase sigops
@@ -99,7 +99,7 @@ TCP server that receives `TemplatePropose` messages and returns `TemplateVerdict
 Fetches block templates from bitcoind (`getblocktemplate`) or a Stratum bridge and forwards them to the verifier. Exposes mempool stats for the verifier fee tier logic. Supports runtime settings updates.
 
 ### sv2-gateway
-Stratum V2 mining gateway with Noise NX encryption. Accepts miner connections on standard and extended mining channels, distributes `NewMiningJob` and `NewExtendedMiningJob` messages, and validates submitted shares (including variable length extranonce for extended channels). Variable difficulty adjusts each channel's target based on observed share rate. Tracks per channel state including a sliding window hashrate estimator. Automatic inline to observe degradation when the verifier heartbeat is lost. Exposes channel snapshots via HTTP for the miners page.
+Stratum V2 mining gateway with Noise NX encryption. Accepts miner connections on standard and extended mining channels, distributes `NewMiningJob` and `NewExtendedMiningJob` messages, and validates submitted shares (including variable length extranonce for extended channels). Each channel runs at `channel_target_hex`, which the modes that serve miners require; optional variable difficulty adjusts it from the observed share rate, off by default. Tracks per channel state including a sliding window hashrate estimator. Automatic inline to observe degradation when the verifier heartbeat is lost. Exposes channel snapshots via HTTP for the miners page.
 
 ### rg-desktop
 Native desktop application (macOS/Linux) built with Tauri. Wraps rg-dashboard in a native window with IPC commands for license management, system tray integration, and in-app auto-updates (signed, with Tauri updater). The desktop app is the primary distribution format for operators. For headless or Docker deployments, rg-dashboard runs standalone.

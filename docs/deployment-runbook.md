@@ -205,7 +205,7 @@ Fill in the TODO fields:
 3. `template_url`: your template-manager URL (default `http://template-manager:8082` if same compose stack)
 4. Verify `wal_path` points to a persistent volume mount
 
-**Tunable gateway keys (defaults shown, all optional):**
+**Tunable gateway keys (defaults shown; optional unless marked required):**
 
 | Key | Default | What it does |
 |---|---|---|
@@ -709,6 +709,14 @@ fail the Noise handshake and be rejected.
 
 ## Troubleshooting
 
+### Gateway Exits at Startup Citing PB-53
+
+**Symptom:** the gateway logs `config validation failed` with a message naming PB-53, and exits.
+
+**Cause:** a mode that serves miners (inline or observe) has no `channel_target_hex`, or it is zero or does not parse. Without a target every channel would run at difficulty 1.
+
+**Fix:** set `channel_target_hex = "000000000003fffc000000000000000000000000000000000000000000000000"` (difficulty 16,384) in the `[gateway]` table, as `deploy/gateway-prod.toml` does. A startup warning about `vardiff_enabled` means vardiff is on; the prod template keeps it off until per-job targets land.
+
 ### Templates Not Flowing
 
 **Symptom:** `curl http://localhost:8082/latest` returns 404 or stale data.
@@ -959,7 +967,10 @@ connection-level stickiness by default for TCP targets.
 ### Gateway Instance Configuration
 
 Each gateway instance requires a unique `gateway_instance_id` and its own
-Noise keypair, but must share the same `authority_pubkey`.
+Noise keypair, but must share the same `authority_pubkey`. The two examples
+below show only what differs per instance: start each from
+`deploy/gateway-prod.toml`, which supplies `mode`, `channel_target_hex` and
+`[share_upstream]`, and note that the `[verifier]` key is `addr`.
 
 **Instance A (`config/gateway-a.toml`):**
 

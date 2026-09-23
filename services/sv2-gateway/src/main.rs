@@ -529,29 +529,26 @@ async fn gw_save_settings(
             return (
                 StatusCode::BAD_REQUEST,
                 Json({
-                    // Cut on a character, not a byte: a byte cut through a
-                    // multi-byte character panics.
-                    let msg: String = format!("invalid config after patch: {e}")
-                        .chars()
-                        .take(600)
-                        .collect();
+                    let msg = error_excerpt(&format!("invalid config after patch: {e}"));
                     serde_json::json!({ "ok": false, "error": msg })
                 }),
             );
         }
     };
 
-    if let Err(e) = config::validate(&patched_cfg) {
-        return (StatusCode::BAD_REQUEST, {
-            // Long enough for PB-53's refusal to keep its fix, and cut on a
-            // character: a byte cut through a multi-byte character panics.
-            let msg: String = format!("validation failed: {e}")
-                .chars()
-                .take(600)
-                .collect();
-            Json(serde_json::json!({ "ok": false, "error": msg }))
-        });
-    }
+    // Warnings go back to the caller: for an easy target or vardiff they are
+    // the whole guard on this path (PB-53), and a log line at the next
+    // restart is too late.
+    let warnings = match config::validate(&patched_cfg) {
+        Ok(warnings) => warnings,
+        Err(e) => {
+            let msg = error_excerpt(&format!("validation failed: {e}"));
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": msg })),
+            );
+        }
+    };
 
     // Atomic write to disk.
     if let Err(e) = reservegrid_common::config_io::atomic_write_toml(config_path.as_ref(), &doc) {
@@ -566,8 +563,16 @@ async fn gw_save_settings(
 
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "ok": true, "restart_required": true })),
+        Json(serde_json::json!({ "ok": true, "restart_required": true, "warnings": warnings })),
     )
+}
+
+/// A settings error short enough for the dashboard, long enough to keep
+/// PB-53's refusal whole with its fix (under 400 characters), and cut on a
+/// character: a byte cut through a multi-byte character panics. This exists
+/// because both settings-save error paths need it.
+fn error_excerpt(msg: &str) -> String {
+    msg.chars().take(600).collect()
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -687,6 +692,23 @@ impl GatewayMetrics {
             m.vardiff_retargets_total.clone(),
         );
         m
+    }
+}
+
+#[cfg(test)]
+mod settings_error_tests {
+    use super::error_excerpt;
+
+    /// PB-53 review: the settings API cut its errors at byte 200, which
+    /// panics when that byte falls inside a multi-byte character.
+    #[test]
+    fn an_error_is_cut_on_a_character_not_a_byte() {
+        let long = format!("{}{}", "a".repeat(199), "é".repeat(700));
+        let cut = error_excerpt(&long);
+        assert_eq!(cut.chars().count(), 600);
+        assert!(cut.ends_with('é'));
+        let short = "validation failed: short";
+        assert_eq!(error_excerpt(short), short);
     }
 }
 
@@ -1207,7 +1229,7 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
         let channel_target = if let Some(ref hex_str) = cfg.gateway.channel_target_hex {
             match sv2_gateway::shares::display_hex_to_wire_bytes(hex_str) {
                 Ok(t) => {
-                    info!(target_hex = %hex_str, "using configured channel target override");
+                    info!(target_hex = %hex_str, "using configured channel target");
                     t
                 }
                 Err(e) => {
@@ -1219,7 +1241,10 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                 }
             }
         } else {
-            default_share_target()
+            // Unreachable while `config::validate` requires a target in the
+            // modes that serve miners (PB-53); never fall back to DIFF1.
+            error!("no channel_target_hex; refusing to serve miners");
+            return ExitCode::FAILURE;
         };
 
         let handler_config = Arc::new(HandlerConfig {
@@ -2345,19 +2370,6 @@ fn build_template_propose(
         // verifier_shield_skipped_total).
         raw_block_hex: template.raw_block_hex.clone(),
     }
-}
-
-/// Default share target for development and regtest use.
-///
-/// This sets the target to `0x00000000FFFF...` in LE byte order, which
-/// corresponds to Bitcoin difficulty 1 (`DIFF1_TARGET`). Byte index 29 is
-/// the most significant non-zero byte in the LE representation.
-fn default_share_target() -> [u8; 32] {
-    // DIFF1_TARGET in LE: bytes 26..29 = 0xFF, 0xFF, 0x00, 0x00
-    // matches 0x00000000FFFF0000...0000 BE.
-    let mut diff1_le = rg_protocol::gateway::DIFF1_TARGET_BE;
-    diff1_le.reverse();
-    diff1_le
 }
 
 // ─────────────────────────────────────────────────────────────────────

@@ -659,25 +659,47 @@ fn validate_channel_target(
                  32-byte target, most significant byte first."
             )
         })?;
+        // A target no share can meet rejects every share, block solutions
+        // included. `target_to_difficulty_u64` saturates at u64::MAX for zero
+        // and for anything harder than difficulty 2^64.
+        if target.iter().all(|&b| b == 0) {
+            return Err(
+                "channel_target_hex is zero, which no share can meet. It is the 32-byte \
+                 target, most significant byte first; difficulty 16,384 is 000000000003fffc \
+                 followed by zeros."
+                    .to_string(),
+            );
+        }
         match crate::shares::target_to_difficulty_u64(&target) {
-            // An all-zero target: only a hash of zero meets it, so every
-            // share, block solutions included, would be rejected.
             u64::MAX => {
                 return Err(
-                    "channel_target_hex is zero, which no share can meet. It is the 32-byte \
-                     target, most significant byte first; difficulty 16,384 is \
-                     000000000003fffc followed by zeros."
+                    "channel_target_hex is harder than difficulty 2^64, which no share can \
+                     meet. It is the 32-byte target, most significant byte first; difficulty \
+                     16,384 is 000000000003fffc followed by zeros."
                         .to_string(),
                 );
             }
             0 | 1 if config.mode.accepts_miners() => warnings.push(
                 "channel_target_hex is difficulty 1 or easier. That suits regtest only: on \
-                 mainnet any current miner exceeds max_shares_per_second_per_channel and the \
-                 excess, block solutions included, is dropped unchecked (PB-53)."
+                 mainnet any current miner floods the gateway with shares, and with \
+                 max_shares_per_second_per_channel set the excess, block solutions included, is \
+                 dropped before the proof-of-work check (PB-53)."
                     .to_string(),
             ),
             _ => {}
         }
+    }
+
+    // PB-53: vardiff applies a raised target at once, to shares on jobs the
+    // miner already has, where SV2 applies a new target to future jobs only.
+    // So each step up rejects honest shares until per-job targets land.
+    if config.mode.accepts_miners() && config.gateway.vardiff_enabled {
+        warnings.push(
+            "vardiff_enabled: until each share is judged against its own job's target, a \
+             step up applies to jobs the miner already has and rejects honest shares. The prod \
+             template keeps it off (PB-53)."
+                .to_string(),
+        );
     }
 
     // PB-53: with no target every channel opens at DIFF1, and vardiff does not
@@ -689,10 +711,11 @@ fn validate_channel_target(
     if config.mode.accepts_miners() && config.gateway.channel_target_hex.is_none() {
         return Err(format!(
             "{} mode serves miners, and with no channel_target_hex every channel opens at \
-             difficulty 1, where any current miner exceeds max_shares_per_second_per_channel \
-             and the excess, block solutions included, is dropped unchecked (PB-53). Vardiff \
-             does not prevent it: it starts from the channel target. Set channel_target_hex, \
-             as deploy/gateway-prod.toml does.",
+             difficulty 1, where any current miner floods the gateway with shares; with \
+             max_shares_per_second_per_channel set, the excess, block solutions included, is \
+             dropped before the proof-of-work check (PB-53). Vardiff does not prevent it: it \
+             starts from the channel target. Set channel_target_hex, as \
+             deploy/gateway-prod.toml does.",
             config.mode
         ));
     }
@@ -935,7 +958,11 @@ mod tests {
         config.gateway.prevhash_verdict_timeout_ms = 2000;
         config.gateway.channel_target_hex = Some("00".repeat(32));
         let err = validate(&config).expect_err("a zero target must be refused");
-        assert!(err.contains("zero"), "{err}");
+        assert!(err.contains("is zero"), "{err}");
+
+        config.gateway.channel_target_hex = Some(format!("{}01", "00".repeat(31)));
+        let err = validate(&config).expect_err("an unmeetable target must be refused");
+        assert!(err.contains("harder than difficulty 2^64"), "{err}");
 
         for easy in [
             "00000000ffff0000000000000000000000000000000000000000000000000000".to_string(),
@@ -948,6 +975,37 @@ mod tests {
                 "{easy}: {warnings:?}"
             );
         }
+
+        // Shadow mode serves no miners, so an easy target is not a warning.
+        let mut shadow = minimal_config(GatewayMode::Shadow);
+        shadow.share_upstream = None;
+        shadow.gateway.channel_target_hex = Some("ff".repeat(32));
+        let warnings = validate(&shadow).expect("shadow accepts any parsable target");
+        assert!(
+            !warnings.iter().any(|w| w.contains("regtest only")),
+            "{warnings:?}"
+        );
+    }
+
+    /// PB-53: vardiff in a mode that serves miners warns until per-job
+    /// targets land, because each step up rejects honest shares.
+    #[test]
+    fn validate_warns_while_vardiff_would_reject_shares_on_a_step_up() {
+        let mut config = minimal_config(GatewayMode::Inline);
+        config.gateway.prevhash_verdict_timeout_ms = 2000;
+        let quiet = validate(&config).expect("valid");
+        assert!(
+            !quiet.iter().any(|w| w.contains("vardiff_enabled")),
+            "{quiet:?}"
+        );
+        config.gateway.vardiff_enabled = true;
+        let warnings = validate(&config).expect("vardiff is allowed, with a warning");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("vardiff_enabled") && w.contains("PB-53")),
+            "{warnings:?}"
+        );
     }
 
     /// PB-53: a target that does not parse is refused, not replaced by DIFF1.

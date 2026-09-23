@@ -317,6 +317,8 @@ interface SaveResponse {
   ok: boolean;
   restart_required?: boolean;
   error?: string;
+  /** Config validation warnings the saved file carries (PB-53). */
+  warnings?: string[];
 }
 
 export async function saveVerifierSettings(patch: Record<string, unknown>): Promise<SaveResponse> {
