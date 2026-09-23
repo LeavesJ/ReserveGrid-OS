@@ -25,7 +25,7 @@ Production configuration templates. Copy and customize before deploying.
 | `upstream_failure_policy` | `fail_open` | `fail_closed` |
 | `max_connections_per_ip` | 0 (unlimited) | 50 |
 | `ntime_elapsed_slack_seconds` | 30 (regtest) | 10 (mainnet) |
-| `channel_target_hex` | all-FF (every hash passes) | omitted (difficulty 1 fallback, vardiff off; PB-53, open) |
+| `channel_target_hex` | all-FF (every hash passes) | difficulty 16,384, with `vardiff_enabled = true` (PB-53) |
 | `wal_path` | disabled | `/data/share_wal.ndjson` |
 | `noise_keypair_poll_interval_secs` | 0 (disabled) | 300 (5 min check) |
 | `enforce_template_age` | false | true (5s stale) |

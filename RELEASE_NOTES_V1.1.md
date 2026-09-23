@@ -12,9 +12,11 @@ Variable difficulty adjusts the channel target based on observed share submissio
 
 Config fields: `extended_channels_enabled` (default true), `vardiff_enabled` (default true), `vardiff_target_shares_per_min`, `vardiff_retarget_interval_secs`, `vardiff_min_difficulty`, `vardiff_max_difficulty`, `vardiff_max_adjustment_factor`. Prometheus metric: `svtwo_vardiff_retargets_total{direction}`.
 
+**Correction, 2026-09-22 (PB-53).** The two paragraphs above do not match the code, and did not at the `v1.1.0` tag either, which had no vardiff at all. Vardiff landed on 2026-04-22 with these actual defaults: `vardiff_enabled` false, 20 shares per minute, a 90 second retarget interval, and a 4x cap. It starts from the channel target (`channel_target_hex`, or DIFF1 without it), not from `nominal_hash_rate`, which the gateway does not read. Since PB-53 the shipped `deploy/gateway-prod.toml` starts channels at difficulty 16,384 with vardiff on, and the gateway refuses to start inline with neither a target nor vardiff.
+
 ## Automatic inline-to-observe degradation
 
-When the verifier heartbeat is lost, the gateway suspends verdict enforcement and flushes all pending templates to miners without blocking. Recovery requires a full `HeartbeatAck` round trip, not just TCP reconnect. The health probe returns `"status":"degraded"` during the window. A config validation warning fires at startup if `auto_degrade_after_ms` is set below the verifier heartbeat interval, which would cause permanent degradation.
+When the verifier heartbeat is lost, the gateway suspends verdict enforcement and flushes all pending templates to miners without blocking. Recovery requires a full `HeartbeatAck` round trip, not just TCP reconnect. The health probe returns `"status":"degraded"` during the window. A config validation warning fires at startup if `auto_degrade_after_ms` is set below the verifier heartbeat interval, which would cause permanent degradation. (Since PB-31 that is a startup refusal, not a warning.)
 
 Config fields: `auto_degrade` (default true), `auto_degrade_after_ms` (default 10000). Prometheus counter: `svtwo_mode_transitions_total{direction}`.
 

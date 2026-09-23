@@ -1201,8 +1201,11 @@ async fn run_gateway(cfg: GatewayConfig) -> ExitCode {
                     t
                 }
                 Err(e) => {
-                    error!(error = %e, "invalid channel_target_hex; falling back to DIFF1");
-                    default_share_target()
+                    // `config::validate` refuses this at startup (PB-53), so
+                    // reaching it means that check was bypassed. Never fall
+                    // back to DIFF1: that is the silent default PB-53 closed.
+                    error!(error = %e, "invalid channel_target_hex; refusing to serve miners");
+                    return ExitCode::FAILURE;
                 }
             }
         } else {

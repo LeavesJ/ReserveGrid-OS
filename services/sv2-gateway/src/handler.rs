@@ -5,9 +5,12 @@
 //! SV2 session lifecycle:
 //!
 //! 1. `SetupConnection` exchange (validate protocol version 2 + flags).
-//! 2. Channel open (`OpenStandardMiningChannel` -> auth check -> allocate
-//!    `channel_id` + extranonce -> Success + `SetTarget` + initial `NewMiningJob`;
-//!    reject Extended channels with close).
+//! 2. Channel open (`OpenStandardMiningChannel` or, when
+//!    `extended_channels_enabled`, `OpenExtendedMiningChannel` -> allocate
+//!    `channel_id` + extranonce -> Success + `SetTarget` + initial job). There
+//!    is no per-miner auth check. The target is `channel_target_hex`, or DIFF1
+//!    without it; the miner's `nominal_hash_rate` and `max_target` are not read
+//!    (PB-53).
 //! 3. Steady-state `select!` loop:
 //!    - `job_rx` broadcast: distribute `NewMiningJob` + optional `SetNewPrevHash`
 //!    - `transport.read_frame()`: handle `SubmitSharesStandard`,
