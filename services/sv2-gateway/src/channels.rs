@@ -1,8 +1,9 @@
-//! Standard mining channel management.
+//! Mining channel management, standard and extended.
 //!
-//! Each SV2 TCP connection may open up to `max_channels_per_conn` standard
-//! mining channels. Extended channels are rejected with
-//! `GatewayReason::ExtendedChannelUnsupported`.
+//! Each SV2 TCP connection may open up to `max_channels_per_conn` channels.
+//! Extended channels are rejected with
+//! `GatewayReason::ExtendedChannelUnsupported` only when
+//! `extended_channels_enabled` is false.
 //!
 //! Channel state tracks the per-channel extranonce prefix, current job pointer,
 //! difficulty target, and ntime tracking for share validation.

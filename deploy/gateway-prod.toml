@@ -4,8 +4,8 @@
 # Copy to your deployment and fill in all TODO fields before starting.
 #
 # Key differences from dev/gateway.toml:
-#   - Channels start at difficulty 16,384 with vardiff on, not the regtest
-#     all-FF target (PB-53; see channel_target_hex below)
+#   - Channels run at difficulty 16,384, not the regtest all-FF target
+#     (PB-53; see channel_target_hex below)
 #   - Per-IP connection cap enforced (50)
 #   - Tighter ntime slack (10s, tuned for mainnet)
 #   - WAL enabled for crash-durable share delivery
@@ -47,19 +47,26 @@ max_shares_per_second_per_channel = 100
 # you have measured a need.
 ntime_elapsed_slack_seconds = 10
 
-# Every channel starts at difficulty 16,384 (the default start in OCEAN's
-# DATUM gateway; J's choice for PB-53, 2026-09-22) and vardiff moves it
-# toward vardiff_target_shares_per_min from there. At 16,384 a 335 TH/s
+# Every channel runs at difficulty 16,384, the difficulty floor in OCEAN's
+# DATUM gateway (J's choice for PB-53, 2026-09-22). At 16,384 a 335 TH/s
 # miner sends about 286 shares a minute and a 100 TH/s one about 85, both
 # well under max_shares_per_second_per_channel above; a 1 TH/s miner sends
-# under one a minute until vardiff eases it down. Without a target, every
-# channel would start at difficulty 1, where any current miner exceeds the
-# rate limit and the excess, block solutions included, is dropped before
-# the proof-of-work check. The gateway refuses to start inline with neither
-# a target nor vardiff. The hex is the 32-byte target, most significant
-# byte first.
+# about one a minute. The limit is exceeded only by a single channel above
+# about 7 PH/s, such as a proxy aggregating a farm, and then the excess is
+# dropped before the proof-of-work check, block solutions included; seeding
+# each channel from its declared hashrate (PB-53 option B) is the fix for
+# that. Without any target every channel would run at difficulty 1, and the
+# gateway refuses to start that way in a mode that serves miners. The hex is
+# the 32-byte target, most significant byte first.
 channel_target_hex = "000000000003fffc000000000000000000000000000000000000000000000000"
-vardiff_enabled = true
+
+# Vardiff stays off for now: today a raised target applies to shares on jobs
+# the miner already has, and SV2 applies a new target to future jobs only, so
+# each step up would reject honest shares. It comes back on once each share
+# is judged against its own job's target. The floor is set now, so turning
+# vardiff on cannot ease a channel below 16,384.
+vardiff_enabled = false
+vardiff_min_difficulty = 16384
 
 noise_cert_path = "/config/keys/noise_cert.bin"
 noise_keypair_reload_sighup = true

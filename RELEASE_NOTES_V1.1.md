@@ -12,7 +12,7 @@ Variable difficulty adjusts the channel target based on observed share submissio
 
 Config fields: `extended_channels_enabled` (default true), `vardiff_enabled` (default true), `vardiff_target_shares_per_min`, `vardiff_retarget_interval_secs`, `vardiff_min_difficulty`, `vardiff_max_difficulty`, `vardiff_max_adjustment_factor`. Prometheus metric: `svtwo_vardiff_retargets_total{direction}`.
 
-**Correction, 2026-09-22 (PB-53).** The two paragraphs above do not match the code, and did not at the `v1.1.0` tag either, which had no vardiff at all. Vardiff landed on 2026-04-22 with these actual defaults: `vardiff_enabled` false, 20 shares per minute, a 90 second retarget interval, and a 4x cap. It starts from the channel target (`channel_target_hex`, or DIFF1 without it), not from `nominal_hash_rate`, which the gateway does not read. Since PB-53 the shipped `deploy/gateway-prod.toml` starts channels at difficulty 16,384 with vardiff on, and the gateway refuses to start inline with neither a target nor vardiff.
+**Correction, 2026-09-22 (PB-53).** This section does not describe the `v1.1.0` tag, which still rejected extended channels with `ExtendedChannelUnsupported` and had no vardiff at all. Both landed nine days later, on 2026-04-22 (`3607408`). Vardiff's actual defaults are also different: `vardiff_enabled` false, 20 shares per minute, a 90 second retarget interval, and a 4x cap. It starts from the channel target, not from `nominal_hash_rate`, which the gateway does not read. Since PB-53 the shipped `deploy/gateway-prod.toml` runs channels at a fixed difficulty 16,384 with vardiff off, and the gateway refuses to start without a `channel_target_hex` in a mode that serves miners.
 
 ## Automatic inline-to-observe degradation
 

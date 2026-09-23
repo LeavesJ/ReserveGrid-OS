@@ -529,8 +529,13 @@ async fn gw_save_settings(
             return (
                 StatusCode::BAD_REQUEST,
                 Json({
-                    let msg = format!("invalid config after patch: {e}");
-                    serde_json::json!({ "ok": false, "error": &msg[..msg.len().min(200)] })
+                    // Cut on a character, not a byte: a byte cut through a
+                    // multi-byte character panics.
+                    let msg: String = format!("invalid config after patch: {e}")
+                        .chars()
+                        .take(600)
+                        .collect();
+                    serde_json::json!({ "ok": false, "error": msg })
                 }),
             );
         }
@@ -538,8 +543,13 @@ async fn gw_save_settings(
 
     if let Err(e) = config::validate(&patched_cfg) {
         return (StatusCode::BAD_REQUEST, {
-            let msg = format!("validation failed: {e}");
-            Json(serde_json::json!({ "ok": false, "error": &msg[..msg.len().min(200)] }))
+            // Long enough for PB-53's refusal to keep its fix, and cut on a
+            // character: a byte cut through a multi-byte character panics.
+            let msg: String = format!("validation failed: {e}")
+                .chars()
+                .take(600)
+                .collect();
+            Json(serde_json::json!({ "ok": false, "error": msg }))
         });
     }
 

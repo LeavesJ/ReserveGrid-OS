@@ -8,9 +8,9 @@
 //! 2. Channel open (`OpenStandardMiningChannel` or, when
 //!    `extended_channels_enabled`, `OpenExtendedMiningChannel` -> allocate
 //!    `channel_id` + extranonce -> Success + `SetTarget` + initial job). There
-//!    is no per-miner auth check. The target is `channel_target_hex`, or DIFF1
-//!    without it; the miner's `nominal_hash_rate` and `max_target` are not read
-//!    (PB-53).
+//!    is no per-miner auth check. The target is `channel_target_hex`, which the
+//!    modes that serve miners require; the miner's `nominal_hash_rate` and
+//!    `max_target` are not read (PB-53).
 //! 3. Steady-state `select!` loop:
 //!    - `job_rx` broadcast: distribute `NewMiningJob` + optional `SetNewPrevHash`
 //!    - `transport.read_frame()`: handle `SubmitSharesStandard`,
