@@ -4312,6 +4312,7 @@ dependencies = [
  "http",
  "mime_guess",
  "reqwest 0.12.28",
+ "reservegrid-common",
  "rust-embed",
  "serde",
  "serde_json",
@@ -4375,6 +4376,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "toml 0.8.2",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]

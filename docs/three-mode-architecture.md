@@ -363,12 +363,14 @@ listen = "127.0.0.1:18444"
 feed_url = "wss://demo.veldra.org/ws"   # shadow
 # feed_url = "wss://feed.veldra.org/ws" # observe
 license_key = ""                         # empty for shadow, required for observe
+rate_limit_per_minute = 1200             # JSON-RPC calls per peer per minute; optional
 ```
 
 Env var overrides:
 - `VELDRA_FEED_URL` → feed_url
 - `VELDRA_FEED_LICENSE_KEY` → license_key
 - `VELDRA_ADAPTER_LISTEN` → listen
+- `VELDRA_ADAPTER_RATE_LIMIT_PER_MINUTE` → rate_limit_per_minute (0 or a non-number stops startup)
 
 **Behavior:**
 - Connects to the feed WebSocket on startup
@@ -377,6 +379,7 @@ Env var overrides:
 - When template-manager polls `getmempoolinfo`, adapter returns the buffered mempool snapshot
 - Reconnects automatically on WebSocket disconnect (exponential backoff, max 30s)
 - Health endpoint at `/health` returns `{"status":"ok","feed_connected":true,"last_template_age_ms":1234}`
+- JSON-RPC calls are limited per TCP peer (1200 per minute by default, a sliding 60 s window). Call 1201 gets HTTP 429 with `Retry-After` and a JSON-RPC error whose message is `rate_limited`. `/health` is not limited. Forwarded-for headers are never read, because the adapter is never behind a proxy. On loopback every caller shares `127.0.0.1`, so the budget covers template-manager, pool-verifier and rg-feed-server together.
 
 **Auth handling:**
 - If `license_key` is non-empty, sends it in the WebSocket handshake `Authorization` header

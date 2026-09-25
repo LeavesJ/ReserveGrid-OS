@@ -37,3 +37,6 @@ workspace = true
 # crates and cannot reach the package's regular `[dependencies]`, so the
 # same tokio has to be re-listed here for the test binary.
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time", "sync"] }
+# `ServiceExt::oneshot` drives the router in `src/rate_limit.rs` tests
+# without a socket.
+tower = { version = "0.5", features = ["util"] }
