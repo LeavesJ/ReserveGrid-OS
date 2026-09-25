@@ -9,3 +9,13 @@ listen = "127.0.0.1:8084"
 auth_url     = "http://127.0.0.1:8088"
 verifier_url = "http://127.0.0.1:8080"
 template_url = "http://127.0.0.1:8082"
+
+# Request limits per client, over a sliding 60 s window. The defaults below
+# apply when the table is absent. Behind a reverse proxy, set both
+# trusted_proxies and client_ip_header, or every operator shares the proxy's
+# budget; see "Dashboard request limits" in docs/deployment-runbook.md.
+#
+# [rate_limit]
+# api_per_minute   = 600
+# trusted_proxies  = ["127.0.0.1"]
+# client_ip_header = "cf-connecting-ip"   # or "x-forwarded-for"

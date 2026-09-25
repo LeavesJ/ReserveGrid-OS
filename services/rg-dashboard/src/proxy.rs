@@ -61,7 +61,10 @@ pub async fn proxy_templates(
 /// Routes: `/api/auth/{path}` to `{auth_url}/auth/{path}`
 ///
 /// Forwards `x-forwarded-for` so rg-auth rate limiting sees the real client IP
-/// instead of the proxy's loopback address.
+/// instead of the proxy's loopback address. The value is the dashboard's own
+/// answer from `ClientAddr::resolve`, one address and never the client's
+/// header passed through, so a client cannot choose its rg-auth bucket. With
+/// no `[rate_limit]` trust configured it is the TCP peer, as it always was.
 pub async fn proxy_auth(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -72,6 +75,7 @@ pub async fn proxy_auth(
     body: Body,
 ) -> Response {
     let upstream_path = format!("auth/{path}");
+    let client = state.client_addr.resolve(addr.ip(), &headers);
     proxy_to(
         &state.client,
         &state.config.auth_url,
@@ -80,13 +84,15 @@ pub async fn proxy_auth(
         method,
         headers,
         body,
-        Some(addr.ip()),
+        Some(client),
     )
     .await
 }
 
 /// Proxy requests to rg-auth `/keys/*`.
 /// Routes: `/api/keys/{path}` to `{auth_url}/keys/{path}`
+///
+/// Forwards `x-forwarded-for` exactly as [`proxy_auth`] does.
 pub async fn proxy_keys(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -97,6 +103,7 @@ pub async fn proxy_keys(
     body: Body,
 ) -> Response {
     let upstream_path = format!("keys/{path}");
+    let client = state.client_addr.resolve(addr.ip(), &headers);
     proxy_to(
         &state.client,
         &state.config.auth_url,
@@ -105,7 +112,7 @@ pub async fn proxy_keys(
         method,
         headers,
         body,
-        Some(addr.ip()),
+        Some(client),
     )
     .await
 }

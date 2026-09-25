@@ -5,12 +5,14 @@
 
 mod config;
 mod proxy;
+mod rate_limit;
 
 use axum::extract::DefaultBodyLimit;
 use axum::{
     Json, Router,
     extract::State,
     http::{StatusCode, Uri, header},
+    middleware,
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -42,6 +44,9 @@ struct Cli {
 pub struct AppState {
     pub config: DashboardConfig,
     pub client: Client,
+    /// Who a request is from, for the limiter and for the address the
+    /// rg-auth proxies forward.
+    pub client_addr: Arc<rate_limit::ClientAddr>,
 }
 
 #[tokio::main]
@@ -74,6 +79,9 @@ async fn main() -> std::process::ExitCode {
         templates = %cfg.template_url,
         auth = %cfg.auth_url,
         probes = cfg.health_probes.len(),
+        api_per_minute = cfg.rate_limit.api_per_minute,
+        health_per_minute = rate_limit::FANOUT_PER_MINUTE,
+        trusted_proxies = cfg.rate_limit.trusted_proxies.len(),
         "starting rg-dashboard"
     );
 
@@ -88,36 +96,21 @@ async fn main() -> std::process::ExitCode {
         }
     };
 
+    let client_addr = Arc::new(rate_limit::ClientAddr::from_config(&cfg.rate_limit));
+    let api_limit =
+        rate_limit::LimitClass::new("api", cfg.rate_limit.api_per_minute, client_addr.clone());
+    let fanout_limit =
+        rate_limit::LimitClass::new("fanout", rate_limit::FANOUT_PER_MINUTE, client_addr.clone());
+    rate_limit::spawn_sweeper(api_limit.clone());
+    rate_limit::spawn_sweeper(fanout_limit.clone());
+
     let state = Arc::new(AppState {
         config: cfg,
         client,
+        client_addr,
     });
 
-    let app = Router::new()
-        // API proxy routes
-        .route(
-            "/api/verifier/{*path}",
-            axum::routing::any(proxy::proxy_verifier),
-        )
-        .route(
-            "/api/templates/{*path}",
-            axum::routing::any(proxy::proxy_templates),
-        )
-        .route("/api/auth/{*path}", axum::routing::any(proxy::proxy_auth))
-        .route("/api/keys/{*path}", axum::routing::any(proxy::proxy_keys))
-        .route(
-            "/api/gateway/{*path}",
-            axum::routing::any(proxy::proxy_gateway),
-        )
-        .route("/api/health", get(proxy::health_aggregate))
-        .route("/api/dashboard/settings", get(dashboard_get_settings))
-        // Health endpoint for the dashboard itself
-        .route("/healthz", get(healthz))
-        // SPA: serve embedded static files, fallback to index.html
-        .fallback(get(serve_spa))
-        .layer(CompressionLayer::new())
-        .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MiB; proxy_to enforces the same cap
-        .with_state(state);
+    let app = router(state, api_limit, fanout_limit);
 
     let addr: SocketAddr = match listen.parse() {
         Ok(a) => a,
@@ -159,6 +152,56 @@ async fn main() -> std::process::ExitCode {
     }
 
     std::process::ExitCode::SUCCESS
+}
+
+/// Every route the dashboard serves.
+///
+/// `route_layer` covers only the routes already added to the router it is
+/// called on, so the two limited classes are built as separate routers and
+/// merged, and `/healthz` and the SPA fallback are added after, unlimited.
+fn router(
+    state: Arc<AppState>,
+    api_limit: Arc<rate_limit::LimitClass>,
+    fanout_limit: Arc<rate_limit::LimitClass>,
+) -> Router {
+    let api = Router::new()
+        .route(
+            "/api/verifier/{*path}",
+            axum::routing::any(proxy::proxy_verifier),
+        )
+        .route(
+            "/api/templates/{*path}",
+            axum::routing::any(proxy::proxy_templates),
+        )
+        .route("/api/auth/{*path}", axum::routing::any(proxy::proxy_auth))
+        .route("/api/keys/{*path}", axum::routing::any(proxy::proxy_keys))
+        .route(
+            "/api/gateway/{*path}",
+            axum::routing::any(proxy::proxy_gateway),
+        )
+        .route("/api/dashboard/settings", get(dashboard_get_settings))
+        .route_layer(middleware::from_fn_with_state(
+            api_limit,
+            rate_limit::enforce,
+        ));
+
+    let fanout = Router::new()
+        .route("/api/health", get(proxy::health_aggregate))
+        .route_layer(middleware::from_fn_with_state(
+            fanout_limit,
+            rate_limit::enforce,
+        ));
+
+    Router::new()
+        .merge(api)
+        .merge(fanout)
+        // Health endpoint for the dashboard itself
+        .route("/healthz", get(healthz))
+        // SPA: serve embedded static files, fallback to index.html
+        .fallback(get(serve_spa))
+        .layer(CompressionLayer::new())
+        .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MiB; proxy_to enforces the same cap
+        .with_state(state)
 }
 
 async fn dashboard_get_settings(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {

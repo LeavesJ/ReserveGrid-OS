@@ -820,12 +820,54 @@ Run through this checklist before exposing any service to the internet.
 
 ---
 
+## Dashboard request limits
+
+rg-dashboard limits each client, over a sliding 60 s window:
+
+| Routes | Per client per minute | Setting |
+|---|---|---|
+| `/api/*` except `/api/health` | 600 | `[rate_limit] api_per_minute` |
+| `GET /api/health` (fans out to every service) | 120 | fixed |
+| `/healthz`, the SPA and its assets | not limited | |
+
+One open dashboard tab polls about 84 `/api` calls a minute, so the default
+covers about seven tabs from one address. A refused call gets HTTP 429,
+`Retry-After`, and `{"reason_code":"rate_limited",...}`. The SPA's pollers
+keep the last data they received when a call fails, so a 429 leaves the view
+as it was until a later poll succeeds.
+
+IPv6 clients are counted per /64. With no further setting the client is the
+TCP peer. That is right when the dashboard is reached directly, including
+through Docker's published port. **Behind a reverse proxy every operator
+arrives from the proxy's address and shares one budget**, so name the proxy
+and the header it sets:
+
+```toml
+[rate_limit]
+trusted_proxies  = ["127.0.0.1"]        # exact addresses, no CIDR
+client_ip_header = "cf-connecting-ip"   # cloudflared; "x-forwarded-for" for nginx or Caddy
+```
+
+The header is read only on requests whose TCP peer is in `trusted_proxies`.
+For `x-forwarded-for` the list is read from the right, skipping trusted
+addresses, so a value the client wrote itself is never used. A missing or
+unreadable header falls back to the peer. Setting one of the two keys
+without the other refuses to start. In compose, the proxy's address is the
+bridge gateway or the proxy container's address, so pin it with a static
+`ipv4_address`.
+
+The same client address is what the dashboard forwards to rg-auth as
+`x-forwarded-for` on `/api/auth/*` and `/api/keys/*`. With no trust
+configured that is the TCP peer, as before.
+
+---
+
 ## Port Reference
 
 | Port | Service | Protocol | Exposure |
 |---|---|---|---|
 | 3333 | sv2-gateway | TCP (Noise NX) | Public (miners) |
-| 8084 | rg-dashboard | HTTP | Public (operators), put behind HTTPS reverse proxy |
+| 8084 | rg-dashboard | HTTP | Public (operators), put behind HTTPS reverse proxy; `/api/*` limited per client, see [Dashboard request limits](#dashboard-request-limits) |
 | 8080 | sv2-gateway health/metrics | HTTP | Internal only |
 | 8081 | pool-verifier HTTP API | HTTP | Internal only |
 | 8082 | template-manager HTTP API | HTTP | Internal only |

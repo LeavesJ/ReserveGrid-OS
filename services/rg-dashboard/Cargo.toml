@@ -21,6 +21,15 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 rust-embed = { version = "8", features = ["compression"] }
 mime_guess = "2"
 http = "1"
+# The shared per-IP sliding-window limiter (`rate_limit::RateLimiter`), the
+# same one rg-auth uses, plus `ErrorResponse` and `ReasonCode` for the 429
+# body. No `rustls-provider` feature: the limiter needs none, and superscan
+# D13 counts rustls providers per shipped binary, so this edge adds none.
+reservegrid-common = { path = "../reservegrid-common" }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# `ServiceExt::oneshot` drives the router in unit tests without a socket.
+tower = { version = "0.5", features = ["util"] }

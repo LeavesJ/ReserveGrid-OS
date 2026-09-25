@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **rg-dashboard and rg-feed-adapter limit requests per client.** The dashboard allows 600 `/api` calls per client per minute (`[rate_limit] api_per_minute`) and 120 of `/api/health`, which fans out to every service; `/healthz` and the SPA are not limited. Behind a reverse proxy, set `[rate_limit] trusted_proxies` and `client_ip_header`, or every operator shares the proxy's budget (see "Dashboard request limits" in `docs/deployment-runbook.md`). The feed adapter allows 1200 JSON-RPC calls per peer per minute (`[adapter] rate_limit_per_minute`, `VELDRA_ADAPTER_RATE_LIMIT_PER_MINUTE`); `/health` is not limited. Both answer a refused call with 429 and `Retry-After`, and a limit of 0 or a value that does not parse stops startup.
+
 ### Changed
 
 - **Operators: an older gateway config may now refuse to start (PB-53).** A mode that serves miners (inline or observe) requires `channel_target_hex`. Without it every channel ran at difficulty 1, where any current miner exceeds `max_shares_per_second_per_channel` and the excess, block solutions included, was dropped before the proof-of-work check. Vardiff does not avoid this, because it starts from the channel target. A config copied from the old `deploy/gateway-prod.toml` needs `channel_target_hex = "000000000003fffc000000000000000000000000000000000000000000000000"` (difficulty 16,384, as the template now ships). A target that does not parse, or is zero, is refused instead of falling back to difficulty 1. If you followed the old template's advice to enable vardiff instead, also set `vardiff_enabled = false` and `vardiff_min_difficulty = 16384`, as the template now ships: until each share is judged against its own job's target, a vardiff step up rejects honest shares, and the gateway now warns when vardiff is on.
