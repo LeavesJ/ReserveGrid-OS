@@ -812,6 +812,7 @@ Run through this checklist before exposing any service to the internet.
 - [ ] Grafana anonymous access is disabled (`GF_AUTH_ANONYMOUS_ENABLED=false`)
 - [ ] Grafana admin password is changed from the default
 - [ ] Firewall exposes only ports 3333 (miners) and 8084 (dashboard) externally
+- [ ] Behind a reverse proxy, `[rate_limit] trusted_proxies` names only the proxy, and nothing else can reach 8084 from that address (see [Dashboard request limits](#dashboard-request-limits)); no warning about forwarding headers in the dashboard's log
 - [ ] All internal service ports (8080, 8081, 8082, 9090, 3030) are not reachable from the internet
 - [ ] `VELDRA_AUTH_ALLOWED_ORIGIN` is set to the actual frontend URL, not `*`
 - [ ] SMTP is configured for email verification (not printing to stdout)
@@ -832,33 +833,100 @@ rg-dashboard limits each client, over a sliding 60 s window:
 
 One open dashboard tab polls about 84 `/api` calls a minute, so the default
 covers about seven tabs from one address. A refused call gets HTTP 429,
-`Retry-After`, and `{"reason_code":"rate_limited",...}`. The SPA's pollers
-keep the last data they received when a call fails, so a 429 leaves the view
-as it was until a later poll succeeds.
+`Retry-After`, and `{"reason_code":"rate_limited",...}`. The SPA treats a
+429 like any failed call: it keeps the data it last received, but the badge
+turns from LIVE to MOCK and Apply is disabled until a poll succeeds. A
+refused login shows "Login failed (429)".
 
 IPv6 clients are counted per /64. With no further setting the client is the
-TCP peer. That is right when the dashboard is reached directly, including
-through Docker's published port. **Behind a reverse proxy every operator
-arrives from the proxy's address and shares one budget**, so name the proxy
-and the header it sets:
+TCP peer, the address the connection arrived from. Through Docker's
+published port that is the client's own address only for IPv4 connections
+from other hosts, which Docker forwards by NAT. Connections from the host
+itself and IPv6 connections to a bridge network without IPv6 are relayed by
+Docker's userland proxy, and Docker Desktop and rootless Docker's default
+port driver relay everything; all of these arrive from one Docker address,
+usually the bridge gateway, and share its one budget.
+
+### Behind a reverse proxy
+
+**Every request arrives from the proxy's address, so without the settings
+below every operator shares one budget.** One client sending about 10
+requests a second through the proxy takes each slot as it frees, and
+everyone else gets 429 on every `/api` call, `/api/auth/login` included.
+An existing deployment upgrades into this with no config error. Once a
+minute the dashboard logs a warning naming the connecting address when
+requests carried `x-forwarded-for`, `cf-connecting-ip` or `forwarded` but
+were counted against that address. That line is also the quickest way to
+learn which address the proxy's connections arrive from.
+
+Name the proxy and the header it sets, in the file `VELDRA_DASHBOARD_CONFIG`
+names (`dev/dashboard.toml` in the shipped compose files):
 
 ```toml
 [rate_limit]
-trusted_proxies  = ["127.0.0.1"]        # exact addresses, no CIDR
-client_ip_header = "cf-connecting-ip"   # cloudflared; "x-forwarded-for" for nginx or Caddy
+trusted_proxies  = ["172.30.0.10"]      # exact addresses, no CIDR
+client_ip_header = "x-forwarded-for"    # or "cf-connecting-ip", see below
 ```
 
-The header is read only on requests whose TCP peer is in `trusted_proxies`.
-For `x-forwarded-for` the list is read from the right, skipping trusted
-addresses, so a value the client wrote itself is never used. A missing or
-unreadable header falls back to the peer. Setting one of the two keys
-without the other refuses to start. In compose, the proxy's address is the
-bridge gateway or the proxy container's address, so pin it with a static
-`ipv4_address`.
+A trusted address can name any client it likes, both to the dashboard's
+limiter and in the `x-forwarded-for` the dashboard sends rg-auth on
+`/api/auth/*` and `/api/keys/*`, where rg-auth keys its per-address limits,
+10 login attempts a minute among them. **Trust an address only if nothing
+but the proxy can reach the dashboard from it.** Two setups meet that:
 
-The same client address is what the dashboard forwards to rg-auth as
-`x-forwarded-for` on `/api/auth/*` and `/api/keys/*`. With no trust
-configured that is the TCP peer, as before.
+1. The proxy runs as a compose service on its own network with a fixed
+   subnet and a pinned `ipv4_address`, and 8084 is not published. Trust
+   that address. This is the better one. As an override file beside the
+   stack (`docker compose -f docker-compose.yml -f docker-compose.proxy.yml
+   up -d`; `!reset` needs Compose 2.24 or later):
+
+   ```yaml
+   networks:
+     edge:
+       ipam:
+         config:
+           - subnet: 172.30.0.0/24
+   services:
+     rg-dashboard:
+       ports: !reset []
+       networks: [default, edge]
+     proxy:
+       image: caddy:2            # or nginx, or cloudflared
+       networks:
+         edge:
+           ipv4_address: 172.30.0.10
+       ports: ["443:443"]
+   ```
+
+2. The proxy runs on the host and 8084 is published on loopback only,
+   `"127.0.0.1:8084:8084"` in place of `"8084:8084"`, as
+   `docker-compose.auth.yml` does for rg-auth. The proxy's connections then
+   arrive from the bridge gateway (`docker network inspect <project>_default
+   --format '{{(index .IPAM.Config 0).Gateway}}'`, or read it from the
+   warning above). Trust the gateway in this setup only, and only on a host
+   that runs nothing untrusted, since every process on the host reaches the
+   dashboard from the same address.
+
+**Never trust the bridge gateway while 8084 is published on every
+interface**, as the shipped compose files publish it (`"8084:8084"`). The
+connections Docker relays, listed above, come from the gateway too, and any
+of those clients could then choose its own dashboard budget and its own
+rg-auth login budget.
+
+For `x-forwarded-for` the list is read from the right, skipping trusted
+addresses, so a value the client wrote itself is never used; nginx
+(`$proxy_add_x_forwarded_for`) and Caddy put the address they saw last. Use
+`cf-connecting-ip` only when cloudflared is the only client at the trusted
+address. Cloudflare's edge sets that header, but nginx and Caddy pass on a
+`Cf-Connecting-Ip` the client wrote. The header is read only on requests
+whose TCP peer is in `trusted_proxies`. A missing or unreadable header falls
+back to the peer. Setting one of the two keys without the other refuses to
+start.
+
+With no trust configured, the address the dashboard forwards to rg-auth is
+the TCP peer, as before. `VELDRA_AUTH_RATE_GLOBAL_CEILING` (Step 1) caps
+rg-auth's requests from all addresses together; the shipped compose files
+leave it unset.
 
 ---
 
