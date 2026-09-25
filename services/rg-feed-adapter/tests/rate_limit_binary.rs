@@ -74,17 +74,23 @@ impl AdapterProcess {
             .env_remove("VELDRA_ALLOW_NON_LOOPBACK")
             .env("VELDRA_LOG_FILTER", "warn")
             .current_dir(&scratch.path)
-            .stdout(Stdio::null())
+            // Both piped: tracing writes to stdout, panics to stderr.
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn rg-feed-adapter");
         Self { child }
     }
 
-    fn kill_and_drain_stderr(&mut self) -> String {
+    /// Stop the adapter and return what it wrote, stdout (its log) then
+    /// stderr.
+    fn kill_and_drain_output(&mut self) -> String {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let mut buf = String::new();
+        if let Some(mut out) = self.child.stdout.take() {
+            let _ = out.read_to_string(&mut buf);
+        }
         if let Some(mut err) = self.child.stderr.take() {
             let _ = err.read_to_string(&mut buf);
         }
@@ -168,14 +174,14 @@ async fn fourth_rpc_call_from_one_peer_is_refused_by_the_real_binary() {
         }
         if let Ok(Some(status)) = adapter.child.try_wait() {
             panic!(
-                "rg-feed-adapter exited during boot with {status}; stderr:\n{}",
-                adapter.kill_and_drain_stderr()
+                "rg-feed-adapter exited during boot with {status}; output:\n{}",
+                adapter.kill_and_drain_output()
             );
         }
         assert!(
             started.elapsed() < DEADLINE,
-            "rg-feed-adapter did not answer /health within {DEADLINE:?}; stderr:\n{}",
-            adapter.kill_and_drain_stderr()
+            "rg-feed-adapter did not answer /health within {DEADLINE:?}; output:\n{}",
+            adapter.kill_and_drain_output()
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -225,8 +231,8 @@ async fn unusable_limit_values_stop_the_process() {
                 let health = get_health(port).await.map(|(s, _, _)| s).ok();
                 panic!(
                     "{ENV_LIMIT}={bad:?} should stop the adapter, but it was still running \
-                     after {DEADLINE:?}; /health answered {health:?}; stderr:\n{}",
-                    adapter.kill_and_drain_stderr()
+                     after {DEADLINE:?}; /health answered {health:?}; output:\n{}",
+                    adapter.kill_and_drain_output()
                 );
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -234,6 +240,18 @@ async fn unusable_limit_values_stop_the_process() {
         assert!(
             !status.success(),
             "{ENV_LIMIT}={bad:?} exited with {status}, expected a failure"
+        );
+        // For the reason the test names, not any startup failure such as
+        // a port already in use.
+        let output = adapter.kill_and_drain_output();
+        let why = if bad == "0" {
+            "rate_limit_per_minute must be at least 1".to_owned()
+        } else {
+            format!("{ENV_LIMIT}={bad:?} is not a whole number")
+        };
+        assert!(
+            output.contains(&why),
+            "{ENV_LIMIT}={bad:?} should stop the adapter with {why:?}; output:\n{output}"
         );
     }
 }
