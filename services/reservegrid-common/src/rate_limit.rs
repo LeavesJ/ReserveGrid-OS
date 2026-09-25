@@ -5,6 +5,7 @@
 //! - Fail closed on mutex poison
 //! - Bounded IP tracking with LRU eviction
 //! - Optional global aggregate ceiling across all IPs
+//! - `admit` reports how long until a denied caller would be admitted
 
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
@@ -76,19 +77,42 @@ impl RateLimiter {
     /// Uses a sliding window: counts requests within the last 60 seconds.
     /// Returns `false` (deny) if the per-IP limit or global ceiling is
     /// exceeded, or if the internal lock is poisoned (fail closed).
+    ///
+    /// This is [`admit`](Self::admit) without the wait. A one-line adapter
+    /// would normally go, and this one stays on purpose: rg-auth calls it at
+    /// eight sites, and rewriting those means editing rg-auth, a T2 surface,
+    /// for no change in behaviour. `admit` exists because the rg-dashboard
+    /// and rg-feed-adapter middlewares need the wait for `Retry-After`.
     pub fn check(&self, ip: IpAddr, max_per_window: u32) -> bool {
+        self.admit(ip, max_per_window).is_ok()
+    }
+
+    /// Admits a request from `ip`, or says how long until one would be
+    /// admitted, so a caller can send `Retry-After`.
+    ///
+    /// `Err(wait)` always has `0 < wait <= window`. On a per-IP denial the
+    /// wait runs until that IP's oldest request in the window turns one
+    /// window old; on a global-ceiling denial, until the oldest request
+    /// across all IPs does. A denial records nothing. A poisoned lock is
+    /// `Err(window)`: fail closed, and send the client away for a full
+    /// window.
+    pub fn admit(&self, ip: IpAddr, max_per_window: u32) -> Result<(), Duration> {
         let now = Instant::now();
 
         let Ok(mut state) = self.state.lock() else {
             warn!("rate limiter mutex poisoned, failing closed");
-            return false;
+            return Err(self.window);
         };
 
         // Prune and check global ceiling.
         if let Some(ceiling) = self.global_ceiling {
             Self::prune_window(&mut state.global_timestamps, now, self.window);
             if state.global_timestamps.len() >= ceiling as usize {
-                return false;
+                return Err(Self::until_front_expires(
+                    &state.global_timestamps,
+                    now,
+                    self.window,
+                ));
             }
         }
 
@@ -102,7 +126,11 @@ impl RateLimiter {
 
         // Check per-IP limit.
         if ip_window.timestamps.len() >= max_per_window as usize {
-            return false;
+            return Err(Self::until_front_expires(
+                &ip_window.timestamps,
+                now,
+                self.window,
+            ));
         }
 
         // Record the request.
@@ -116,7 +144,7 @@ impl RateLimiter {
             Self::evict_oldest(&mut state.ips);
         }
 
-        true
+        Ok(())
     }
 
     /// Removes entries whose most recent request is older than two windows.
@@ -149,6 +177,15 @@ impl RateLimiter {
                 break;
             }
         }
+    }
+
+    /// How long until the oldest entry of a pruned window leaves it. After
+    /// `prune_window` every entry is younger than `window`, so this is never
+    /// zero. An empty window (a limit of 0) waits a full window.
+    fn until_front_expires(deque: &VecDeque<Instant>, now: Instant, window: Duration) -> Duration {
+        deque.front().map_or(window, |front| {
+            window.saturating_sub(now.duration_since(*front))
+        })
     }
 
     /// Evicts the IP with the oldest most-recent timestamp.
@@ -354,5 +391,102 @@ mod tests {
 
         // The 6th request must be denied even though no time has passed.
         assert!(!limiter.check(ip, max));
+    }
+
+    #[test]
+    fn admit_ok_until_limit_then_err_with_wait_in_window() {
+        let limiter = RateLimiter::new();
+        let ip: IpAddr = Ipv4Addr::new(198, 51, 100, 1).into();
+
+        for _ in 0..3 {
+            assert_eq!(limiter.admit(ip, 3), Ok(()));
+        }
+        let wait = limiter.admit(ip, 3).unwrap_err();
+        assert!(wait > Duration::ZERO, "wait {wait:?} must be positive");
+        assert!(
+            wait <= Duration::from_secs(60),
+            "wait {wait:?} exceeds the window"
+        );
+    }
+
+    #[test]
+    fn admit_wait_shrinks_as_oldest_ages() {
+        let limiter = RateLimiter::new();
+        let ip: IpAddr = Ipv4Addr::new(198, 51, 100, 2).into();
+
+        for _ in 0..3 {
+            assert_eq!(limiter.admit(ip, 3), Ok(()));
+        }
+        // The oldest request is now 50 s old, so a slot frees in at most 10 s.
+        {
+            let mut state = limiter.state.lock().unwrap();
+            let w = state.ips.get_mut(&ip).unwrap();
+            *w.timestamps.front_mut().unwrap() =
+                Instant::now().checked_sub(Duration::from_secs(50)).unwrap();
+        }
+        let wait = limiter.admit(ip, 3).unwrap_err();
+        assert!(wait > Duration::ZERO, "wait {wait:?} must be positive");
+        assert!(
+            wait <= Duration::from_secs(10),
+            "wait {wait:?} should run only until the 50 s old request expires"
+        );
+    }
+
+    #[test]
+    fn admit_denial_records_nothing() {
+        let limiter = RateLimiter::new();
+        let ip: IpAddr = Ipv4Addr::new(198, 51, 100, 3).into();
+
+        assert_eq!(limiter.admit(ip, 1), Ok(()));
+        for _ in 0..5 {
+            assert!(limiter.admit(ip, 1).is_err());
+        }
+        let state = limiter.state.lock().unwrap();
+        assert_eq!(state.ips[&ip].timestamps.len(), 1);
+    }
+
+    #[test]
+    fn admit_poisoned_is_err_full_window() {
+        let limiter = RateLimiter::new();
+        let ip: IpAddr = Ipv4Addr::LOCALHOST.into();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = limiter.state.lock().unwrap();
+            panic!("intentional poison");
+        }));
+        assert!(result.is_err());
+
+        assert_eq!(limiter.admit(ip, 100), Err(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn admit_global_ceiling_reports_global_wait() {
+        let limiter = RateLimiter::with_config(10_000, Some(2));
+        let ip1: IpAddr = Ipv4Addr::new(10, 0, 0, 1).into();
+        let ip2: IpAddr = Ipv4Addr::new(10, 0, 0, 2).into();
+        let ip3: IpAddr = Ipv4Addr::new(10, 0, 0, 3).into();
+
+        assert_eq!(limiter.admit(ip1, 10), Ok(()));
+        assert_eq!(limiter.admit(ip2, 10), Ok(()));
+        // ip3 has sent nothing, so only the global ceiling can refuse it.
+        {
+            let mut state = limiter.state.lock().unwrap();
+            *state.global_timestamps.front_mut().unwrap() =
+                Instant::now().checked_sub(Duration::from_secs(55)).unwrap();
+        }
+        let wait = limiter.admit(ip3, 10).unwrap_err();
+        assert!(wait > Duration::ZERO, "wait {wait:?} must be positive");
+        assert!(
+            wait <= Duration::from_secs(5),
+            "wait {wait:?} should follow the oldest request across all IPs"
+        );
+    }
+
+    #[test]
+    fn admit_zero_limit_waits_a_full_window() {
+        let limiter = RateLimiter::new();
+        let ip: IpAddr = Ipv4Addr::new(198, 51, 100, 4).into();
+
+        assert_eq!(limiter.admit(ip, 0), Err(Duration::from_secs(60)));
     }
 }
