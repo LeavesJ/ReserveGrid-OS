@@ -526,6 +526,45 @@ pub fn load_authority_credentials(
 mod tests {
     use super::*;
 
+    /// Scratch directory this test alone owns, torn down on `Drop`.
+    ///
+    /// `$TMPDIR` is shared across every worktree and every concurrent cargo
+    /// run. These tests used fixed directory and file names, so a second run
+    /// could rewrite a key file between the write here and the read under
+    /// test. pid plus nanoseconds plus a per test tag is the same shape as
+    /// `ScratchDir` in the integration tests, and it makes the whole tree
+    /// safe to remove. Teardown belongs in `Drop` rather than a trailing
+    /// statement because a panicking test unwinds past the statement, and
+    /// with unique names that leaks a fresh directory on every failing run
+    /// instead of reusing one.
+    struct ScratchDir {
+        path: std::path::PathBuf,
+    }
+
+    impl ScratchDir {
+        fn new(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let pid = std::process::id();
+            let path = std::env::temp_dir().join(format!("rg-gateway-keys-{tag}-{pid}-{nanos}"));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("create scratch dir");
+            Self { path }
+        }
+
+        fn join(&self, leaf: &str) -> std::path::PathBuf {
+            self.path.join(leaf)
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
     #[test]
     fn sv2_frame_header_round_trip() {
         let header = Sv2FrameHeader {
@@ -699,16 +738,13 @@ mod tests {
         let pubkey_hex = hex::encode(xonly.serialize());
 
         // Write secret key to a temp file.
-        let dir = std::env::temp_dir().join("rg_test_keys");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = ScratchDir::new("valid");
         let sk_path = dir.join("test_authority.key");
         std::fs::write(&sk_path, kp.secret_key().secret_bytes()).unwrap();
 
         let creds = load_authority_credentials(&sk_path, &pubkey_hex, 3600).unwrap();
         assert_eq!(creds.keypair.x_only_public_key().0, xonly);
         assert_eq!(creds.cert_validity_secs, 3600);
-
-        let _ = std::fs::remove_file(&sk_path);
     }
 
     #[test]
@@ -723,8 +759,7 @@ mod tests {
 
     #[test]
     fn load_credentials_wrong_length() {
-        let dir = std::env::temp_dir().join("rg_test_keys");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = ScratchDir::new("short");
         let sk_path = dir.join("test_short.key");
         std::fs::write(&sk_path, [0u8; 16]).unwrap();
 
@@ -733,8 +768,6 @@ mod tests {
             result,
             Err(KeyLoadError::InvalidSecretKeyLength(16))
         ));
-
-        let _ = std::fs::remove_file(&sk_path);
     }
 
     #[test]
@@ -742,8 +775,7 @@ mod tests {
         let secp = secp256k1::Secp256k1::new();
         let kp = Keypair::new(&secp, &mut rand::thread_rng());
 
-        let dir = std::env::temp_dir().join("rg_test_keys");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = ScratchDir::new("mismatch");
         let sk_path = dir.join("test_mismatch.key");
         std::fs::write(&sk_path, kp.secret_key().secret_bytes()).unwrap();
 
@@ -754,8 +786,6 @@ mod tests {
 
         let result = load_authority_credentials(&sk_path, &wrong_hex, 3600);
         assert!(matches!(result, Err(KeyLoadError::PubkeyMismatch { .. })));
-
-        let _ = std::fs::remove_file(&sk_path);
     }
 
     #[test]
@@ -763,8 +793,7 @@ mod tests {
         let secp = secp256k1::Secp256k1::new();
         let kp = Keypair::new(&secp, &mut rand::thread_rng());
 
-        let dir = std::env::temp_dir().join("rg_test_keys");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = ScratchDir::new("badhex");
         let sk_path = dir.join("test_badhex.key");
         std::fs::write(&sk_path, kp.secret_key().secret_bytes()).unwrap();
 
@@ -775,8 +804,6 @@ mod tests {
         // Not hex.
         let result = load_authority_credentials(&sk_path, &"zz".repeat(32), 3600);
         assert!(matches!(result, Err(KeyLoadError::InvalidPubkeyHex(_))));
-
-        let _ = std::fs::remove_file(&sk_path);
     }
 
     /// PB-48: an accepted miner socket carries keepalive, and on Linux a user

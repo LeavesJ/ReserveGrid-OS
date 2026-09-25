@@ -2834,6 +2834,45 @@ fn init_tracing() {
 mod key_reload_tests {
     use super::*;
 
+    /// Scratch directory this test alone owns, torn down on `Drop`.
+    ///
+    /// `$TMPDIR` is shared across every worktree and every concurrent cargo
+    /// run. These tests used fixed directory and file names, so a second run
+    /// could rewrite a key file between the write here and the read under
+    /// test. pid plus nanoseconds plus a per test tag is the same shape as
+    /// `ScratchDir` in the integration tests, and it makes the whole tree
+    /// safe to remove. Teardown belongs in `Drop` rather than a trailing
+    /// statement because a panicking test unwinds past the statement, and
+    /// with unique names that leaks a fresh directory on every failing run
+    /// instead of reusing one.
+    struct ScratchDir {
+        path: std::path::PathBuf,
+    }
+
+    impl ScratchDir {
+        fn new(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let pid = std::process::id();
+            let path = std::env::temp_dir().join(format!("rg-gateway-keys-{tag}-{pid}-{nanos}"));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("create scratch dir");
+            Self { path }
+        }
+
+        fn join(&self, leaf: &str) -> std::path::PathBuf {
+            self.path.join(leaf)
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
     /// Helper: generate a secp256k1 keypair and write the 32-byte secret key
     /// to `path`. Returns the x-only public key as 64-char hex.
     fn write_test_keypair(path: &std::path::Path) -> String {
@@ -2852,12 +2891,10 @@ mod key_reload_tests {
 
     #[test]
     fn file_mtime_existing_returns_some() {
-        let dir = std::env::temp_dir().join("rg_mtime_test");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = ScratchDir::new("mtime");
         let path = dir.join("test.key");
         std::fs::write(&path, b"x").unwrap();
         assert!(file_mtime(path.to_str().unwrap()).is_some());
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -2868,8 +2905,7 @@ mod key_reload_tests {
 
     #[tokio::test]
     async fn watch_channel_delivers_rotated_credentials() {
-        let dir = std::env::temp_dir().join("rg_key_rotate_test");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = ScratchDir::new("key-rotate");
         let path = dir.join("noise.key");
 
         // Write initial keypair.
@@ -2890,14 +2926,11 @@ mod key_reload_tests {
         // Reader sees the new credentials.
         let latest = rx.borrow().clone();
         assert_ne!(latest.keypair.secret_bytes(), initial_kp_bytes);
-
-        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
     async fn reload_task_file_poll_rotates_on_mtime_change() {
-        let dir = std::env::temp_dir().join("rg_key_poll_test");
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = ScratchDir::new("key-poll");
         let path = dir.join("noise.key");
 
         let pubkey_hex = write_test_keypair(&path);
@@ -2958,7 +2991,6 @@ mod key_reload_tests {
         // Shutdown.
         let _ = shutdown_tx.send(true);
         let _ = handle.await;
-        let _ = std::fs::remove_file(&path);
         // Suppress unused variable warning.
         let _ = new_pubkey_hex;
     }

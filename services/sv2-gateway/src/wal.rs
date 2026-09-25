@@ -641,42 +641,66 @@ impl ShareWal {
 mod tests {
     use super::*;
 
-    fn temp_wal_path(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join("rg_wal_tests");
-        let _ = std::fs::create_dir_all(&dir);
-        dir.join(format!("{name}.ndjson"))
+    /// Scratch WAL file inside a directory this test alone owns, torn down
+    /// on `Drop`.
+    ///
+    /// `$TMPDIR` is shared across every worktree and every concurrent cargo
+    /// run, so a fixed directory name lets one run's teardown delete a file
+    /// another run is mid write in. pid plus nanoseconds is the same shape
+    /// as `ScratchDir` in the integration tests, and the directory is fresh,
+    /// so callers do not pre-clean it. Teardown belongs in `Drop` rather than
+    /// a trailing statement because a panicking test unwinds past the
+    /// statement, and with unique names that leaks a fresh directory on every
+    /// failing run instead of reusing one. `Drop` also covers the `.wal.tmp`
+    /// compaction file without naming it.
+    struct WalScratch {
+        dir: PathBuf,
+        path: PathBuf,
     }
 
-    fn cleanup(path: &Path) {
-        let _ = std::fs::remove_file(path);
-        let _ = std::fs::remove_file(path.with_extension("wal.tmp"));
+    impl WalScratch {
+        fn new(name: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let pid = std::process::id();
+            let dir = std::env::temp_dir().join(format!("rg-wal-{name}-{pid}-{nanos}"));
+            std::fs::create_dir_all(&dir).expect("create scratch dir");
+            let path = dir.join(format!("{name}.ndjson"));
+            Self { dir, path }
+        }
+    }
+
+    impl Drop for WalScratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 
     #[test]
     fn empty_wal_opens_clean() {
-        let path = temp_wal_path("empty_open");
-        cleanup(&path);
+        let scratch = WalScratch::new("empty_open");
+        let path = scratch.path.clone();
         let wal = ShareWal::open(&path, 100).unwrap();
         assert_eq!(wal.pending_count(), 0);
-        cleanup(&path);
     }
 
     #[test]
     fn mark_pending_then_completed() {
-        let path = temp_wal_path("pending_completed");
-        cleanup(&path);
+        let scratch = WalScratch::new("pending_completed");
+        let path = scratch.path.clone();
         let mut wal = ShareWal::open(&path, 100).unwrap();
         wal.mark_pending(&[("aaa", "bbb")]).unwrap();
         assert_eq!(wal.pending_count(), 1);
         wal.mark_completed(&[("aaa", "bbb")]).unwrap();
         assert_eq!(wal.pending_count(), 0);
-        cleanup(&path);
     }
 
     #[test]
     fn recovery_emits_synthetic_events() {
-        let path = temp_wal_path("recovery");
-        cleanup(&path);
+        let scratch = WalScratch::new("recovery");
+        let path = scratch.path.clone();
 
         // Phase 1: write pending entries and drop (simulate crash).
         {
@@ -703,13 +727,12 @@ mod tests {
 
         // After recovery, pending is empty.
         assert_eq!(wal.pending_count(), 0);
-        cleanup(&path);
     }
 
     #[test]
     fn compaction_rewrites_only_pending() {
-        let path = temp_wal_path("compaction");
-        cleanup(&path);
+        let scratch = WalScratch::new("compaction");
+        let path = scratch.path.clone();
 
         let mut wal = ShareWal::open(&path, 2).unwrap(); // threshold = 2
         wal.mark_pending(&[("s1", "e1")]).unwrap();
@@ -725,26 +748,24 @@ mod tests {
         drop(wal);
         let wal2 = ShareWal::open(&path, 100).unwrap();
         assert_eq!(wal2.pending_count(), 1);
-        cleanup(&path);
     }
 
     #[test]
     fn duplicate_completion_is_harmless() {
-        let path = temp_wal_path("dup_complete");
-        cleanup(&path);
+        let scratch = WalScratch::new("dup_complete");
+        let path = scratch.path.clone();
         let mut wal = ShareWal::open(&path, 100).unwrap();
         wal.mark_pending(&[("s1", "e1")]).unwrap();
         wal.mark_completed(&[("s1", "e1")]).unwrap();
         // Second completion should be a no-op.
         wal.mark_completed(&[("s1", "e1")]).unwrap();
         assert_eq!(wal.pending_count(), 0);
-        cleanup(&path);
     }
 
     #[test]
     fn malformed_lines_skipped() {
-        let path = temp_wal_path("malformed");
-        cleanup(&path);
+        let scratch = WalScratch::new("malformed");
+        let path = scratch.path.clone();
 
         // Write a valid pending entry followed by garbage.
         {
@@ -763,13 +784,12 @@ mod tests {
 
         let wal = ShareWal::open(&path, 100).unwrap();
         assert_eq!(wal.pending_count(), 1);
-        cleanup(&path);
     }
 
     #[test]
     fn recovery_with_no_orphans_is_noop() {
-        let path = temp_wal_path("no_orphans");
-        cleanup(&path);
+        let scratch = WalScratch::new("no_orphans");
+        let path = scratch.path.clone();
 
         {
             let mut wal = ShareWal::open(&path, 100).unwrap();
@@ -781,7 +801,6 @@ mod tests {
         assert_eq!(wal.pending_count(), 0);
         let recovery = wal.recover();
         assert!(recovery.synthetic_events.is_empty());
-        cleanup(&path);
     }
 
     // ── PB-39: the durability the module claims must be observable ──
@@ -809,8 +828,8 @@ mod tests {
 
     #[test]
     fn mark_pending_is_on_disk_before_it_returns() {
-        let path = temp_wal_path("pb39_pending_visible");
-        cleanup(&path);
+        let scratch = WalScratch::new("pb39_pending_visible");
+        let path = scratch.path.clone();
         {
             let mut wal = ShareWal::open(&path, 1000).unwrap();
             wal.mark_pending(&[("aa".repeat(32).as_str(), "bb".repeat(32).as_str())])
@@ -828,13 +847,12 @@ mod tests {
                  recoverable; it is not. File held: {contents:?}"
             );
         }
-        cleanup(&path);
     }
 
     #[test]
     fn compaction_result_is_on_disk_before_it_returns() {
-        let path = temp_wal_path("pb39_compaction_visible");
-        cleanup(&path);
+        let scratch = WalScratch::new("pb39_compaction_visible");
+        let path = scratch.path.clone();
         {
             let mut wal = ShareWal::open(&path, 2).unwrap();
             wal.mark_pending(&[("11".repeat(32).as_str(), "aa".repeat(32).as_str())])
@@ -858,7 +876,6 @@ mod tests {
                 "both shares completed, so nothing should be pending"
             );
         }
-        cleanup(&path);
     }
 
     /// Re-measure the durability cost wherever this is run. Ignored by
@@ -871,8 +888,8 @@ mod tests {
     #[test]
     #[ignore = "a measurement, not an assertion: fdatasync is a no-op on tmpfs"]
     fn bench_append_cost_on_this_filesystem() {
-        let path = temp_wal_path("pb39_bench");
-        cleanup(&path);
+        let scratch = WalScratch::new("pb39_bench");
+        let path = scratch.path.clone();
         let n = 2000;
         let mut wal = ShareWal::open(&path, usize::MAX).unwrap();
         let start = std::time::Instant::now();
@@ -895,8 +912,8 @@ mod tests {
             .map(|i| (format!("{i:064x}"), format!("{:064x}", i * 7)))
             .collect();
         for per_sync in [64usize, 1024] {
-            let batched_path = temp_wal_path("pb44_bench");
-            cleanup(&batched_path);
+            let batched_scratch = WalScratch::new("pb44_bench");
+            let batched_path = batched_scratch.path.clone();
             let mut batched_wal = ShareWal::open(&batched_path, usize::MAX).unwrap();
             let start = std::time::Instant::now();
             for chunk in ids.chunks(per_sync) {
@@ -910,15 +927,13 @@ mod tests {
                  {batched_per_sec:.0}/s, {:.1}x the per-record rate above.",
                 batched_per_sec / per_sec
             );
-            cleanup(&batched_path);
         }
-        cleanup(&path);
     }
 
     #[test]
     fn multiple_crash_cycles() {
-        let path = temp_wal_path("multi_crash");
-        cleanup(&path);
+        let scratch = WalScratch::new("multi_crash");
+        let path = scratch.path.clone();
 
         // Crash 1: leave s1 pending.
         {
@@ -949,8 +964,6 @@ mod tests {
             assert_eq!(r.synthetic_events.len(), 1);
             assert_eq!(r.synthetic_events[0].share_id_hex, "s2");
         }
-
-        cleanup(&path);
     }
 
     /// When the underlying writer returns an I/O error, `mark_pending` and
@@ -978,8 +991,8 @@ mod tests {
         // Hand-construct a WAL pointed at a throwaway tmp path but with the
         // writer replaced by /dev/full. open() itself can't fail here because
         // the path is writable; we only substitute the append handle.
-        let path = temp_wal_path("dev_full");
-        cleanup(&path);
+        let scratch = WalScratch::new("dev_full");
+        let path = scratch.path.clone();
         let mut wal = ShareWal {
             path: path.clone(),
             pending: HashMap::new(),
@@ -1008,7 +1021,6 @@ mod tests {
         );
         // In-memory pending must NOT have been updated on failure.
         assert_eq!(wal.pending_count(), 0);
-        cleanup(&path);
     }
 
     /// ENOSPC on Linux. Hardcoded rather than pulling in libc for one constant.
@@ -1019,8 +1031,8 @@ mod tests {
 
     #[test]
     fn a_batch_costs_one_sync() {
-        let path = temp_wal_path("pb44_one_sync");
-        cleanup(&path);
+        let scratch = WalScratch::new("pb44_one_sync");
+        let path = scratch.path.clone();
         let mut wal = ShareWal::open(&path, usize::MAX).unwrap();
         let ids: Vec<(String, String)> = (0..64)
             .map(|i| (format!("{i:064x}"), format!("{:064x}", i + 1000)))
@@ -1034,13 +1046,12 @@ mod tests {
         wal.mark_completed(&ids).unwrap();
         assert_eq!(wal.syncs, 2, "64 completions must cost exactly one more");
         assert_eq!(wal.pending_count(), 0);
-        cleanup(&path);
     }
 
     #[test]
     fn a_whole_batch_is_on_disk_before_it_returns() {
-        let path = temp_wal_path("pb44_batch_visible");
-        cleanup(&path);
+        let scratch = WalScratch::new("pb44_batch_visible");
+        let path = scratch.path.clone();
         let ids: Vec<(String, String)> = (0..3)
             .map(|i| (format!("{i:064x}"), format!("{:064x}", i + 7)))
             .collect();
@@ -1067,7 +1078,6 @@ mod tests {
             3,
             "replay reads every record back"
         );
-        cleanup(&path);
     }
 
     #[test]
@@ -1102,8 +1112,8 @@ mod tests {
 
     #[test]
     fn a_completion_that_arrives_first_leaves_nothing_pending() {
-        let path = temp_wal_path("pb47_reversed");
-        cleanup(&path);
+        let scratch = WalScratch::new("pb47_reversed");
+        let path = scratch.path.clone();
         {
             let mut wal = ShareWal::open(&path, 1000).unwrap();
             wal.mark_completed(&[("aa", "bb")]).unwrap();
@@ -1124,13 +1134,12 @@ mod tests {
             0,
             "PB-47: no crash orphan, so no second forward result on restart"
         );
-        cleanup(&path);
     }
 
     #[test]
     fn a_completion_that_arrives_first_stays_neutralised_across_compaction() {
-        let path = temp_wal_path("pb47_compacted");
-        cleanup(&path);
+        let scratch = WalScratch::new("pb47_compacted");
+        let path = scratch.path.clone();
         {
             let mut wal = ShareWal::open(&path, 2).unwrap();
             wal.mark_completed(&[("aa", "bb")]).unwrap();
@@ -1146,14 +1155,13 @@ mod tests {
         }
         let mut reopened = ShareWal::open(&path, 1000).unwrap();
         assert_eq!(reopened.recover().synthetic_events.len(), 0);
-        cleanup(&path);
     }
 
     #[test]
     fn replay_ignores_a_pending_record_whose_completion_came_first() {
         // A WAL written before PB-47 can hold the two records in this order.
-        let path = temp_wal_path("pb47_legacy_order");
-        cleanup(&path);
+        let scratch = WalScratch::new("pb47_legacy_order");
+        let path = scratch.path.clone();
         let completed =
             r#"{"status":"completed","share_id_hex":"aa","event_id_hex":"bb","timestamp_ms":1}"#;
         let pending =
@@ -1165,13 +1173,12 @@ mod tests {
             0,
             "PB-47: replay must not depend on which record comes first"
         );
-        cleanup(&path);
     }
 
     #[test]
     fn an_early_completion_is_forgotten_once_its_pending_cannot_be_coming() {
-        let path = temp_wal_path("pb47_ttl");
-        cleanup(&path);
+        let scratch = WalScratch::new("pb47_ttl");
+        let path = scratch.path.clone();
         let mut wal = ShareWal::open(&path, 1000).unwrap();
         wal.mark_completed(&[("aa", "bb")]).unwrap();
         assert_eq!(
@@ -1189,7 +1196,6 @@ mod tests {
             wal.completed_early.is_empty(),
             "past the TTL it is forgotten"
         );
-        cleanup(&path);
     }
 
     /// PB-44 T2: a batch whose completions carry the count PAST the threshold
@@ -1198,8 +1204,8 @@ mod tests {
     /// threshold, and the WAL then grows without bound.
     #[test]
     fn a_batch_that_jumps_past_the_threshold_still_compacts() {
-        let path = temp_wal_path("pb44_jump_threshold");
-        cleanup(&path);
+        let scratch = WalScratch::new("pb44_jump_threshold");
+        let path = scratch.path.clone();
         let ids: Vec<(String, String)> = (0..5)
             .map(|i| (format!("{i:064x}"), format!("{:064x}", i + 50)))
             .collect();
@@ -1211,7 +1217,6 @@ mod tests {
             contents.is_empty(),
             "five completions against a threshold of three must compact to an empty file: {contents:?}"
         );
-        cleanup(&path);
     }
 
     /// PB-44 T2: a pending batch that cannot be written leaves the index
@@ -1219,8 +1224,8 @@ mod tests {
     /// this one runs everywhere.
     #[test]
     fn a_failed_pending_batch_changes_nothing() {
-        let path = temp_wal_path("pb44_failed_batch");
-        cleanup(&path);
+        let scratch = WalScratch::new("pb44_failed_batch");
+        let path = scratch.path.clone();
         let mut wal = ShareWal::open(&path, 1000).unwrap();
         wal.fail_writes_for_test();
         let ids: Vec<(String, String)> = (0..3)
@@ -1231,7 +1236,6 @@ mod tests {
             "a read-only handle must fail the append"
         );
         assert_eq!(wal.pending_count(), 0, "a failed batch indexes nothing");
-        cleanup(&path);
     }
 
     /// PB-47 T2: a late pending record that arrives after a compaction must
@@ -1241,8 +1245,8 @@ mod tests {
     /// completion that is still waiting, so the pair survives together.
     #[test]
     fn a_late_pending_record_after_compaction_is_not_an_orphan() {
-        let path = temp_wal_path("pb47_late_after_compaction");
-        cleanup(&path);
+        let scratch = WalScratch::new("pb47_late_after_compaction");
+        let path = scratch.path.clone();
         let mut wal = ShareWal::open(&path, 1).unwrap();
         wal.mark_completed(&[("aa", "bb")]).unwrap();
         let after_compaction = read_wal_file_independently(&path);
@@ -1255,7 +1259,6 @@ mod tests {
         drop(wal);
         let mut reopened = ShareWal::open(&path, 1000).unwrap();
         assert_eq!(reopened.recover().synthetic_events.len(), 0);
-        cleanup(&path);
     }
 
     /// PB-47 T2: replay must reach the same pending set the in-memory index
@@ -1266,11 +1269,11 @@ mod tests {
     /// the file in RAM.
     #[test]
     fn replay_agrees_with_memory_on_every_order() {
-        let path = temp_wal_path("pb47_every_order");
         for threshold in [0usize, 1, 2] {
             for len in 1..=4u32 {
                 for bits in 0..(1u32 << len) {
-                    cleanup(&path);
+                    let scratch = WalScratch::new("pb47_every_order");
+                    let path = scratch.path.clone();
                     let ops: Vec<bool> = (0..len).map(|i| bits & (1 << i) != 0).collect();
                     let mut wal = ShareWal::open(&path, threshold).unwrap();
                     for &is_pending in &ops {
@@ -1292,7 +1295,6 @@ mod tests {
                 }
             }
         }
-        cleanup(&path);
     }
 
     /// One early completion is consumed by ONE pending record, even when a
@@ -1300,8 +1302,8 @@ mod tests {
     /// indexed, in memory and on replay alike.
     #[test]
     fn one_early_completion_is_consumed_once_within_a_batch() {
-        let path = temp_wal_path("pb47_twice_in_batch");
-        cleanup(&path);
+        let scratch = WalScratch::new("pb47_twice_in_batch");
+        let path = scratch.path.clone();
         let mut wal = ShareWal::open(&path, 0).unwrap();
         wal.mark_completed(&[("aa", "bb")]).unwrap();
         wal.mark_pending(&[("aa", "bb"), ("aa", "bb")]).unwrap();
@@ -1316,7 +1318,6 @@ mod tests {
             1,
             "replay agrees"
         );
-        cleanup(&path);
     }
 
     /// PB-47 T2 re-review: recovery used to compact before the caller emitted
@@ -1325,8 +1326,8 @@ mod tests {
     /// it replays the orphan again: a duplicate, never nothing.
     #[test]
     fn orphans_stay_on_disk_until_their_lines_are_out() {
-        let path = temp_wal_path("pb47r_recover_order");
-        cleanup(&path);
+        let scratch = WalScratch::new("pb47r_recover_order");
+        let path = scratch.path.clone();
         ShareWal::open(&path, 100)
             .unwrap()
             .mark_pending(&[("aa", "bb")])
@@ -1357,7 +1358,6 @@ mod tests {
                 .len(),
             0
         );
-        cleanup(&path);
     }
 
     /// PB-47 T2 re-review: a completion still waiting when the process
@@ -1365,8 +1365,8 @@ mod tests {
     /// replay spends it on a later genuine re-accept of the same share.
     #[test]
     fn a_restart_forgets_waiting_completions_in_the_file_as_in_memory() {
-        let path = temp_wal_path("pb47r_restart");
-        cleanup(&path);
+        let scratch = WalScratch::new("pb47r_restart");
+        let path = scratch.path.clone();
         ShareWal::open(&path, 0)
             .unwrap()
             .mark_completed(&[("aa", "bb")])
@@ -1387,22 +1387,20 @@ mod tests {
             1,
             "replay must agree"
         );
-        cleanup(&path);
     }
 
     /// PB-47 T2 re-review: the waiting set is bounded, because under overload
     /// it fills with completions whose accounting event was dropped.
     #[test]
     fn the_waiting_set_is_capped() {
-        let path = temp_wal_path("pb47r_cap");
-        cleanup(&path);
+        let scratch = WalScratch::new("pb47r_cap");
+        let path = scratch.path.clone();
         let mut wal = ShareWal::open(&path, 0).unwrap();
         let ids: Vec<(String, String)> = (0..EARLY_COMPLETION_CAP + 10)
             .map(|i| (format!("{i:064x}"), format!("{:064x}", i + 1)))
             .collect();
         wal.mark_completed(&ids).unwrap();
         assert_eq!(wal.completed_early.len(), EARLY_COMPLETION_CAP);
-        cleanup(&path);
     }
 
     /// PB-47 T2 re-review: pruning happens in compaction, so the file forgets a
@@ -1410,8 +1408,8 @@ mod tests {
     /// file kept it, and replay spent it on the share's next pending record.
     #[test]
     fn a_pruned_completion_leaves_the_file_with_memory() {
-        let path = temp_wal_path("pb47r_prune");
-        cleanup(&path);
+        let scratch = WalScratch::new("pb47r_prune");
+        let path = scratch.path.clone();
         let mut wal = ShareWal::open(&path, 1).unwrap();
         wal.mark_completed(&[("aa", "bb")]).unwrap();
         let expired = std::time::Instant::now()
@@ -1437,6 +1435,5 @@ mod tests {
             1,
             "replay agrees"
         );
-        cleanup(&path);
     }
 }
