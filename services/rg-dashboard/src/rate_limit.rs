@@ -17,10 +17,16 @@
 //! `ErrorResponse` with `reason_code: rate_limited`. Each refusal is a
 //! `debug!` line; once a minute each class logs a `warn!` with the count,
 //! so a flood cannot fill the disk one line per request.
+//!
+//! Also once a minute, a `warn!` names the connecting address of requests
+//! that carried a forwarding header but were counted against that address.
+//! Behind a reverse proxy the dashboard has not been told about, that is
+//! every request, and every client shares the proxy's one budget; nothing
+//! else would say so.
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use axum::Json;
@@ -47,6 +53,11 @@ const MAX_TRACKED_CLIENTS: usize = 10_000;
 /// How often each class logs its refusal count and drops idle clients.
 const SWEEP_EVERY: Duration = Duration::from_secs(60);
 
+/// Headers a reverse proxy sets to name the client it relays for. Only
+/// their presence is checked, to notice a proxy nobody configured; which
+/// one is read, if any, is `[rate_limit] client_ip_header`.
+const FORWARDING_HEADERS: [&str; 3] = ["x-forwarded-for", "cf-connecting-ip", "forwarded"];
+
 /// Works out which client a request came from.
 ///
 /// This exists because the limiter middleware and the two rg-auth proxies
@@ -58,6 +69,19 @@ pub struct ClientAddr {
     /// `127.0.0.1` and the other way round.
     trusted_proxies: Vec<IpAddr>,
     header: Option<ClientIpHeader>,
+    /// What [`ClientAddr::note_unattributed`] has counted since the last
+    /// [`ClientAddr::take_unattributed`].
+    unattributed: Mutex<Option<Unattributed>>,
+}
+
+/// Requests that named a client in a forwarding header and were counted
+/// against their TCP peer anyway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unattributed {
+    /// The TCP peer of the most recent one.
+    pub last_peer: IpAddr,
+    /// How many since the last sweep, from any peer.
+    pub requests: u64,
 }
 
 impl ClientAddr {
@@ -69,6 +93,7 @@ impl ClientAddr {
                 .map(IpAddr::to_canonical)
                 .collect(),
             header: cfg.client_ip_header,
+            unattributed: Mutex::new(None),
         }
     }
 
@@ -92,6 +117,43 @@ impl ClientAddr {
             ClientIpHeader::XForwardedFor => self.rightmost_untrusted(headers),
         };
         named.map_or(peer, |ip| ip.to_canonical())
+    }
+
+    /// Count a request that carries a forwarding header but was keyed by
+    /// its TCP peer (`client` is `peer`). From an address that is not in
+    /// `trusted_proxies`, or with no trust configured at all, that is
+    /// usually a reverse proxy nobody told the dashboard about, and every
+    /// client behind it then shares one budget, so one client at about 10
+    /// requests a second locks the rest out of `/api`, login included. From
+    /// a trusted proxy it is a proxy that did not send the configured
+    /// header. A client that writes the header itself also lands here,
+    /// which costs one log line a minute.
+    fn note_unattributed(&self, peer: IpAddr, client: IpAddr, headers: &HeaderMap) {
+        if client.to_canonical() != peer.to_canonical()
+            || !FORWARDING_HEADERS.iter().any(|h| headers.contains_key(*h))
+        {
+            return;
+        }
+        let peer = peer.to_canonical();
+        let mut slot = self
+            .unattributed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let seen = slot.get_or_insert(Unattributed {
+            last_peer: peer,
+            requests: 0,
+        });
+        seen.last_peer = peer;
+        seen.requests = seen.requests.saturating_add(1);
+    }
+
+    /// What [`Self::note_unattributed`] counted since the last call, and
+    /// reset. Both classes' sweeps call this; whichever runs first logs.
+    fn take_unattributed(&self) -> Option<Unattributed> {
+        self.unattributed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
     }
 
     /// Walk `x-forwarded-for` from the right, past the trusted proxies. The
@@ -135,8 +197,9 @@ impl LimitClass {
         })
     }
 
-    /// Log and reset the refusal count, and drop clients idle for two
-    /// windows. Returns the count it logged.
+    /// Log and reset the refusal count, log any requests whose forwarding
+    /// header went unused, and drop clients idle for two windows. Returns
+    /// the refusal count it logged.
     pub fn sweep(&self) -> u64 {
         let rejected = self.rejected.swap(0, Ordering::Relaxed);
         if rejected > 0 {
@@ -145,6 +208,17 @@ impl LimitClass {
                 class = self.name,
                 rejected,
                 "rate limiter rejected requests in the last minute"
+            );
+        }
+        if let Some(seen) = self.client.take_unattributed() {
+            warn!(
+                peer = %seen.last_peer,
+                requests = seen.requests,
+                trusted_proxies = self.client.trusted_proxies.len(),
+                "requests in the last minute carried a forwarding header but were counted \
+                 against the connecting address; if a reverse proxy is at that address, every \
+                 client behind it shares one request budget: set [rate_limit] trusted_proxies \
+                 and client_ip_header (docs/deployment-runbook.md, Dashboard request limits)"
             );
         }
         self.limiter.cleanup();
@@ -175,6 +249,9 @@ pub async fn enforce(
     next: Next,
 ) -> Response {
     let client = class.client.resolve(peer.ip(), req.headers());
+    class
+        .client
+        .note_unattributed(peer.ip(), client, req.headers());
     match class.limiter.admit(bucket_key(client), class.per_minute) {
         Ok(()) => next.run(req).await,
         Err(wait) => {

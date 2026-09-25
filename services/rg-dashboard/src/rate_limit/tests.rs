@@ -103,6 +103,53 @@ async fn api_n_plus_one_gets_429_with_retry_after() {
     assert_eq!(json["reason_code"], ReasonCode::RateLimited.as_str());
 }
 
+/// Every group under the `api` class draws on its budget, so a group moved
+/// out of the limited router fails here. The upstreams are dead or absent,
+/// so an admitted call answers fast with an error status, never 429.
+#[tokio::test]
+async fn every_api_route_group_is_limited() {
+    const GROUPS: [&str; 6] = [
+        "/api/verifier/x",
+        "/api/templates/x",
+        "/api/auth/x",
+        "/api/keys/x",
+        "/api/gateway/x",
+        SETTINGS,
+    ];
+    for path in GROUPS {
+        let app = app(THREE);
+        for n in 1..=3 {
+            assert_ne!(
+                status(&app, path, "198.51.100.30", &[]).await,
+                429,
+                "{path} call {n}"
+            );
+        }
+        assert_eq!(
+            status(&app, path, "198.51.100.30", &[]).await,
+            429,
+            "{path} call 4"
+        );
+    }
+
+    // One budget across the groups, not one each.
+    let app = app(THREE);
+    for path in &GROUPS[..3] {
+        assert_ne!(
+            status(&app, path, "198.51.100.31", &[]).await,
+            429,
+            "{path}"
+        );
+    }
+    for path in GROUPS {
+        assert_eq!(
+            status(&app, path, "198.51.100.31", &[]).await,
+            429,
+            "{path} after three calls to other groups"
+        );
+    }
+}
+
 #[tokio::test]
 async fn healthz_and_spa_stay_open_after_api_exhausted() {
     let app = app(THREE);
@@ -415,6 +462,8 @@ async fn auth_proxy_forwards_resolved_client_ip() {
         assert_eq!(seen.recv().await.unwrap().as_deref(), Some("198.51.100.20"));
     }
 }
+
+mod unattributed;
 
 #[test]
 fn retry_after_rounds_up_inside_one_to_sixty() {
