@@ -11,6 +11,7 @@ use std::time::Instant;
 
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, State};
+use axum::middleware;
 use axum::routing::{get, post};
 use clap::Parser;
 use serde::Serialize;
@@ -19,6 +20,7 @@ use tracing::{error, info, warn};
 
 mod config;
 mod feed;
+mod rate_limit;
 mod rpc;
 
 use config::AdapterConfig;
@@ -147,6 +149,7 @@ async fn main() {
         listen = %cfg.listen,
         feed_url = %cfg.feed_url,
         has_license_key = !cfg.license_key.is_empty(),
+        rate_limit_per_minute = cfg.rate_limit_per_minute,
         "rg-feed-adapter starting"
     );
 
@@ -161,11 +164,9 @@ async fn main() {
     });
 
     // HTTP server (JSON-RPC + health) ---------------------------------------
-    let app = Router::new()
-        .route("/", post(rpc::handle_jsonrpc))
-        .route("/health", get(health))
-        .with_state(buffer)
-        .layer(DefaultBodyLimit::max(64 * 1024)); // 64 KiB; JSON-RPC calls are small
+    let rpc_limit = rate_limit::RpcLimit::new(cfg.rate_limit_per_minute);
+    rate_limit::spawn_sweeper(rpc_limit.clone());
+    let app = router(buffer, rpc_limit);
 
     let addr: SocketAddr = cfg.listen.parse().unwrap_or_else(|e| {
         error!(listen = %cfg.listen, error = %e, "invalid listen address");
@@ -198,12 +199,32 @@ async fn main() {
             std::process::exit(1);
         });
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .unwrap_or_else(|e| {
-            error!(error = %e, "server error");
-        });
+    // Connect-info is what the rate limiter keys on. Without it every
+    // JSON-RPC call fails its `ConnectInfo` extractor with a 500.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .unwrap_or_else(|e| {
+        error!(error = %e, "server error");
+    });
+}
+
+/// JSON-RPC on `/`, limited per peer, and `/health`, not limited.
+/// `route_layer` covers only the routes added before it, which is what
+/// leaves `/health` out.
+fn router(buffer: SharedBuffer, rpc_limit: Arc<rate_limit::RpcLimit>) -> Router {
+    Router::new()
+        .route("/", post(rpc::handle_jsonrpc))
+        .route_layer(middleware::from_fn_with_state(
+            rpc_limit,
+            rate_limit::enforce,
+        ))
+        .route("/health", get(health))
+        .with_state(buffer)
+        .layer(DefaultBodyLimit::max(64 * 1024)) // 64 KiB; JSON-RPC calls are small
 }
 
 async fn shutdown_signal() {

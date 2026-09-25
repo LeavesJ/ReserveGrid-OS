@@ -45,17 +45,19 @@ pub struct RpcRequest {
     params: Option<serde_json::Value>,
 }
 
+/// Crate-visible so `rate_limit` answers a refused call in the same
+/// envelope every other reply uses.
 #[derive(Serialize)]
 pub struct RpcResponse {
-    result: Option<serde_json::Value>,
-    error: Option<RpcError>,
-    id: serde_json::Value,
+    pub(crate) result: Option<serde_json::Value>,
+    pub(crate) error: Option<RpcError>,
+    pub(crate) id: serde_json::Value,
 }
 
 #[derive(Serialize)]
 pub struct RpcError {
-    code: i32,
-    message: String,
+    pub(crate) code: i32,
+    pub(crate) message: String,
 }
 
 // ---------------------------------------------------------------------------
