@@ -346,15 +346,26 @@ gate "deep: SQLite opens near busy_timeout/pragma (warn)" \
 #
 # If you exempt a service, put it in EXEMPT with the reason. Do not return
 # this check to exit 0 — that is the defect this commit removes.
-gate "deep: HTTP services enforce a rate limit" \
+#
+# What it proves (2026-09-24): each HTTP service's src/ names a limiter on a
+# line that is not a // comment. It is a presence check. It does not prove
+# a limiter is wired to a route: a deleted route_layer still passes it. The
+# services' own tests are that guard, for example rg-dashboard's
+# every_api_route_group_is_limited and each of rg-dashboard's and
+# rg-feed-adapter's tests/rate_limit_binary.rs. Comment lines no longer
+# count: a tree whose only "limiter" was a TODO comment used to pass.
+# EXEMPT takes one name:reason per line, leading spaces ignored; before,
+# a second entry was never matched.
+gate "deep: HTTP services name a rate limiter in code" \
   bash -c '
-    # Services deliberately shipped without a limiter. Format: name:reason.
+    # Services deliberately shipped without a limiter, one per line:
+    # name:reason
     EXEMPT=""
     UNPROTECTED=""
     for SVC in $(grep -rln "axum::serve\|Router::new" services/*/src --include="*.rs" 2>/dev/null | cut -d/ -f1-2 | sort -u); do
       NAME=$(basename "$SVC")
-      case ":$EXEMPT:" in *":$NAME:"*) continue ;; esac
-      if ! grep -rqiE "RateLimiter|rate_limit|RateLimitLayer|throttle|governor|ConcurrencyLimit" "$SVC/src" 2>/dev/null; then
+      if printf "%s\n" "$EXEMPT" | sed "s/^[[:space:]]*//" | cut -d: -f1 | grep -qxF "$NAME"; then continue; fi
+      if ! grep -rhiE "RateLimiter|rate_limit|RateLimitLayer|throttle|governor|ConcurrencyLimit" "$SVC/src" 2>/dev/null | grep -qvE "^[[:space:]]*//"; then
         UNPROTECTED="$UNPROTECTED  $SVC
 "
       fi
